@@ -1,0 +1,19 @@
+[
+    {
+        "nc_var_name": "instrument_ctd",
+        "type": "i4",
+        "attrs": {
+            "serial_number": "0034",
+            "make_model": "Sea-Bird GPCTD",
+            "comment": "Unpumped",
+            "long_name": "Conductivity, Temperature, Depth (CTD) Sensor",
+            "calibration_date": " ",
+            "user_calibrated": "",
+            "factory_calibrated": " ",
+            "calibration_report": "",
+            "type": "instrument",
+            "platform": "platform",
+            "deployment" : "542"
+        }
+    }
+]

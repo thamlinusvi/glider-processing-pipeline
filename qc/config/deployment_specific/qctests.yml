@@ -1,0 +1,10 @@
+# Template — copy to deployments/<year>/<glider-YYYYmmddTHHMM>/config/qc/qctests.yml
+# and edit as needed for each deployment.
+check_science_variables: True   # rename files without CTD data to .nosci
+check_duplicate_timestamps: True
+qartod: True                    # gross range, flatline, spike, climatology, rate-of-change
+interp_depth: True              # interpolate depth gaps
+hysteresis: True                # flag CTD profile pairs with severe lag
+qartod_summary: True            # roll up all flags into one summary variable per sensor
+time_shift: True                # requires time_shift.yml in this config/qc/ dir
+add_derived_variables: False    # requires derived_variables config; adds pH, TA, omega etc

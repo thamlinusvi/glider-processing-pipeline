@@ -1,0 +1,21 @@
+{
+    "glider": " ",
+    "trajectory_datetime": " ",
+    "trajectory_name": " ",
+    "global_attributes": {
+        "wmo_id": " ",
+        "deployment_name": " ",
+        "deployment_id" : "-1"
+    },
+    "platform": {
+        "id": " ",
+        "wmo_id": " ",
+        "long_name": "Teledyne Webb Research Slocum G2 glider",
+        "os_version": " ",
+        "glider_type": " ",
+        "depth_rating": " ",
+        "comment": " ",
+        "instrument": " ",
+        "type": "platform"
+    }
+}

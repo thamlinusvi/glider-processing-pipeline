@@ -1,0 +1,20 @@
+name: glider-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy
+  - pandas
+  - xarray
+  - netcdf4
+  - gsw
+  - matplotlib
+  - scipy
+  - pyyaml
+  - h5py
+  - cftime
+  - ruamel.yaml
+  - pip
+  - pip:
+      - dbdreader
+      - yamlordereddictloader

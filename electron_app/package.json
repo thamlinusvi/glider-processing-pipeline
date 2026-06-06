@@ -1,0 +1,13 @@
+{
+  "name": "uvi-glider-pipeline",
+  "version": "1.0.0",
+  "description": "UVI Glider Processing Pipeline desktop app",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "install-python": "pip install flask"
+  },
+  "dependencies": {
+    "electron": "^28.3.3"
+  }
+}

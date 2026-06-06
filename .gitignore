@@ -1,0 +1,30 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.env
+.venv/
+venv/
+
+# ── Node / Electron ───────────────────────────────────────────────────────────
+electron_app/node_modules/
+electron_app/dist/
+
+# ── Glider data directories (deployment-specific, never committed) ────────────
+incoming_data/
+dat_files/
+deployments/
+gncutils_slocum_nc_output/
+
+# ── Sample / scratch data files ───────────────────────────────────────────────
+erddap_uvi02_sample.csv
+
+# ── OS / editor / tooling ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.claude/

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>UVI Glider Pipeline</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Sidebar ───────────────────────────────────────────────── -->
+    <nav id="sidebar">
+      <div class="brand">
+        <div class="brand-title">UVI Glider</div>
+        <div class="brand-sub">PROCESSING PIPELINE</div>
+      </div>
+
+      <div class="dep-section">
+        <div class="dep-label">DEPLOYMENT</div>
+        <select id="dep-select"></select>
+      </div>
+
+      <ul id="nav-list">
+        <li data-page="dashboard"   class="nav-item active">Dashboard</li>
+        <li data-page="pipeline"    class="nav-item">Pipeline</li>
+        <li data-page="reports"     class="nav-item">Reports</li>
+        <li data-page="metadata"    class="nav-item">Metadata</li>
+        <li data-page="dat-browser" class="nav-item">DAT Browser</li>
+      </ul>
+
+      <div class="sidebar-footer">
+        <div class="footer-label">PIPELINE ROOT</div>
+        <div id="base-dir-lbl" class="footer-path">—</div>
+      </div>
+    </nav>
+
+    <!-- ── Content pages ─────────────────────────────────────────── -->
+    <main id="content">
+      <div id="page-dashboard"   class="page active"></div>
+      <div id="page-pipeline"    class="page"></div>
+      <div id="page-reports"     class="page"></div>
+      <div id="page-metadata"    class="page"></div>
+      <div id="page-dat-browser" class="page"></div>
+    </main>
+
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Deployment-specific glider config directories (e.g. uvi_01/)
+# The app creates these at runtime — they hold per-deployment JSON configs
+# and are not tracked.  Add your glider prefix below if needed.
+uvi_*/
+
+# Generated sensor definitions output (produced by build_sensor_defs.py)
+updated_sensor_defs/
+
+# User's active sensor-set configuration (machine-specific)
+sensor_sets.json

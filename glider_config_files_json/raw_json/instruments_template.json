@@ -1,0 +1,63 @@
+[
+    {   
+        "nc_var_name": "instrument_dmon",
+        "type": "i4",
+        "attrs":{
+            "calibration_date": "1970-01-01",
+            "comment": "Version 32.2. No calibration date. No NVS instrument definition (https://vocab.nerc.ac.uk/collection/L22/current/) as of 2023-02-24.",
+            "description": "The digital acoustic monitoring instrument or DMON is a passive acoustic instrument that is capable of recording and processing audio in realtime. The developers have implemented a low-frequency detection and classification system (LFDCS) on the DMON to identify marine mammal calls from a variety of autonomous platforms, including gliders, profiling floats, and moorings. The LFDCS produces pitch tracks of sounds, which describe changes in the frequency (pitch) of a call over time. While automated software can roughly identify calls, for best results scientists typically examine spectrograms to identify marine mammal calls and pitch tracks are derived from spectrograms.",
+            "factory_calibrated": "1970-01-01",
+            "ioos_category": "identifier",
+            "long_name": "WHOI Digital Acoustic Monitoring Instrument DMON",
+            "maker": "Mark Baumgartner,Woods Hole Oceanographic Institution",
+            "maker_vocabulary": "https://vocab.nerc.ac.uk/collection/L35/current/MAN0064/",
+            "model": "DMON Digital Monitoring Acoustic Instrument",
+            "owner": "University of the Virgin Islands",
+            "references": "http://dcs.whoi.edu/,https://www.whoi.edu/cms/files/JASMAN12952889_85804.pdf,https://www.whoi.edu/fileserver.do?id=163064&pt=2&p=9906",
+            "serial_number": "0223252F",
+            "type": "hydrophones",
+            "type_vocabulary": "http://dcs.whoi.edu/,https://www.whoi.edu/cms/files/JASMAN12952889_85804.pdf,https://www.whoi.edu/fileserver.do?id=163064&pt=2&p=9906"   
+        }
+    },
+    {
+        "nc_var_name": "instrument_optode",
+        "type": "i4",
+        "attrs":{
+            "calibration_date": "2023-03-15",
+            "comment": "Model 4831",
+            "description": "A dissolved oxygen sensor which provides analogue (0-5V) and digital output (RS-232) to third party data loggers, gliders and floats. Measurement based on the ability of selected substances to act as dynamic fluorescence quenchers. The fluorescent indicator is a special platinum porphyrin complex embedded in a gas permeable foil that is exposed to the surrounding water. In this standard model, a black optical isolation coating protects the complex from sunlight and fluorescent particles in the water. This sensing foil is attached to a window providing optical access for the measuring system from inside a watertight housing. The foil is excited by modulated blue light, and the phase of a returned red light is measured. For improved stability the 4831 optode also performs a reference phase reading by use of a red LED that does not produce fluorescence in the foil. This model is fitted with a standard sensing foil. By linearizing and temperature compensating, with an incorporated temperature sensor, the absolute O2 concentration can be determined. Accuracy +/- 1.5% or 2uM; precision +/- 0.2 uM.",
+            "factory_calibrated": "2023-03-15",
+            "ioos_category": "identifier",
+            "long_name": "AA Optode 4831",
+            "maker": "Aanderaa Data Instruments AS",
+            "maker_vocabulary": "https://vocab.nerc.ac.uk/collection/B75/current/ORG00228/,https://vocab.nerc.ac.uk/collection/L35/current/MAN0007/",
+            "model": "Aanderaa Oxygen Optode 4831",
+            "model_vocabulary": "https://vocab.nerc.ac.uk/collection/L22/current/TOOL1239/",
+            "owner" : "University of the Virgin Islands",
+            "serial_number": "1082",
+            "type": "sensor_model,dissolved gas sensors",
+            "type_vocabulary": "https://vocab.nerc.ac.uk/collection/L19/current/SDNKG17/,https://vocab.nerc.ac.uk/collection/L05/current/351/",
+            "user_calibrated": "2023-07-17"
+        }
+    },
+    {
+        "nc_var_name": "instrument_rbrctd",
+        "type": "i4",
+        "attrs":{
+            "calibration_date": "2023-04-04",
+            "description": "A conductivity, temperature and pressure sensor designed for use on gliders and autonomous underwater vehicles (AUVs). It can be used to derive salinity, density and sound velocity and is optimised for turbulence measurements and passive acoustic monitoring due to its silent operation (non-pumped). The instrument is available as two configurations; the standard RBR Legato3 has a 2 Hz standard thermistor response; the RBR Legato3 Fast 16 instrument has a 16 Hz fast thermistor response. Additional sensors such as dissolved oxygen, fluorescence, turbidity, and PAR are all supported. The RBR Legato3 is designed to fit into a standard 2 x 7 inch sensor bay, with both wet- and dry-bay models. The RBR Legato3 is depth-rated to 1000m, with a pressure range from 500-1000 db and accuracy of +/- 0.05 percent (full scale). The conductivity accuracy is +/- 0.003 mS/cm. Temperature range is -5 degC to +42 degC (ITS-90) with an accuracy of +/- 0.002 degC (-5 to +35 degC) and +/- 0.004 degC (+35 to +42 degC).",
+            "factory_calibrated": "2023-04-04",
+            "ioos_category": "Salinity",
+            "long_name": "RBR Legato3 CTD",
+            "maker": "RBR",
+            "maker_vocabulary": "https://vocab.nerc.ac.uk/collection/L35/current/MAN0049/,https://vocab.nerc.ac.uk/collection/B75/current/ORG00299/",
+            "model": "RBR Legato3 CTD",
+            "model_vocabulary": "https://vocab.nerc.ac.uk/collection/L22/current/TOOL1745/",
+            "owner": "University of the Virgin Islands",
+            "serial_number": "212386",
+            "type": "CTD,salinity sensor,water temperature sensor,water pressure sensor",
+            "type_vocabulary": "https://vocab.nerc.ac.uk/collection/L05/current/130/,https://vocab.nerc.ac.uk/collection/L05/current/350/,https://vocab.nerc.ac.uk/collection/L05/current/134/,https://vocab.nerc.ac.uk/collection/L05/current/WPS/"
+        }
+    }
+
+]

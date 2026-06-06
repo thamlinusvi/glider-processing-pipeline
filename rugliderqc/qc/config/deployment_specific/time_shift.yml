@@ -1,0 +1,13 @@
+# Template — copy to deployments/<year>/<glider-YYYYmmddTHHMM>/config/qc/time_shift.yml
+# Add/remove variables as appropriate for each deployment.
+# sbe41n_ph_ref_voltage is for SBE CTD deployments with pH — remove if not applicable.
+time_shift:
+    oxygen_concentration:
+        long_name: Time-lag Adjusted Dissolved Oxygen
+        default_shift: 30
+    oxygen_saturation:
+        long_name: Time-lag Adjusted Dissolved Oxygen Saturation
+        default_shift: 30
+    # sbe41n_ph_ref_voltage:
+    #     long_name: Time-lag Adjusted pH Voltage
+    #     default_shift: 30

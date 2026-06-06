@@ -1,0 +1,43 @@
+{
+    "glider": "uvi_02",
+    "trajectory_name": "",
+    "global_attributes": {
+        "comment": "",
+        "contributor_name": " ",
+        "acknowledgment": " ",
+        "sea_name": "Caribbean Sea",
+        "deployment": " ",
+        "summary": " ",
+        "project": " ",
+        "cdm_data_type": "Trajectory",
+        "program": " ",
+        "references": "https://rucool.marine.rutgers.edu",
+        "contributor_role": " ",
+        "wmo_id": " ",
+        "wmo_platform_code": " ",
+        "gts_ingest": "True",
+        "institution_name": "University of the Virgin Islands",
+        "deployment_id" : "-1"
+    },
+    "platform": {
+        "comment": " ",
+        "model_vocabulary": "http://vocab.nerc.ac.uk/collection/B76/current/B7600029/",
+        "maker_vocabulary": "http://vocab.nerc.ac.uk/collection/L35/current/MAN0020/,http://vocab.nerc.ac.uk/collection/B75/current/ORG01077/",
+        "description": "A long-range autonomous underwater vehicle (AUV) based on buoyancy. The G3S utilises the same features as the G3 glider but uses a new STM32 Processor. This replaces the Persistor processor used on the G3 glider in the Science and Flight Bays. The G3S is used for remote water column sampling. It uses hydraulic buoyancy change to alter the vehicle density in relation to the surrounding water thereby causing the vehicle to either float or sink. Given an appropriate dive or climb angle, the wings and body lift and convert some of this vertical motion into a forward saw tooth horizontal motion. Periodically, the glider surfaces and calls via Iridium Satellite Phone (anywhere in world) or Free Wave RF Modem (line of sight) in to Dockserver (auto attendant computer) to relay navigational fix, data and receive further instructions for command and control. The glider is capable of storm sampling and can be flown in a coordinated fleet. It is 1.5 m in length, has a hull diameter of 22 cm and mass of 55-70 kgs (dependent upon configuration). It has an exchangeable payload (capacity up to 6 L) which is capable of housing a variety of environmental sensors such as nitrate and oxygen. It uses lithium or alkaline batteries. It has a deployment range of 350-13000 km (dependent upon configuration), a deployment length of 15 days to 18 months (dependent upon configuration) and an operating depth range of 4-1000m. Navigation is via GPS waypoints, a pressure and altimeter sensor. Maximum speed is 0.35 m/s (0.68 knot) with the buoyancy engine and an average up to 0.5 m/s (1 knots) with full drive. The thruster provides speeds up to 1 m/s (2 knots). It transmits via RF modem, Iridium (RUDICS), ARGOS or acoustic modem. The new STM32L4 CPU processor utilises OpenRTOS running up to 120 MHz, with 8 Mbytes RAM and 32 Mbytes of flash memory.",
+        "instruments": "instrument_rbrctd,instrument_dmon,instrument_optode",
+        "long_name": "uvi_02 Slocum G3S",
+        "owner": "University of the Virgin Islands",
+        "type_vocabulary": "https://vocab.nerc.ac.uk/collection/L06/current/27/",
+        "id": " ",
+        "depth_rating": " ",
+        "wmo_id": " ",
+        "wmo_platform_code": " ",
+        "os_version": "10.08",
+        "serial_number": " ",
+        "model": "Teledyne Webb Research Slocum G3S glider",
+        "type": "sub-surface gliders",
+        "glider_type": "Slocum G3s",
+        "maker": "Teledyne Webb Research"
+        
+    }
+}
