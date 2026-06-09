@@ -119,7 +119,7 @@ class JsonEditorTab(QWidget):
             self._raw_edit.setPlainText('File not found:\n' + (self.filepath or '(no path)'))
             return
         try:
-            with open(self.filepath, 'r', encoding='utf-8') as f:
+            with open(self.filepath, 'r', encoding='utf-8-sig') as f:
                 self._data = json.load(f)
             self._raw_edit.setPlainText(json.dumps(self._data, indent=2))
             # Populate form fields

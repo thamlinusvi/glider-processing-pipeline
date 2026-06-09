@@ -1,17 +1,36 @@
 import os
+import sys
 import shutil
+import warnings
 import xarray as xr
 import numpy as np
 
+# Suppress harmless xarray RuntimeWarnings about all-NaN time slices
+# (happens when a profile has no valid timestamps — the data is still usable)
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='xarray')
+
+
 def fix_trajectoryprofile_metadata_ignore_encoding(directory):
-    for fname in os.listdir(directory):
+    # Remove any stale .tmp files left by a previous crashed run
+    for f in os.listdir(directory):
+        if f.endswith(".nc.tmp"):
+            stale = os.path.join(directory, f)
+            os.remove(stale)
+            print(f"  🧹 Removed stale temp file: {f}")
+
+    errors = 0
+    for fname in sorted(os.listdir(directory)):
         if not fname.endswith(".nc"):
             continue
 
         path = os.path.join(directory, fname)
         print(f"🔍 Checking: {fname}")
+        tmp_path = path + ".tmp"
         try:
-            ds = xr.open_dataset(path)
+            # decode_times=False: keep time as raw numeric values so xarray
+            # never tries to compare NoneType with datetime when re-encoding.
+            # We only modify global attributes here — time data is untouched.
+            ds = xr.open_dataset(path, decode_times=False)
             modified = False
 
             # Set required global attributes
@@ -42,7 +61,6 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
             # Ensure profile_id variable with cf_role exists
             if not any(v.attrs.get("cf_role") == "profile_id" for v in ds.variables.values()):
                 if "profile_id" not in ds:
-                    # Attempt to use the length of the 'profile' dimension or fall back to time
                     dim_size = ds.dims.get("profile", ds.dims.get("time", 1))
                     ds["profile_id"] = ("profile", np.arange(1, dim_size + 1, dtype=np.int32))
                 ds["profile_id"].attrs["cf_role"] = "profile_id"
@@ -51,23 +69,36 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
                 print("  ✅ Added or updated profile_id with cf_role = profile_id")
                 modified = True
 
-            # Save changes
+            # Save changes atomically: write to .tmp then rename
             if modified:
-                tmp_path = path + ".tmp"
-                ds.to_netcdf(tmp_path, mode="w")
-                ds.close()
-                shutil.move(tmp_path, path)
-                print("  💾 Changes saved")
+                try:
+                    ds.to_netcdf(tmp_path, mode="w")
+                    ds.close()
+                    shutil.move(tmp_path, path)
+                    print("  💾 Changes saved")
+                except Exception:
+                    ds.close()
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
             else:
                 ds.close()
                 print("  ✅ No changes needed")
 
         except Exception as e:
             print(f"  ❌ Error with {fname}: {e}")
+            errors += 1
+
+    if errors:
+        print(f"\n✖ Finished with {errors} error(s).")
+        sys.exit(1)
+    else:
+        print("\n✔ All files processed successfully.")
+
 
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) != 2:
-        print("Usage: python fix_trajectoryprofile_metadata_ignore_encoding.py /path/to/nc/files")
+        print("Usage: python fix_trajectoryprofile_metadata.py /path/to/nc/files")
+        sys.exit(1)
     else:
         fix_trajectoryprofile_metadata_ignore_encoding(sys.argv[1])

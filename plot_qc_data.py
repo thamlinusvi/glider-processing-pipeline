@@ -1,205 +1,346 @@
 #!/usr/bin/env python
 """
 Author: glider_processing_pipeline
-Visualize QARTOD QC'd glider data.
+Visualize QARTOD QC'd glider data — interactive Plotly charts.
 
 Usage:
     python plot_qc_data.py uvi_01-20250318T2008
     python plot_qc_data.py uvi_01-20250318T2008 --mode delayed --nprofiles 20
 
-Plots saved to:  <deployment>/figs/
+Plots saved to:  <deployment>/figs/   (*.html — open in browser or iframe)
 """
 
 import argparse
 import os
 import glob
+import shutil
+import time
 import warnings
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
-from matplotlib.patches import Patch
-from matplotlib.lines import Line2D
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 warnings.filterwarnings('ignore')
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+# 'cdn'  → small files (~20 KB each), requires internet to render
+# True   → fully self-contained (~3.5 MB each), works offline
+PLOTLYJS = 'cdn'
+
+# Maximum data points per variable in deployment-wide plots (timeseries, T-S, sections).
+# Plotly serialises every point to JSON so uncapped plots balloon to hundreds of MB.
+# 50 000 points ≈ 2–5 MB per HTML file and is more than enough visual resolution.
+MAX_POINTS_PER_VAR = 50_000
 
 # ── QC flag styling ────────────────────────────────────────────────────────────
 FLAG_COLOR = {1: '#2ecc71', 2: '#95a5a6', 3: '#f39c12', 4: '#e74c3c', 9: '#cccccc'}
 FLAG_LABEL = {1: 'Good', 2: 'Not Evaluated', 3: 'Suspect', 4: 'Fail', 9: 'Missing'}
-FLAG_ZORDER = {1: 1, 2: 2, 9: 0, 3: 3, 4: 4}
 FLAG_VALUES = [1, 2, 3, 4, 9]
 
+SCI_PAIRS = [
+    ('temperature',          'temperature_qartod_summary_flag',          'Temperature (°C)'),
+    ('salinity',             'salinity_qartod_summary_flag',              'Salinity (PSU)'),
+    ('density',              'density_qartod_summary_flag',               'Density (kg/m³)'),
+    ('sci_water_pressure',   'sci_water_pressure_qartod_summary_flag',    'Pressure (bar)'),
+    ('oxygen_concentration', 'oxygen_concentration_qartod_summary_flag',  'O₂ Conc. (µmol/L)'),
+    ('oxygen_saturation',    'oxygen_saturation_qartod_summary_flag',     'O₂ Sat. (%)'),
+]
 
-def qc_legend_elements():
-    return [Patch(facecolor=FLAG_COLOR[f], label=FLAG_LABEL[f]) for f in [1, 3, 4, 2, 9]]
+
+# ── Progress helpers ───────────────────────────────────────────────────────────
+def _step(msg):
+    """Print a prominent step header and return the start time."""
+    print(f'\n{"="*60}', flush=True)
+    print(f'  {msg}', flush=True)
+    print(f'{"="*60}', flush=True)
+    return time.time()
 
 
-def flag_scatter(ax, x, y, flags, size=6, alpha=0.7):
-    """Scatter plot coloured by QC flag value."""
+def _done(t0, extra=''):
+    elapsed = time.time() - t0
+    suffix = f'  {extra}' if extra else ''
+    print(f'  -> done in {elapsed:.1f}s{suffix}', flush=True)
+
+
+def _progress(i, total, label='', every=50):
+    if total == 0:
+        return
+    if i == 0 or (i + 1) % every == 0 or i + 1 == total:
+        pct = (i + 1) / total * 100
+        print(f'  [{i+1}/{total}  {pct:.0f}%] {label}', flush=True)
+
+
+def _subsample(*arrays, max_n=MAX_POINTS_PER_VAR):
+    """Return uniformly subsampled copies of arrays along axis-0.
+
+    If len(arrays[0]) <= max_n the originals are returned unchanged.
+    All arrays must have the same length.
+    """
+    n = len(arrays[0])
+    if n <= max_n:
+        return arrays
+    idx = np.round(np.linspace(0, n - 1, max_n)).astype(int)
+    return tuple(a[idx] for a in arrays)
+
+
+# ── Plotly helpers ─────────────────────────────────────────────────────────────
+def _flag_traces(x, y, flags, size=5, opacity=0.7, legend_added=None,
+                 hover_x='%{x}', hover_y='%{y}', use_gl=True):
+    """Return (list_of_traces, legend_added_set) with one trace per QC flag group."""
+    if legend_added is None:
+        legend_added = set()
+    ScatterCls = go.Scattergl if use_gl else go.Scatter
+    traces = []
     for f in FLAG_VALUES:
-        mask = flags == f
-        if mask.any():
-            ax.scatter(x[mask], y[mask],
-                       c=FLAG_COLOR[f], s=size, alpha=alpha,
-                       zorder=FLAG_ZORDER[f], label=FLAG_LABEL[f])
+        mask = (flags == f)
+        if not mask.any():
+            continue
+        show = f not in legend_added
+        if show:
+            legend_added.add(f)
+        traces.append(ScatterCls(
+            x=x[mask], y=y[mask],
+            mode='markers',
+            marker=dict(color=FLAG_COLOR[f], size=size, opacity=opacity),
+            name=FLAG_LABEL[f],
+            legendgroup=f'flag_{f}',
+            showlegend=show,
+            hovertemplate=(
+                f'{hover_x}<br>{hover_y}'
+                f'<br><b style="color:{FLAG_COLOR[f]}">{FLAG_LABEL[f]}</b>'
+                '<extra></extra>'
+            ),
+        ))
+    return traces, legend_added
 
 
+def _save_html(fig, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.write_html(path, include_plotlyjs=PLOTLYJS)
+    print(f'  Saved: {os.path.basename(path)}', flush=True)
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
 def load_deployment(data_dir, max_files=None):
-    """Load all NC files from a deployment directory into a list of datasets."""
+    """Load NC files from a deployment directory into a list of xarray datasets."""
     files = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
     if max_files:
-        # Spread evenly across the deployment
         idx = np.linspace(0, len(files) - 1, min(max_files, len(files))).astype(int)
         files = [files[i] for i in idx]
+    total = len(files)
+    every = max(1, min(50, total // 10))
     datasets = []
-    for f in files:
+    for i, f in enumerate(files):
         try:
-            ds = xr.open_dataset(f, decode_times=False)
-            datasets.append(ds)
+            datasets.append(xr.open_dataset(f, decode_times=False))
         except Exception as e:
-            print(f'  Warning: could not open {os.path.basename(f)}: {e}')
+            print(f'  Warning: could not open {os.path.basename(f)}: {e}', flush=True)
+        _progress(i, total, os.path.basename(f), every=every)
     return datasets, files
 
 
 def epoch_to_dt(epoch_seconds):
-    """Convert epoch seconds to datetime64."""
     return pd.to_datetime(epoch_seconds, unit='s', origin='unix')
 
 
-# ── Plot 1: Profile plots for sampled files ────────────────────────────────────
-def plot_profiles(datasets, out_dir, nprofiles=20):
-    """Individual profile plots: T, S, density, O2 vs depth coloured by QC summary flag."""
-    print(f'  Plotting profiles ({len(datasets)} files)...')
+# ── Plot 1: Individual profile plots ──────────────────────────────────────────
+def plot_profiles(datasets, out_dir, nprofiles=20, min_depth=10):
+    """One interactive HTML per sampled profile: T, S, density, O2 vs depth.
 
-    sci_pairs = [
-        ('temperature',          'temperature_qartod_summary_flag',      'Temperature (°C)'),
-        ('salinity',             'salinity_qartod_summary_flag',          'Salinity (PSU)'),
-        ('density',              'density_qartod_summary_flag',           'Density (kg m⁻³)'),
-        ('sci_water_pressure',   'sci_water_pressure_qartod_summary_flag','Pressure (bar)'),
-        ('oxygen_concentration', 'oxygen_concentration_qartod_summary_flag', 'O₂ Conc. (µmol L⁻¹)'),
-        ('oxygen_saturation',    'oxygen_saturation_qartod_summary_flag', 'O₂ Sat. (%)'),
-    ]
+    Args:
+        min_depth: Skip profiles whose maximum depth (m) is below this threshold.
+                   Useful to exclude surface checkout dives. Default 10 m.
+    """
+    total = len(datasets)
+    print(f'  Plotting {total} individual profiles (min depth: {min_depth} m)...', flush=True)
+    saved = 0
+    skipped_shallow = 0
 
-    for ds in datasets:
+    for i, ds in enumerate(datasets):
         fname = str(ds.encoding.get('source', 'profile')).split(os.sep)[-1].replace('.nc', '')
-        depth = ds['depth'].values if 'depth' in ds else ds.get('depth_interpolated', ds['sci_water_pressure']).values
-
-        # Filter to panels that have data
-        available = [(var, flag_var, label) for var, flag_var, label in sci_pairs
-                     if var in ds.data_vars and np.any(~np.isnan(ds[var].values))]
+        available = [
+            (var, fv, lbl) for var, fv, lbl in SCI_PAIRS
+            if var in ds.data_vars and np.any(~np.isnan(ds[var].values))
+        ]
         if not available:
+            print(f'  [{i+1}/{total}] {fname} - skipped (no data)', flush=True)
             continue
 
-        ncols = min(len(available), 3)
+        depth = (
+            ds['depth'].values if 'depth' in ds.data_vars
+            else ds['sci_water_pressure'].values
+        ).astype(float)
+
+        # Skip shallow dives (e.g. surface checkout dives) below the depth threshold
+        depth_max = float(np.nanmax(depth)) if depth.size else 0.0
+        if depth_max < min_depth:
+            skipped_shallow += 1
+            print(f'  [{i+1}/{total}] {fname} - skipped (max depth {depth_max:.1f} m < {min_depth} m)', flush=True)
+            continue
+
+        ncols = min(len(available), 2)
         nrows = int(np.ceil(len(available) / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 8 * nrows), sharey=False)
-        axes = np.array(axes).flatten()
 
-        for ax, (var, flag_var, label) in zip(axes, available):
-            x = ds[var].values.astype(float)
-            d = depth.astype(float)
-            flags = ds[flag_var].values.astype(int) if flag_var in ds.data_vars else np.ones_like(x, dtype=int)
+        fig = make_subplots(
+            rows=nrows, cols=ncols,
+            subplot_titles=[lbl for _, _, lbl in available],
+            shared_yaxes=False,
+            horizontal_spacing=0.14,
+            vertical_spacing=0.12,
+        )
 
-            mask = ~np.isnan(x) & ~np.isnan(d)
-            if mask.any():
-                flag_scatter(ax, x[mask], d[mask], flags[mask])
-            ax.invert_yaxis()
-            ax.set_xlabel(label, fontsize=9)
-            ax.set_ylabel('Depth (m)', fontsize=9)
-            ax.grid(True, alpha=0.3)
-
-        # Hide unused axes
-        for ax in axes[len(available):]:
-            ax.set_visible(False)
-
-        axes[0].legend(handles=qc_legend_elements(), fontsize=7, loc='lower right')
         try:
-            profile_time = epoch_to_dt(float(ds['profile_time'].values.flat[0]))
-            title_time = profile_time.strftime('%Y-%m-%d %H:%M UTC')
+            pt = epoch_to_dt(float(ds['profile_time'].values.flat[0]))
+            title_str = pt.strftime('%Y-%m-%d %H:%M UTC')
         except Exception:
-            title_time = fname
-        fig.suptitle(f'Profiles  |  {title_time}', fontsize=11, y=1.01)
-        plt.tight_layout()
+            title_str = fname
 
-        out_path = os.path.join(out_dir, 'profiles', fname + '_profiles.png')
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        plt.savefig(out_path, dpi=120, bbox_inches='tight')
-        plt.close()
+        legend_added = set()
+        for j, (var, flag_var, label) in enumerate(available):
+            row = j // ncols + 1
+            col = j % ncols + 1
 
-    print(f'    Saved to {os.path.join(out_dir, "profiles")}')
+            x = ds[var].values.astype(float)
+            flags = (
+                ds[flag_var].values.astype(int)
+                if flag_var in ds.data_vars
+                else np.ones_like(x, dtype=int)
+            )
+            mask = ~np.isnan(x) & ~np.isnan(depth)
+            if not mask.any():
+                continue
+
+            traces, legend_added = _flag_traces(
+                x[mask], depth[mask], flags[mask],
+                size=7, opacity=0.85,
+                legend_added=legend_added,
+                hover_x=f'{label}: %{{x:.3f}}',
+                hover_y='Depth: %{y:.1f} m',
+                use_gl=False,   # profiles are small, Scatter looks better
+            )
+            for tr in traces:
+                fig.add_trace(tr, row=row, col=col)
+
+            fig.update_xaxes(title_text=label, row=row, col=col, showgrid=True, gridcolor='#eee')
+            fig.update_yaxes(
+                title_text='Depth (m)',
+                autorange='reversed',
+                row=row, col=col,
+                showgrid=True, gridcolor='#eee',
+            )
+
+        fig.update_layout(
+            title=dict(text=f'<b>Profile — {title_str}</b>', font=dict(size=15)),
+            height=440 * nrows,
+            template='plotly_white',
+            legend=dict(
+                orientation='h', yanchor='bottom', y=1.02,
+                xanchor='left', x=0, font=dict(size=13),
+                itemsizing='constant',
+            ),
+            margin=dict(t=110, b=60, l=70, r=30),
+            plot_bgcolor='white',
+        )
+
+        out_path = os.path.join(out_dir, 'profiles', fname + '_profiles.html')
+        _save_html(fig, out_path)
+        saved += 1
+        print(f'  [{i+1}/{total}] saved: {fname}_profiles.html', flush=True)
+
+    skipped_msg = f', {skipped_shallow} skipped (shallow)' if skipped_shallow else ''
+    print(f'  Profiles done -{saved}/{total} saved{skipped_msg}', flush=True)
 
 
 # ── Plot 2: Deployment-wide time series ───────────────────────────────────────
 def plot_timeseries(all_datasets, out_dir):
-    """Time series of key variables across the full deployment, coloured by QC summary flag."""
-    print('  Building deployment time series...')
+    """Stacked interactive time series of all science variables, coloured by QC flag."""
+    total = len(all_datasets)
+    print(f'  Building deployment time series ({total} files)...', flush=True)
+    every = max(1, min(100, total // 10))
 
-    sci_pairs = [
-        ('temperature',          'temperature_qartod_summary_flag',          'Temperature (°C)'),
-        ('salinity',             'salinity_qartod_summary_flag',              'Salinity (PSU)'),
-        ('density',              'density_qartod_summary_flag',               'Density (kg m⁻³)'),
-        ('sci_water_pressure',   'sci_water_pressure_qartod_summary_flag',    'Pressure (bar)'),
-        ('oxygen_concentration', 'oxygen_concentration_qartod_summary_flag',  'O₂ Conc. (µmol L⁻¹)'),
-        ('oxygen_saturation',    'oxygen_saturation_qartod_summary_flag',     'O₂ Sat. (%)'),
-    ]
+    ts_data = {var: {'time': [], 'val': [], 'flag': []} for var, _, _ in SCI_PAIRS}
 
-    # Collect data
-    records = {k: {'time': [], 'val': [], 'flag': []} for _, k, _ in [(a, a, b) for a, _, b in sci_pairs]}
-    ts_data = {var: {'time': [], 'val': [], 'flag': []} for var, _, _ in sci_pairs}
-
-    for ds in all_datasets:
+    for i, ds in enumerate(all_datasets):
+        _progress(i, total, 'aggregating', every=every)
         try:
             t = epoch_to_dt(ds['time'].values.astype(float))
         except Exception:
             continue
-        for var, flag_var, _ in sci_pairs:
+        for var, flag_var, _ in SCI_PAIRS:
             if var not in ds.data_vars:
                 continue
             x = ds[var].values.astype(float)
-            flags = ds[flag_var].values.astype(int) if flag_var in ds.data_vars else np.ones_like(x, dtype=int)
+            flags = (
+                ds[flag_var].values.astype(int)
+                if flag_var in ds.data_vars
+                else np.ones_like(x, dtype=int)
+            )
             mask = ~np.isnan(x)
             if mask.any():
                 ts_data[var]['time'].extend(t[mask].tolist())
                 ts_data[var]['val'].extend(x[mask].tolist())
                 ts_data[var]['flag'].extend(flags[mask].tolist())
 
-    available = [(var, flag_var, label) for var, flag_var, label in sci_pairs
-                 if ts_data[var]['time']]
+    available = [(var, fv, lbl) for var, fv, lbl in SCI_PAIRS if ts_data[var]['time']]
     if not available:
-        print('    No data found for time series.')
+        print('  No data found for time series.', flush=True)
         return
 
-    fig, axes = plt.subplots(len(available), 1, figsize=(16, 3.5 * len(available)), sharex=True)
-    if len(available) == 1:
-        axes = [axes]
+    n = len(available)
+    print(f'  Rendering {n} panels...', flush=True)
 
-    for ax, (var, flag_var, label) in zip(axes, available):
+    fig = make_subplots(
+        rows=n, cols=1,
+        shared_xaxes=True,
+        subplot_titles=[lbl for _, _, lbl in available],
+        vertical_spacing=0.04,
+    )
+
+    legend_added = set()
+    for row, (var, _, label) in enumerate(available, 1):
         d = ts_data[var]
-        t_arr = np.array(d['time'])
-        v_arr = np.array(d['val'])
-        f_arr = np.array(d['flag'])
-        flag_scatter(ax, t_arr, v_arr, f_arr, size=3, alpha=0.6)
-        ax.set_ylabel(label, fontsize=9)
-        ax.grid(True, alpha=0.3)
+        t_arr  = np.array(d['time'])
+        v_arr  = np.array(d['val'])
+        f_arr  = np.array(d['flag'])
+        n_raw  = len(t_arr)
+        t_arr, v_arr, f_arr = _subsample(t_arr, v_arr, f_arr)
+        if len(t_arr) < n_raw:
+            print(f'  {var}: subsampled {n_raw:,} -> {len(t_arr):,} points', flush=True)
+        traces, legend_added = _flag_traces(
+            t_arr, v_arr, f_arr,
+            size=3, opacity=0.6,
+            legend_added=legend_added,
+            hover_x='Time: %{x}',
+            hover_y=f'{label}: %{{y:.3f}}',
+        )
+        for tr in traces:
+            fig.add_trace(tr, row=row, col=1)
+        fig.update_yaxes(title_text=label, row=row, col=1, showgrid=True, gridcolor='#eee')
 
-    axes[-1].set_xlabel('Time (UTC)', fontsize=9)
-    axes[0].legend(handles=qc_legend_elements(), fontsize=7, ncol=5, loc='upper right')
-    plt.suptitle('Deployment Time Series', fontsize=12)
-    plt.tight_layout()
+    fig.update_xaxes(title_text='Time (UTC)', row=n, col=1)
+    fig.update_layout(
+        title=dict(text='<b>Deployment Time Series</b>', font=dict(size=18)),
+        height=260 * n,
+        template='plotly_white',
+        legend=dict(
+            orientation='h', yanchor='bottom', y=1.01,
+            xanchor='left', x=0, font=dict(size=13),
+            itemsizing='constant',
+        ),
+        margin=dict(t=120, b=60, l=90, r=40),
+    )
+    _save_html(fig, os.path.join(out_dir, 'timeseries.html'))
 
-    out_path = os.path.join(out_dir, 'timeseries.png')
-    plt.savefig(out_path, dpi=120, bbox_inches='tight')
-    plt.close()
-    print(f'    Saved: {out_path}')
 
-
-# ── Plot 3: QC flag summary bar chart ─────────────────────────────────────────
+# ── Plot 3: QC flag summary ────────────────────────────────────────────────────
 def plot_qc_summary(all_datasets, out_dir):
-    """Bar chart: % GOOD / SUSPECT / FAIL / MISSING per QC variable across the deployment."""
-    print('  Building QC flag summary...')
+    """Stacked bar chart: % Good / Suspect / Fail / Not-Eval per QC variable."""
+    total = len(all_datasets)
+    print(f'  Building QC flag summary ({total} files)...', flush=True)
+    every = max(1, min(100, total // 10))
 
     qc_vars_order = [
         'temperature_qartod_gross_range_test',
@@ -240,9 +381,9 @@ def plot_qc_summary(all_datasets, out_dir):
         'oxygen_saturation_qartod_summary_flag',
     ]
 
-    # Accumulate counts
     counts = {}
-    for ds in all_datasets:
+    for i, ds in enumerate(all_datasets):
+        _progress(i, total, 'counting flags', every=every)
         for v in qc_vars_order:
             if v not in ds.data_vars:
                 continue
@@ -254,53 +395,75 @@ def plot_qc_summary(all_datasets, out_dir):
 
     present = [v for v in qc_vars_order if v in counts]
     if not present:
+        print('  No QC flag variables found.', flush=True)
         return
+    print(f'  Rendering {len(present)} QC variables...', flush=True)
 
-    # Build percentage arrays (exclude MISSING from the non-missing total)
-    labels = [v.replace('_qartod_', '\n').replace('_test', '').replace('_', ' ') for v in present]
-    n = len(present)
+    labels = [
+        v.replace('_qartod_', ' / ')
+         .replace('_test', '')
+         .replace('_', ' ')
+        for v in present
+    ]
+    totals_arr = [max(sum(counts[v].values()), 1) for v in present]
 
-    fig, ax = plt.subplots(figsize=(max(12, n * 0.45), 7))
-    x = np.arange(n)
-    width = 0.7
+    fig = go.Figure()
+    for flag in [1, 2, 3, 4]:
+        pct = [counts[v][flag] / totals_arr[i] * 100 for i, v in enumerate(present)]
+        raw = [counts[v][flag] for v in present]
+        fig.add_trace(go.Bar(
+            x=labels, y=pct,
+            name=FLAG_LABEL[flag],
+            marker_color=FLAG_COLOR[flag],
+            customdata=raw,
+            hovertemplate=(
+                '<b>%{x}</b><br>'
+                f'{FLAG_LABEL[flag]}: %{{y:.1f}}%  (%{{customdata:,}} obs)'
+                '<extra></extra>'
+            ),
+        ))
 
-    bottom = np.zeros(n)
-    for flag in [1, 2, 3, 4]:  # stack in order, skip MISSING
-        pct = np.array([counts[v][flag] / max(sum(counts[v].values()), 1) * 100 for v in present])
-        ax.bar(x, pct, width, bottom=bottom, color=FLAG_COLOR[flag], label=FLAG_LABEL[flag])
-        bottom += pct
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=60, ha='right', fontsize=7)
-    ax.set_ylabel('% of all observations', fontsize=10)
-    ax.set_title('QC Flag Distribution Across Deployment', fontsize=12)
-    ax.legend(loc='upper right', fontsize=9)
-    ax.set_ylim(0, 105)
-    ax.grid(axis='y', alpha=0.3)
-
-    plt.tight_layout()
-    out_path = os.path.join(out_dir, 'qc_flag_summary.png')
-    plt.savefig(out_path, dpi=120, bbox_inches='tight')
-    plt.close()
-    print(f'    Saved: {out_path}')
+    fig.update_layout(
+        barmode='stack',
+        title=dict(text='<b>QC Flag Distribution Across Deployment</b>', font=dict(size=18)),
+        xaxis=dict(tickangle=-45, tickfont=dict(size=10), title='QC Variable'),
+        yaxis=dict(title='% of all observations', range=[0, 105]),
+        legend=dict(
+            orientation='h', yanchor='bottom', y=1.02,
+            xanchor='left', x=0, font=dict(size=13),
+        ),
+        template='plotly_white',
+        height=620,
+        margin=dict(t=100, b=220, l=70, r=40),
+    )
+    _save_html(fig, os.path.join(out_dir, 'qc_flag_summary.html'))
 
 
 # ── Plot 4: T–S diagram ───────────────────────────────────────────────────────
 def plot_ts_diagram(all_datasets, out_dir):
-    """T–S diagram coloured by depth, with QC summary flag filter."""
-    print('  Building T-S diagram...')
+    """T–S scatter: depth-coloured (left) and QC-flag-coloured (right)."""
+    total = len(all_datasets)
+    print(f'  Building T-S diagram ({total} files)...', flush=True)
+    every = max(1, min(100, total // 10))
 
     temp_all, salt_all, depth_all, flag_all = [], [], [], []
 
-    for ds in all_datasets:
+    for i, ds in enumerate(all_datasets):
+        _progress(i, total, 'collecting T-S data', every=every)
         if 'temperature' not in ds.data_vars or 'salinity' not in ds.data_vars:
             continue
         t = ds['temperature'].values.astype(float)
         s = ds['salinity'].values.astype(float)
-        d = ds['depth'].values.astype(float) if 'depth' in ds.data_vars else np.full_like(t, np.nan)
-        flags = ds['temperature_qartod_summary_flag'].values.astype(int) \
-            if 'temperature_qartod_summary_flag' in ds.data_vars else np.ones_like(t, dtype=int)
-
+        d = (
+            ds['depth'].values.astype(float)
+            if 'depth' in ds.data_vars
+            else np.full_like(t, np.nan)
+        )
+        flags = (
+            ds['temperature_qartod_summary_flag'].values.astype(int)
+            if 'temperature_qartod_summary_flag' in ds.data_vars
+            else np.ones_like(t, dtype=int)
+        )
         mask = ~np.isnan(t) & ~np.isnan(s)
         temp_all.extend(t[mask].tolist())
         salt_all.extend(s[mask].tolist())
@@ -308,54 +471,85 @@ def plot_ts_diagram(all_datasets, out_dir):
         flag_all.extend(flags[mask].tolist())
 
     if not temp_all:
+        print('  No T-S data found.', flush=True)
         return
 
     T = np.array(temp_all)
     S = np.array(salt_all)
     D = np.array(depth_all)
     F = np.array(flag_all)
+    n_raw = len(T)
+    T, S, D, F = _subsample(T, S, D, F)
+    if len(T) < n_raw:
+        print(f'  T-S: subsampled {n_raw:,} -> {len(T):,} points', flush=True)
+    print(f'  Rendering T-S diagram ({len(T):,} points)...', flush=True)
 
-    # Plot only good + suspect
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=['Coloured by Depth', 'Coloured by QC Flag'],
+        horizontal_spacing=0.14,
+    )
 
     # Left: coloured by depth
-    sc = axes[0].scatter(S, T, c=D, cmap='viridis_r', s=2, alpha=0.5)
-    plt.colorbar(sc, ax=axes[0], label='Depth (m)')
-    axes[0].set_xlabel('Salinity (PSU)')
-    axes[0].set_ylabel('Temperature (°C)')
-    axes[0].set_title('T–S Diagram (coloured by depth)')
-    axes[0].grid(True, alpha=0.3)
+    fig.add_trace(go.Scattergl(
+        x=S, y=T,
+        mode='markers',
+        marker=dict(
+            color=D, colorscale='Viridis_r', size=2, opacity=0.5,
+            showscale=True,
+            colorbar=dict(title='Depth (m)', x=0.44, thickness=14),
+        ),
+        showlegend=False,
+        hovertemplate='S: %{x:.3f} PSU<br>T: %{y:.3f} °C<br>Depth: %{marker.color:.1f} m<extra></extra>',
+    ), row=1, col=1)
 
     # Right: coloured by QC flag
-    flag_scatter(axes[1], S, T, F, size=2, alpha=0.5)
-    axes[1].set_xlabel('Salinity (PSU)')
-    axes[1].set_ylabel('Temperature (°C)')
-    axes[1].set_title('T–S Diagram (coloured by QC flag)')
-    axes[1].legend(handles=qc_legend_elements(), fontsize=8)
-    axes[1].grid(True, alpha=0.3)
+    legend_added = set()
+    for f in FLAG_VALUES:
+        mask = F == f
+        if not mask.any():
+            continue
+        fig.add_trace(go.Scattergl(
+            x=S[mask], y=T[mask],
+            mode='markers',
+            marker=dict(color=FLAG_COLOR[f], size=2, opacity=0.5),
+            name=FLAG_LABEL[f],
+            legendgroup=f'flag_{f}',
+            showlegend=True,
+            hovertemplate=f'S: %{{x:.3f}} PSU<br>T: %{{y:.3f}} °C<br><b>{FLAG_LABEL[f]}</b><extra></extra>',
+        ), row=1, col=2)
 
-    plt.suptitle('T–S Diagram — Full Deployment', fontsize=12)
-    plt.tight_layout()
-    out_path = os.path.join(out_dir, 'ts_diagram.png')
-    plt.savefig(out_path, dpi=120, bbox_inches='tight')
-    plt.close()
-    print(f'    Saved: {out_path}')
+    fig.update_xaxes(title_text='Salinity (PSU)', showgrid=True, gridcolor='#eee')
+    fig.update_yaxes(title_text='Temperature (°C)', showgrid=True, gridcolor='#eee')
+    fig.update_layout(
+        title=dict(text='<b>T–S Diagram — Full Deployment</b>', font=dict(size=18)),
+        height=600,
+        template='plotly_white',
+        legend=dict(font=dict(size=13), itemsizing='constant'),
+        margin=dict(t=80, b=60, l=80, r=40),
+    )
+    _save_html(fig, os.path.join(out_dir, 'ts_diagram.html'))
 
 
-# ── Plot 5: Section (depth-time) plots ────────────────────────────────────────
+# ── Plot 5: Depth–time section plots ──────────────────────────────────────────
 def plot_sections(all_datasets, out_dir):
-    """Depth–time section plots for T, S, O2."""
-    print('  Building section plots...')
+    """Depth–time sections for T, S, O2: good-data coloured by value + all data by QC flag."""
+    total = len(all_datasets)
+    print(f'  Building section plots ({total} files)...', flush=True)
+    every = max(1, min(100, total // 10))
 
     section_vars = [
-        ('temperature',          'temperature_qartod_summary_flag',         'Temperature (°C)',      'RdYlBu_r'),
-        ('salinity',             'salinity_qartod_summary_flag',             'Salinity (PSU)',         'viridis'),
-        ('oxygen_concentration', 'oxygen_concentration_qartod_summary_flag', 'O₂ Conc. (µmol L⁻¹)',  'plasma'),
+        ('temperature',          'temperature_qartod_summary_flag',          'Temperature (°C)',   'RdYlBu', True),
+        ('salinity',             'salinity_qartod_summary_flag',             'Salinity (PSU)',      'Viridis', False),
+        ('oxygen_concentration', 'oxygen_concentration_qartod_summary_flag', 'O₂ Conc. (µmol/L)', 'Plasma',  False),
     ]
 
-    for var, flag_var, label, cmap in section_vars:
+    for var, flag_var, label, colorscale, reversescale in section_vars:
+        print(f'  Collecting data for {label}...', flush=True)
         time_all, depth_all, val_all, flag_all = [], [], [], []
-        for ds in all_datasets:
+
+        for i, ds in enumerate(all_datasets):
+            _progress(i, total, var, every=every)
             if var not in ds.data_vars:
                 continue
             try:
@@ -363,8 +557,16 @@ def plot_sections(all_datasets, out_dir):
             except Exception:
                 continue
             v = ds[var].values.astype(float)
-            d = ds['depth'].values.astype(float) if 'depth' in ds.data_vars else np.full_like(v, np.nan)
-            flags = ds[flag_var].values.astype(int) if flag_var in ds.data_vars else np.ones_like(v, dtype=int)
+            d = (
+                ds['depth'].values.astype(float)
+                if 'depth' in ds.data_vars
+                else np.full_like(v, np.nan)
+            )
+            flags = (
+                ds[flag_var].values.astype(int)
+                if flag_var in ds.data_vars
+                else np.ones_like(v, dtype=int)
+            )
             mask = ~np.isnan(v) & ~np.isnan(d)
             time_all.extend(t[mask].tolist())
             depth_all.extend(d[mask].tolist())
@@ -372,48 +574,93 @@ def plot_sections(all_datasets, out_dir):
             flag_all.extend(flags[mask].tolist())
 
         if not time_all:
+            print(f'  No data for {label} - skipping.', flush=True)
             continue
 
         T_arr = np.array(time_all)
         D_arr = np.array(depth_all)
         V_arr = np.array(val_all)
         F_arr = np.array(flag_all)
+        n_raw = len(V_arr)
+        T_arr, D_arr, V_arr, F_arr = _subsample(T_arr, D_arr, V_arr, F_arr)
+        if len(V_arr) < n_raw:
+            print(f'  {label}: subsampled {n_raw:,} -> {len(V_arr):,} points', flush=True)
+        print(f'  Rendering section for {label} ({len(V_arr):,} points)...', flush=True)
 
-        # Show only GOOD data on the section
         good = F_arr == 1
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=[
+                f'{label} — Good data coloured by value',
+                f'{label} — All data coloured by QC flag',
+            ],
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+        )
 
-        fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
-
-        # Top: section scatter (good data only, coloured by value)
+        # Top panel: good data, coloured by measured value
         if good.any():
-            sc = axes[0].scatter(T_arr[good], D_arr[good], c=V_arr[good],
-                                 cmap=cmap, s=2, alpha=0.7)
-            plt.colorbar(sc, ax=axes[0], label=label)
-        axes[0].invert_yaxis()
-        axes[0].set_ylabel('Depth (m)')
-        axes[0].set_title(f'{label} — Good data only')
-        axes[0].grid(True, alpha=0.3)
+            fig.add_trace(go.Scattergl(
+                x=T_arr[good], y=D_arr[good],
+                mode='markers',
+                marker=dict(
+                    color=V_arr[good],
+                    colorscale=colorscale,
+                    reversescale=reversescale,
+                    size=2, opacity=0.7,
+                    showscale=True,
+                    colorbar=dict(title=label, y=0.76, len=0.44, thickness=14),
+                ),
+                showlegend=False,
+                hovertemplate=(
+                    'Time: %{x}<br>Depth: %{y:.1f} m'
+                    f'<br>{label}: %{{marker.color:.3f}}<extra></extra>'
+                ),
+            ), row=1, col=1)
 
-        # Bottom: section coloured by QC flag
-        flag_scatter(axes[1], T_arr, D_arr, F_arr, size=2, alpha=0.6)
-        axes[1].invert_yaxis()
-        axes[1].set_ylabel('Depth (m)')
-        axes[1].set_xlabel('Time (UTC)')
-        axes[1].set_title(f'{label} — QC flags')
-        axes[1].legend(handles=qc_legend_elements(), fontsize=8, loc='lower right')
-        axes[1].grid(True, alpha=0.3)
+        # Bottom panel: all data, coloured by QC flag
+        legend_added = set()
+        for f in FLAG_VALUES:
+            mask = F_arr == f
+            if not mask.any():
+                continue
+            show = f not in legend_added
+            if show:
+                legend_added.add(f)
+            fig.add_trace(go.Scattergl(
+                x=T_arr[mask], y=D_arr[mask],
+                mode='markers',
+                marker=dict(color=FLAG_COLOR[f], size=2, opacity=0.6),
+                name=FLAG_LABEL[f],
+                legendgroup=f'flag_{f}',
+                showlegend=show,
+                hovertemplate=(
+                    f'Time: %{{x}}<br>Depth: %{{y:.1f}} m'
+                    f'<br><b>{FLAG_LABEL[f]}</b><extra></extra>'
+                ),
+            ), row=2, col=1)
 
-        plt.suptitle(f'Depth–Time Section: {label}', fontsize=12)
-        plt.tight_layout()
-        out_path = os.path.join(out_dir, f'section_{var}.png')
-        plt.savefig(out_path, dpi=120, bbox_inches='tight')
-        plt.close()
-        print(f'    Saved: {out_path}')
+        fig.update_yaxes(title_text='Depth (m)', autorange='reversed',
+                         showgrid=True, gridcolor='#eee', row=1, col=1)
+        fig.update_yaxes(title_text='Depth (m)', autorange='reversed',
+                         showgrid=True, gridcolor='#eee', row=2, col=1)
+        fig.update_xaxes(title_text='Time (UTC)', row=2, col=1)
+        fig.update_layout(
+            title=dict(text=f'<b>Depth–Time Section: {label}</b>', font=dict(size=18)),
+            height=900,
+            template='plotly_white',
+            legend=dict(
+                orientation='h', yanchor='bottom', y=1.01,
+                xanchor='left', x=0, font=dict(size=13),
+                itemsizing='constant',
+            ),
+            margin=dict(t=100, b=60, l=80, r=40),
+        )
+        _save_html(fig, os.path.join(out_dir, f'section_{var}.html'))
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def _in_jupyter():
-    """Return True when running inside a Jupyter kernel."""
     try:
         from IPython import get_ipython
         return get_ipython() is not None
@@ -427,6 +674,7 @@ def main(
     level='sci',
     data_home=None,
     nprofiles=20,
+    min_depth=10,
     plots=None,
 ):
     """
@@ -434,119 +682,132 @@ def main(
 
         from plot_qc_data import main
         main(deployment='uvi_01-20250318T2008')
-
-    Or set the DEPLOYMENT variable below and run the cell.
     """
     if plots is None:
         plots = ['all']
 
-    # ── Jupyter / interactive mode ────────────────────────────────────────────
     if _in_jupyter() or deployment is not None:
-        # When called programmatically, 'deployment' is passed as a kwarg.
-        # If still None here the caller forgot to set it.
         if deployment is None:
             raise ValueError(
                 "Please pass a deployment name, e.g.:\n"
                 "  main(deployment='uvi_01-20250318T2008')"
             )
     else:
-        # ── Command-line mode ─────────────────────────────────────────────────
         parser = argparse.ArgumentParser(description="Plot QARTOD QC'd glider data")
         parser.add_argument('deployment', help='Deployment name, e.g. uvi_01-20250318T2008')
-        parser.add_argument('--mode', default='delayed', choices=['rt', 'delayed'])
-        parser.add_argument('--level', default='sci', choices=['sci', 'ngdac'])
-        parser.add_argument('--data_home', default=None,
-                            help='Path to GLIDER_DATA_HOME (default: directory of this script)')
-        parser.add_argument('--nprofiles', type=int, default=20,
-                            help='Number of profiles to sample for individual profile plots')
+        parser.add_argument('--mode',     default='delayed', choices=['rt', 'delayed'])
+        parser.add_argument('--level',    default='sci',     choices=['sci', 'ngdac'])
+        parser.add_argument('--data_home', default=None)
+        parser.add_argument('--nprofiles', type=int, default=20)
+        parser.add_argument('--min_depth', type=float, default=10,
+                            help='Skip profiles shallower than this depth in metres (default: 10)')
         parser.add_argument('--plots', nargs='+',
                             choices=['profiles', 'timeseries', 'qc_summary', 'ts', 'sections', 'all'],
-                            default=['all'],
-                            help='Which plots to generate')
-        args = parser.parse_args()
+                            default=['all'])
+        args       = parser.parse_args()
         deployment = args.deployment
         mode       = args.mode
         level      = args.level
         data_home  = args.data_home
         nprofiles  = args.nprofiles
+        min_depth  = args.min_depth
         plots      = args.plots
 
-    # Resolve paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_home = data_home or script_dir
+    data_home  = data_home or script_dir
 
-    year = deployment.split('-')[1][:4]
+    year     = deployment.split('-')[1][:4]
     data_dir = os.path.join(data_home, 'deployments', year, deployment,
-                            'data', 'out', 'nc',
-                            f'{level}-profile', mode)
-    out_dir = os.path.join(data_home, 'deployments', year, deployment, 'figs')
+                            'data', 'out', 'nc', f'{level}-profile', mode)
+    out_dir  = os.path.join(data_home, 'deployments', year, deployment, 'figs')
+
+    # Clear existing plots so reruns don't accumulate stale files
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     if not os.path.isdir(data_dir):
-        print(f'ERROR: data directory not found:\n  {data_dir}')
+        print(f'ERROR: data directory not found:\n  {data_dir}', flush=True)
         return 1
 
-    nc_files = sorted(glob.glob(os.path.join(data_dir, '*.nc')))
-    # exclude any qc_queue subdirectory files
-    nc_files = [f for f in nc_files if 'qc_queue' not in f]
-    print(f'Found {len(nc_files)} NC files in {data_dir}')
-
+    nc_files = [f for f in sorted(glob.glob(os.path.join(data_dir, '*.nc')))
+                if 'qc_queue' not in f]
+    print(f'Found {len(nc_files)} NC files in {data_dir}', flush=True)
     if not nc_files:
-        print('No files found.')
+        print('No files found.', flush=True)
         return 1
 
-    do_all = 'all' in plots
+    do_all    = 'all' in plots
+    run_start = time.time()
+    step      = 0
 
-    # Load profile sample for profile plots
+    # ── Profile plots ─────────────────────────────────────────────────────────
     if do_all or 'profiles' in plots:
-        print(f'\nLoading {nprofiles} profile samples...')
+        step += 1
+        t0 = _step(f'Step {step}: loading {nprofiles} profile samples')
         profile_ds, _ = load_deployment(data_dir, max_files=nprofiles)
-        plot_profiles(profile_ds, out_dir, nprofiles=nprofiles)
+        _done(t0, f'{len(profile_ds)} files loaded')
+
+        t0 = _step(f'Step {step}: individual profile plots')
+        plot_profiles(profile_ds, out_dir, nprofiles=nprofiles, min_depth=min_depth)
+        _done(t0)
         for ds in profile_ds:
             ds.close()
 
-    # Load all files for deployment-wide plots
-    print(f'\nLoading all {len(nc_files)} files for deployment-wide plots...')
+    # ── Load all files for deployment-wide plots ───────────────────────────────
+    step += 1
+    t0 = _step(f'Step {step}: loading all {len(nc_files)} files')
     all_ds, _ = load_deployment(data_dir)
+    _done(t0, f'{len(all_ds)} files loaded')
 
     if do_all or 'timeseries' in plots:
-        print()
+        step += 1
+        t0 = _step(f'Step {step}: time series plot')
         plot_timeseries(all_ds, out_dir)
+        _done(t0)
 
     if do_all or 'qc_summary' in plots:
-        print()
+        step += 1
+        t0 = _step(f'Step {step}: QC flag summary plot')
         plot_qc_summary(all_ds, out_dir)
+        _done(t0)
 
     if do_all or 'ts' in plots:
-        print()
+        step += 1
+        t0 = _step(f'Step {step}: T-S diagram')
         plot_ts_diagram(all_ds, out_dir)
+        _done(t0)
 
     if do_all or 'sections' in plots:
-        print()
+        step += 1
+        t0 = _step(f'Step {step}: depth-time section plots')
         plot_sections(all_ds, out_dir)
+        _done(t0)
 
     for ds in all_ds:
         ds.close()
 
-    print(f'\nAll plots saved to: {out_dir}')
+    total_elapsed = time.time() - run_start
+    print(f'\n{"="*60}', flush=True)
+    print(f'  All plots saved to: {out_dir}', flush=True)
+    print(f'  Total time: {total_elapsed:.1f}s', flush=True)
+    print(f'{"="*60}', flush=True)
     return 0
 
 
 # ── CONFIGURATION — edit this block when running in VS Code or Jupyter ────────
-DEPLOYMENT = 'uvi_01-20250318T2008'   # deployment name
-MODE       = 'delayed'                 # 'rt' or 'delayed'
-LEVEL      = 'sci'                     # 'sci' or 'ngdac'
-DATA_HOME  = None                      # None = folder containing this script
-NPROFILES  = 20                        # number of individual profile plots
-PLOTS      = ['all']                   # ['all'] or any combo of:
-                                       #   'profiles', 'timeseries', 'qc_summary', 'ts', 'sections'
+DEPLOYMENT = 'uvi_01-20250318T2008'
+MODE       = 'delayed'
+LEVEL      = 'sci'
+DATA_HOME  = None
+NPROFILES  = 20
+MIN_DEPTH  = 10      # metres — profiles shallower than this are skipped (removes checkout dives)
+PLOTS      = ['all']
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     if _in_jupyter():
-        # VS Code interactive window / Jupyter notebook — use config block above
         main(deployment=DEPLOYMENT, mode=MODE, level=LEVEL,
-             data_home=DATA_HOME, nprofiles=NPROFILES, plots=PLOTS)
+             data_home=DATA_HOME, nprofiles=NPROFILES, min_depth=MIN_DEPTH, plots=PLOTS)
     else:
-        # Normal command-line run
         exit(main())

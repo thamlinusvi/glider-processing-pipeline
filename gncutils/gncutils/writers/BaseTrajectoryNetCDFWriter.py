@@ -960,7 +960,7 @@ class BaseTrajectoryNetCDFWriter(object):
         self._logger.debug('Loading deployment sensor definitions: {:s}'.format(self._sensor_defs_config_path))
 
         try:
-            with open(self._sensor_defs_config_path, 'r') as fid:
+            with open(self._sensor_defs_config_path, 'r', encoding='utf-8-sig') as fid:
                 self._config_sensor_defs = json.load(fid)
         except ValueError as e:
             self._logger.error('Error parsing deployment-specific sensor definitions: {:s} ({:})'.format(
@@ -1061,7 +1061,7 @@ class BaseTrajectoryNetCDFWriter(object):
 
         self._logger.debug('Loading deployment configuration: {:s}'.format(self._deployment_config_path))
         try:
-            with open(self._deployment_config_path, 'r') as fid:
+            with open(self._deployment_config_path, 'r', encoding='utf-8-sig') as fid:
                 deployment_configs = json.load(fid)
         except ValueError as e:
             self._logger.error('Error loading {:s}: {:}'.format(self._deployment_config_path, e))
@@ -1069,7 +1069,7 @@ class BaseTrajectoryNetCDFWriter(object):
 
         self._logger.debug('Loading global attributes: {:s}'.format(self._global_attributes_path))
         try:
-            with open(self._global_attributes_path, 'r') as fid:
+            with open(self._global_attributes_path, 'r', encoding='utf-8-sig') as fid:
                 global_atts = json.load(fid)
 
         except ValueError as e:
@@ -1078,7 +1078,7 @@ class BaseTrajectoryNetCDFWriter(object):
 
         self._logger.debug('Loading instrument configurations: {:s}'.format(self._instruments_config_path))
         try:
-            with open(self._instruments_config_path, 'r') as fid:
+            with open(self._instruments_config_path, 'r', encoding='utf-8-sig') as fid:
                 instrument_configs = json.load(fid)
         except ValueError as e:
             self._logger.error('Error loading {:s}: {:}'.format(self._instruments_config_path, e))

@@ -10,7 +10,9 @@ const state = {
   stages:     [],
   depStates:  {},          // cache: dep → pipeline_state.json contents
 }
-const activeRuns = {}      // stageKey → AbortController
+const activeRuns  = {}     // stageKey → AbortController
+const stageLogs   = {}     // stageKey → string[]  (persists across re-renders)
+const stageEls    = {}     // stageKey → { log, badge, btnRun, btnAbort }  (live DOM refs)
 
 /* ── API helpers ─────────────────────────────────────────────────────────────*/
 async function apiFetch (url, opts = {}) {
@@ -43,14 +45,16 @@ async function setStageStatus (dep, stage, status) {
 }
 
 /* ── Streaming stage run ─────────────────────────────────────────────────────*/
-async function streamRun (dep, stage, onLog, onDone) {
+async function streamRun (dep, stage, onLog, onDone, opts = {}) {
   const controller = new AbortController()
   activeRuns[stage] = controller
 
   try {
     const resp = await fetch(`${API}/api/deployment/${encodeURIComponent(dep)}/run/${stage}`, {
-      method: 'POST',
-      signal: controller.signal,
+      method:  'POST',
+      headers: Object.keys(opts).length ? { 'Content-Type': 'application/json' } : {},
+      body:    Object.keys(opts).length ? JSON.stringify(opts) : undefined,
+      signal:  controller.signal,
     })
 
     const reader  = resp.body.getReader()
@@ -120,23 +124,18 @@ function showNewDepModal () {
   const deps    = Array.from(document.getElementById('dep-select').options).map(o => o.value).filter(Boolean)
   const gliders = [...new Set(deps.map(d => d.split('-')[0]))].filter(Boolean)
 
-  const now     = new Date()
-  const dateStr = now.toISOString().slice(0, 10)
-  const timeStr = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0')
+  // Free-text deployment name field — user types the full name directly.
+  // Datalist suggests known glider prefixes as a starting point.
+  const nameInput   = h('input', { class: 'form-input', type: 'text', id: 'nd-name',
+    placeholder: gliders.length ? gliders[0] + '-' : 'e.g. uvi_01-20250318T2008',
+    list: 'nd-name-hints',
+    oninput: () => { _ndUpdateFolders(); _ndAutoTemplate() } })
+  const nameHints   = h('datalist', { id: 'nd-name-hints' },
+    ...gliders.map(g => h('option', { value: g + '-' })))
+  const nameHint    = h('div', { class: 'nd-name-hint' }, 'Format: glider-YYYYMMDDThhmm')
 
-  const gliderInput = h('input', { class: 'form-input', type: 'text', id: 'nd-glider',
-    placeholder: gliders[0] || 'uvi_01', value: gliders[0] || '', list: 'nd-glider-list',
-    oninput: () => { _ndUpdatePreview(); _ndAutoTemplate() } })
-  const gliderList  = h('datalist', { id: 'nd-glider-list' },
-    ...gliders.map(g => h('option', { value: g })))
-  const dateInput   = h('input', { class: 'form-input', type: 'date',  id: 'nd-date',
-    value: dateStr, oninput: _ndUpdatePreview })
-  const timeInput   = h('input', { class: 'form-input', type: 'time',  id: 'nd-time',
-    value: timeStr, oninput: _ndUpdatePreview })
-  const preview     = h('div',    { class: 'dep-name-preview', id: 'nd-preview' }, '—')
-  // Build template dropdown grouped by glider
+  // Template dropdown — grouped, auto-selects most recent same-glider dep
   const templateSel = _buildTemplateSelect(deps, gliders[0] || '')
-  // Auto-select most recent same-glider deployment as default
   {
     const g = gliders[0] || ''
     const sameGlider = deps.filter(d => d.startsWith(g + '-')).sort()
@@ -157,12 +156,8 @@ function showNewDepModal () {
         h('button', { class: 'modal-close', onclick: closeModal }, '×')),
       h('div', { class: 'modal-body', id: 'nd-modal-body' },
         h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Glider'), gliderInput, gliderList),
-        h('div', { class: 'form-row' },
-          h('div', { class: 'form-group' }, h('label', { class: 'form-label' }, 'Date'), dateInput),
-          h('div', { class: 'form-group' }, h('label', { class: 'form-label' }, 'Time (UTC)'), timeInput)),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Deployment name'), preview),
+          h('label', { class: 'form-label' }, 'Deployment name'),
+          nameInput, nameHints, nameHint),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Copy config from'), templateSel),
         h('div', { class: 'form-group' },
@@ -173,8 +168,7 @@ function showNewDepModal () {
         createBtn)))
 
   document.body.appendChild(overlay)
-  _ndUpdatePreview()
-  gliderInput.focus()
+  nameInput.focus()
 }
 
 function _buildTemplateSelect (deps, currentGlider) {
@@ -201,42 +195,38 @@ function _buildTemplateSelect (deps, currentGlider) {
 }
 
 function _ndAutoTemplate () {
-  const glider = (document.getElementById('nd-glider').value || '').trim()
+  // Extract glider from whatever the user has typed so far
+  const name   = _ndDepName()
+  const glider = name.includes('-') ? name.split('-')[0] : name
   const sel    = document.getElementById('nd-template')
   if (!sel) return
 
-  // Rebuild grouped options for new glider
-  const deps = Array.from(document.getElementById('dep-select').options).map(o => o.value).filter(Boolean)
+  const deps   = Array.from(document.getElementById('dep-select').options).map(o => o.value).filter(Boolean)
   const newSel = _buildTemplateSelect(deps, glider)
-  sel.innerHTML = newSel.innerHTML  // swap options in place
+  sel.innerHTML = newSel.innerHTML
 
-  // Auto-select most recent same-glider dep
   const sameGlider = deps.filter(d => glider && d.startsWith(glider + '-')).sort()
   if (sameGlider.length) sel.value = sameGlider[sameGlider.length - 1]
   else if (deps.length)  sel.value = deps[deps.length - 1]
 }
 
 function _ndDepName () {
-  const glider = (document.getElementById('nd-glider').value || '').trim()
-  const date   = document.getElementById('nd-date').value   // YYYY-MM-DD
-  const time   = document.getElementById('nd-time').value   // HH:MM
-  if (!glider || !date || !time) return ''
-  return `${glider}-${date.replace(/-/g, '')}T${time.replace(':', '')}`
+  return (document.getElementById('nd-name')?.value || '').trim()
 }
 
-function _ndUpdatePreview () {
+function _ndUpdateFolders () {
   const name    = _ndDepName()
-  const preview = document.getElementById('nd-preview')
   const folders = document.getElementById('nd-folders')
-  if (!name) { preview.textContent = '—'; folders.textContent = '—'; return }
+  if (!folders) return
+  if (!name) { folders.textContent = '—'; return }
   const glider = name.split('-')[0]
-  preview.textContent = name
   folders.textContent = [
     `incoming_data/${name}/`,
     `dat_files/${name}/merged_data/`,
     `dat_files/${name}/flight_data/`,
     `glider_config_files_json/${glider}/${name}/science_profile/`,
     `glider_config_files_json/${glider}/${name}/science_trajectory/`,
+    `glider_config_files_json/${glider}/${name}/trajectory_flight/`,
   ].join('\n')
 }
 
@@ -410,7 +400,7 @@ async function renderDashboard () {
   page.appendChild(header)
   page.appendChild(body)
 
-  const deps = Array.from(document.getElementById('dep-select').options).map(o => o.value)
+  const deps = Array.from(document.getElementById('dep-select').options).map(o => o.value).filter(v => v)
   if (!deps.length) { body.appendChild(h('div', { class: 'empty-state' }, 'No deployments found.')); return }
 
   const allStates = await Promise.all(deps.map(d => loadDepState(d)))
@@ -465,10 +455,13 @@ async function renderDashboard () {
 
 function shortLabel (stageKey) {
   const map = {
-    dbd_to_dat:           'DBD→DAT',
+    dbd_to_dat:           'DBD→DAT (Sci)',
+    dbd_to_dat_flight:    'DBD→DAT (Flt)',
     dat_to_profile_nc:    'Profile NC',
-    dat_to_trajectory_nc: 'Traj NC',
+    dat_to_trajectory_nc:        'Traj NC (Sci)',
+    dat_to_trajectory_flight_nc: 'Traj NC (Flt)',
     fix_metadata:         'Fix Meta',
+    preflight:            'Pre-flight',
     qc:                   'QC',
     report:               'Report',
   }
@@ -478,6 +471,7 @@ function shortLabel (stageKey) {
 function openDeployment (dep) {
   document.getElementById('dep-select').value = dep
   state.deployment = dep
+  localStorage.setItem('lastDeployment', dep)
   navigate('pipeline')
 }
 
@@ -537,11 +531,153 @@ function buildStageCard (sk, info, initialStatus, dep) {
     // ── Automated stage ──────────────────────────────
     const log = h('div', { class: 'log-pane hidden' })
 
-    const btnRun   = h('button', { class: 'btn-success', onclick: () => doRun(dep, sk, badge, btnRun, btnAbort, log) }, '▶  Run Stage')
+    // ── Stage 5 (report) — user-configurable options ─────────────────────────
+    let stageOpts = null
+    let configRow = null
+    if (sk === 'report') {
+      const inputMinDepth = h('input', {
+        type: 'number', value: '10', min: '0', max: '1000', step: '1',
+        class: 'stage-config-input', title: 'Minimum profile depth (m)',
+      })
+      const inputNProfiles = h('input', {
+        type: 'number', value: '20', min: '1', max: '200', step: '1',
+        class: 'stage-config-input', title: 'Number of profiles to plot',
+      })
+      configRow = h('div', { class: 'stage-config-row' },
+        h('label', { class: 'stage-config-label' }, 'Min depth (m):'),
+        inputMinDepth,
+        h('label', { class: 'stage-config-label stage-config-label--gap' }, 'Profile count:'),
+        inputNProfiles,
+        h('span', { class: 'stage-config-hint' },
+          'Profiles shallower than min depth are skipped (removes checkout dives).'
+        ),
+      )
+      stageOpts = () => ({
+        min_depth: parseFloat(inputMinDepth.value) || 10,
+        nprofiles: parseInt(inputNProfiles.value,  10) || 20,
+      })
+    }
+
+    const btnRun   = h('button', { class: 'btn-success', onclick: () => doRun(dep, sk, badge, btnRun, btnAbort, log, stageOpts ? stageOpts() : {}) }, '▶  Run Stage')
     const btnAbort = h('button', { class: 'btn-danger hidden', onclick: () => doAbort(dep, sk, badge, btnRun, btnAbort) }, '■  Abort')
-    const btnClear = h('button', { class: 'btn-secondary', onclick: () => { log.innerHTML = ''; log.classList.add('hidden') } }, 'Clear log')
+    const btnClear = h('button', { class: 'btn-secondary', onclick: () => { log.innerHTML = ''; log.classList.add('hidden'); stageLogs[sk] = [] } }, 'Clear log')
     const btnRow   = h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear)
 
+    // Restore state if this stage is currently running or has prior log output
+    if (activeRuns[sk]) {
+      // This page session started the run — reconnect live DOM refs and replay log
+      stageEls[sk] = { log, badge, btnRun, btnAbort }
+      ;(stageLogs[sk] || []).forEach(line => appendLog(log, line))
+      log.classList.remove('hidden')
+      btnRun.classList.add('hidden')
+      btnAbort.classList.remove('hidden')
+      badge.className   = 'status-badge running'
+      badge.textContent = 'RUNNING…'
+    } else if (initialStatus === 'running') {
+      // Run started before this page session (e.g. after a page refresh / server restart).
+      // Hide Run, show Abort, offer a Reconnect button.
+      btnRun.classList.add('hidden')
+      btnAbort.classList.remove('hidden')
+      badge.className   = 'status-badge running'
+      badge.textContent = 'RUNNING…'
+
+      const note = h('div', { class: 'stage-running-note' })
+
+      function showReconnectBtn () {
+        note.innerHTML = ''
+        const btn = h('button', { class: 'btn-secondary', style: 'margin-left:8px',
+          onclick: attemptReconnect }, '⟳  Reconnect to logs')
+        note.appendChild(document.createTextNode('⏳ Stage is running in the background.'))
+        note.appendChild(btn)
+      }
+
+      function applyFinishedState (st) {
+        note.remove()
+        log.classList.remove('hidden')
+        btnRun.classList.remove('hidden')
+        btnAbort.classList.add('hidden')
+        badge.className   = `status-badge ${statusClass(st)}`
+        badge.textContent = statusLabel(st)
+        btnRun.textContent = '↺  Re-run Stage'
+        delete stageEls[sk]
+        delete activeRuns[sk]
+      }
+
+      async function attemptReconnect () {
+        note.innerHTML = '⏳ Connecting…'
+        const controller = new AbortController()
+        activeRuns[sk] = controller
+        stageEls[sk]   = { log, badge, btnRun, btnAbort }
+        stageLogs[sk]  = []
+
+        try {
+          const resp = await fetch(
+            `${API}/api/deployment/${encodeURIComponent(dep)}/stage-logs/${sk}`,
+            { signal: controller.signal })
+
+          if (!resp.ok) {
+            // Container not found — check real state from server
+            delete activeRuns[sk]; delete stageEls[sk]
+            try {
+              const ds = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/state`)
+              const st = (ds.state?.[sk] || {}).status || 'not_run'
+              if (st === 'running') {
+                // Still running but container name mismatch — let user try again
+                showReconnectBtn()
+              } else {
+                applyFinishedState(st)
+              }
+            } catch { showReconnectBtn() }
+            return
+          }
+
+          // Successfully connected — show log pane, hide note
+          note.remove()
+          log.classList.remove('hidden')
+
+          const reader = resp.body.getReader(), decoder = new TextDecoder()
+          let buffer = ''
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n'); buffer = lines.pop()
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue
+              try {
+                const evt = JSON.parse(line.slice(6))
+                if (evt.type === 'log') {
+                  stageLogs[sk].push(evt.line)
+                  const el = stageEls[sk]; if (el) appendLog(el.log, evt.line)
+                } else if (evt.type === 'done' || evt.type === 'error') {
+                  const success = evt.type === 'done' && evt.success
+                  const finalLine = success ? '✔ Finished successfully.' : '✖ Finished with errors.'
+                  stageLogs[sk].push(finalLine)
+                  const el = stageEls[sk]
+                  if (el) appendLog(el.log, finalLine)
+                  applyFinishedState(success ? 'done' : 'failed')
+                  break
+                }
+              } catch {}
+            }
+          }
+        } catch (e) {
+          if (e.name !== 'AbortError') { appendLog(log, 'Stream error: ' + e.message); log.classList.remove('hidden') }
+          delete activeRuns[sk]; delete stageEls[sk]
+          showReconnectBtn()
+        }
+      }
+
+      showReconnectBtn()
+      bodyEl.appendChild(note)
+    } else if (stageLogs[sk]?.length) {
+      // Stage finished — show last log output
+      ;(stageLogs[sk]).forEach(line => appendLog(log, line))
+      log.classList.remove('hidden')
+      btnRun.textContent = '↺  Re-run Stage'
+    }
+
+    if (configRow) bodyEl.appendChild(configRow)
     bodyEl.appendChild(btnRow)
     bodyEl.appendChild(log)
   }
@@ -554,10 +690,13 @@ function getStagePaths (sk, dep) {
   const y = dep ? dep.split('-')[1].slice(0, 4) : ''
   const g = dep ? dep.split('-')[0] : ''
   const paths = {
-    dbd_to_dat:           { source: `${b}\\incoming_data\\${dep}`,                           output: `${b}\\dat_files\\${dep}\\merged_data` },
+    dbd_to_dat:           { source: `${b}\\incoming_data\\${dep}`,  output: `${b}\\dat_files\\${dep}\\merged_data` },
+    dbd_to_dat_flight:    { source: `${b}\\incoming_data\\${dep}`,  output: `${b}\\dat_files\\${dep}\\flight_data` },
     dat_to_profile_nc:    { source: `${b}\\dat_files\\${dep}\\merged_data`,                  output: `${b}\\gncutils_slocum_nc_output\\${dep}\\profile` },
-    dat_to_trajectory_nc: { source: `${b}\\dat_files\\${dep}\\flight_data`,                  output: `${b}\\gncutils_slocum_nc_output\\${dep}\\trajectory` },
+    dat_to_trajectory_nc:        { source: `${b}\\dat_files\\${dep}\\merged_data`,  output: `${b}\\gncutils_slocum_nc_output\\${dep}\\trajectory_science` },
+    dat_to_trajectory_flight_nc: { source: `${b}\\dat_files\\${dep}\\flight_data`, output: `${b}\\gncutils_slocum_nc_output\\${dep}\\trajectory_flight` },
     fix_metadata:         { source: `${b}\\gncutils_slocum_nc_output\\${dep}\\profile`,      output: `${b}\\gncutils_slocum_nc_output\\${dep}\\profile  (in-place)` },
+    preflight:            { source: `${b}\\gncutils_slocum_nc_output\\${dep}\\profile`,      output: `${b}\\deployments\\${y}\\${dep}\\config\\qc` },
     qc:                   { source: `${b}\\gncutils_slocum_nc_output\\${dep}\\profile`,      output: `${b}\\deployments\\${y}\\${dep}\\data\\out\\nc\\sci-profile\\delayed` },
     report:               { source: `${b}\\deployments\\${y}\\${dep}\\data\\out\\nc\\sci-profile\\delayed`, output: `${b}\\deployments\\${y}\\${dep}\\reports` },
   }
@@ -570,7 +709,11 @@ async function markManual (dep, sk, status, badge) {
   badge.textContent = statusLabel(status)
 }
 
-function doRun (dep, sk, badge, btnRun, btnAbort, log) {
+function doRun (dep, sk, badge, btnRun, btnAbort, log, opts = {}) {
+  // Register live DOM refs — updated by buildStageCard on re-render
+  stageEls[sk]  = { log, badge, btnRun, btnAbort }
+  stageLogs[sk] = []
+
   log.classList.remove('hidden')
   log.innerHTML = ''
   btnRun.classList.add('hidden')
@@ -578,34 +721,296 @@ function doRun (dep, sk, badge, btnRun, btnAbort, log) {
   badge.className   = 'status-badge running'
   badge.textContent = 'RUNNING…'
 
+  // For preflight stage: capture the PREFLIGHT_JSON line as the analysis runs
+  let preflightResult = null
+
   streamRun(dep, sk,
-    (line) => appendLog(log, line),
+    (line) => {
+      stageLogs[sk].push(line)
+      // Intercept preflight JSON marker — don't show this raw line in the log
+      if (line.startsWith('=== PREFLIGHT_JSON ===')) {
+        try { preflightResult = JSON.parse(line.slice('=== PREFLIGHT_JSON ==='.length)) }
+        catch {}
+        return  // skip rendering this line
+      }
+      const el = stageEls[sk]
+      if (el) appendLog(el.log, line)
+    },
     (success) => {
-      btnRun.classList.remove('hidden')
-      btnAbort.classList.add('hidden')
-      const st = success ? 'done' : 'failed'
-      badge.className   = `status-badge ${st}`
-      badge.textContent = statusLabel(st)
-      btnRun.textContent = '↺  Re-run Stage'
-      appendLog(log, success ? '✔ Finished successfully.' : '✖ Finished with errors.')
-    }
+      const el = stageEls[sk]
+      delete stageEls[sk]
+      const finalLine = success ? '✔ Analysis complete.' : '✖ Finished with errors.'
+      stageLogs[sk].push(finalLine)
+      if (el) {
+        appendLog(el.log, finalLine)
+        el.btnRun.classList.remove('hidden')
+        el.btnAbort.classList.add('hidden')
+        const st = success ? (sk === 'preflight' && preflightResult ? 'running' : 'done') : 'failed'
+        el.badge.className   = `status-badge ${st}`
+        el.badge.textContent = sk === 'preflight' && preflightResult && success
+          ? 'REVIEW NEEDED' : statusLabel(success ? 'done' : 'failed')
+        el.btnRun.textContent = '↺  Re-run Stage'
+
+        // Show preflight confirmation panel after a successful analysis
+        if (sk === 'preflight' && success && preflightResult) {
+          const bodyEl = el.log.parentElement
+          showPreflightPanel(dep, preflightResult, bodyEl, el.badge)
+        }
+      }
+    },
+    opts
   )
+}
+
+/* ── Preflight confirmation panel ────────────────────────────────────────────*/
+function actionBadgeClass (action) {
+  if (action === 'create')    return 'preflight-badge-create'
+  if (action === 'update')    return 'preflight-badge-update'
+  return 'preflight-badge-ok'
+}
+
+function showPreflightPanel (dep, data, bodyEl, badge) {
+  // Remove any existing panel first
+  const existing = bodyEl.querySelector('.preflight-panel')
+  if (existing) existing.remove()
+
+  const sensors     = data.sensors || {}
+  const configs     = data.configs || {}
+  const anyChanges  = data.any_changes
+  const oxygenVars  = data.oxygen_vars || []
+
+  // ── Sensor summary row ────────────────────────────────────────────────────
+  function sensorChip (label, info) {
+    const ok  = !!info
+    const txt = ok ? `${info.maker} ${info.model}`.trim() || label : 'not detected'
+    return h('span', { class: `preflight-sensor-chip ${ok ? 'chip-found' : 'chip-missing'}` },
+      `${label}: ${txt}`)
+  }
+
+  const sensorRow = h('div', { class: 'preflight-sensor-row' },
+    sensorChip('CTD', sensors.ctd),
+    sensorChip('O₂', sensors.oxygen),
+    sensorChip('pH', sensors.ph),
+  )
+
+  // Oxygen variable confirmation note
+  let oxygenNote = null
+  if (sensors.oxygen && oxygenVars.length) {
+    oxygenNote = h('div', { class: 'preflight-note' },
+      `Oxygen variables detected in NC file: `,
+      h('code', {}, oxygenVars.join(', ')),
+      '. These will be used in time_shift.yml.')
+  } else if (sensors.oxygen && !oxygenVars.length) {
+    oxygenNote = h('div', { class: 'preflight-note preflight-warn' },
+      '⚠ Oxygen instrument detected but no oxygen variables found in the NC file. ' +
+      'time_shift.yml will be created but may be incomplete.')
+  }
+
+  // ── Config file cards ──────────────────────────────────────────────────────
+  const configCards = []
+  for (const [fname, info] of Object.entries(configs)) {
+    const actionBadge = h('span', { class: `preflight-badge ${actionBadgeClass(info.action)}` },
+      info.action.toUpperCase())
+
+    const headerRow = h('div', { class: 'preflight-file-header' },
+      h('span', { class: 'preflight-file-name' }, fname),
+      actionBadge,
+    )
+
+    let contentEl
+    if (info.action === 'unchanged') {
+      contentEl = h('div', { class: 'preflight-file-unchanged' }, '✔ Already up to date')
+    } else if (info.action === 'update') {
+      // Show both old and new
+      const tabs = h('div', { class: 'preflight-tabs' })
+      const btnNew = h('button', { class: 'preflight-tab active', onclick: () => {
+        btnNew.classList.add('active'); btnOld.classList.remove('active')
+        newPane.classList.remove('hidden'); oldPane.classList.add('hidden')
+      }}, 'New')
+      const btnOld = h('button', { class: 'preflight-tab', onclick: () => {
+        btnOld.classList.add('active'); btnNew.classList.remove('active')
+        oldPane.classList.remove('hidden'); newPane.classList.add('hidden')
+      }}, 'Existing')
+      tabs.appendChild(btnNew); tabs.appendChild(btnOld)
+      const newPane = h('pre', { class: 'preflight-code' }, info.content)
+      const oldPane = h('pre', { class: 'preflight-code hidden' }, info.existing_content || '')
+      contentEl = h('div', {}, tabs, newPane, oldPane)
+    } else {
+      contentEl = h('pre', { class: 'preflight-code' }, info.content)
+    }
+
+    configCards.push(h('div', { class: 'preflight-file-card' }, headerRow, contentEl))
+  }
+
+  // ── Regional boundary card ─────────────────────────────────────────────────
+  const rc = data.region_coverage || {}
+  const boundaryInadequate = rc && !rc.coverage_ok && rc.proposed_lat && rc.proposed_lon
+  let   includeBoundary    = boundaryInadequate  // checkbox default
+
+  let boundaryCard = null
+  if (boundaryInadequate) {
+    const cbBoundary = h('input', { type: 'checkbox' })
+    cbBoundary.checked = true
+    cbBoundary.addEventListener('change', () => { includeBoundary = cbBoundary.checked })
+
+    const mapEl = rc.map_base64
+      ? h('img', { class: 'preflight-boundary-map',
+                   src: `data:image/png;base64,${rc.map_base64}`,
+                   alt: 'USVI region boundary map' })
+      : null
+
+    // Editable proposed boundary inputs
+    const fmt = v => (v == null ? '—' : v.toFixed(1))
+    const makeNumInput = (val) => {
+      const inp = h('input', {
+        type: 'number', step: '0.1', class: 'preflight-bound-input',
+        value: val.toFixed(1)
+      })
+      return inp
+    }
+    const inpLatMin = makeNumInput(rc.proposed_lat[0])
+    const inpLatMax = makeNumInput(rc.proposed_lat[1])
+    const inpLonMin = makeNumInput(rc.proposed_lon[0])
+    const inpLonMax = makeNumInput(rc.proposed_lon[1])
+
+    const boundsTable = h('table', { class: 'preflight-bounds-table' },
+      h('thead', {},
+        h('tr', {},
+          h('th', {}, ''),
+          h('th', {}, 'Lat min'), h('th', {}, 'Lat max'),
+          h('th', {}, 'Lon min'), h('th', {}, 'Lon max'),
+        )
+      ),
+      h('tbody', {},
+        h('tr', { class: 'current-row' },
+          h('td', {}, 'Current'),
+          h('td', {}, fmt(rc.current_lat && rc.current_lat[0])),
+          h('td', {}, fmt(rc.current_lat && rc.current_lat[1])),
+          h('td', {}, fmt(rc.current_lon && rc.current_lon[0])),
+          h('td', {}, fmt(rc.current_lon && rc.current_lon[1])),
+        ),
+        h('tr', { class: 'proposed-row' },
+          h('td', {}, 'Proposed'),
+          h('td', {}, inpLatMin), h('td', {}, inpLatMax),
+          h('td', {}, inpLonMin), h('td', {}, inpLonMax),
+        ),
+      )
+    )
+
+    boundaryCard = h('div', { class: 'preflight-boundary-card' },
+      h('div', { class: 'preflight-file-header' },
+        h('span', { class: 'preflight-file-name' }, 'regional_boundaries.yml'),
+        h('span', { class: 'preflight-badge preflight-badge-warn' }, 'UPDATE NEEDED'),
+      ),
+      h('div', { class: 'preflight-note preflight-warn' },
+        `⚠ ${rc.n_outside} of ${rc.n_profiles} profiles fall outside the current USVI ` +
+        `boundary (lat up to ${rc.data_lat[1].toFixed(3)}°N, lon to ${rc.data_lon[0].toFixed(3)}°). ` +
+        'Profiles outside the region use global (less strict) QC thresholds. ' +
+        'This file is shared across all USVI deployments.'),
+      ...(mapEl ? [mapEl] : []),
+      boundsTable,
+      h('label', { class: 'preflight-checkbox-label' },
+        cbBoundary,
+        'Update USVI regional boundary (global — applies to all USVI deployments)'),
+    )
+  }
+
+  // ── Action buttons ─────────────────────────────────────────────────────────
+  const needsApply = anyChanges || boundaryInadequate
+  const btnApply   = h('button', { class: 'btn-success' }, '✔  Apply Config')
+  const btnSkip    = h('button', { class: 'btn-secondary' },
+    needsApply ? 'Skip (continue without applying)' : '✔  Continue')
+  const resultMsg  = h('div', { class: 'preflight-result hidden' })
+
+  btnApply.addEventListener('click', async () => {
+    btnApply.disabled = true
+    btnSkip.disabled  = true
+    btnApply.textContent = 'Applying…'
+    try {
+      // Build payload — attach boundary update flag if user opted in
+      const payload = Object.assign({}, data)
+      if (boundaryInadequate && includeBoundary) {
+        payload.region_coverage = Object.assign({}, rc, {
+          update_requested: true,
+          // Send user-edited values so server rebuilds YAML from them
+          user_lat: [parseFloat(inpLatMin.value), parseFloat(inpLatMax.value)],
+          user_lon: [parseFloat(inpLonMin.value), parseFloat(inpLonMax.value)],
+        })
+      }
+      const r = await apiFetch(
+        `/api/deployment/${encodeURIComponent(dep)}/preflight/apply`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload) })
+      if (r.ok) {
+        resultMsg.textContent = r.output || 'Config applied successfully.'
+        resultMsg.className = 'preflight-result preflight-result-ok'
+        badge.className   = 'status-badge done'
+        badge.textContent = statusLabel('done')
+      } else {
+        resultMsg.textContent = `Error: ${r.error || 'apply failed'}`
+        resultMsg.className = 'preflight-result preflight-result-err'
+        badge.className   = 'status-badge failed'
+        badge.textContent = statusLabel('failed')
+      }
+    } catch (e) {
+      resultMsg.textContent = `Error: ${e.message}`
+      resultMsg.className = 'preflight-result preflight-result-err'
+    }
+    resultMsg.classList.remove('hidden')
+    btnApply.remove()
+    btnSkip.textContent = 'Done'
+    btnSkip.disabled = false
+  })
+
+  btnSkip.addEventListener('click', () => {
+    // If nothing needs changing, mark stage done; otherwise leave as-is
+    if (!needsApply) {
+      apiFetch(`/api/deployment/${encodeURIComponent(dep)}/set-status/preflight`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'done' }) })
+      badge.className   = 'status-badge done'
+      badge.textContent = statusLabel('done')
+    }
+    panel.remove()
+  })
+
+  const btnRow = h('div', { class: 'btn-row' }, ...(needsApply ? [btnApply, btnSkip] : [btnSkip]))
+
+  // ── Assemble panel ─────────────────────────────────────────────────────────
+  const title = h('div', { class: 'preflight-title' },
+    needsApply ? '⚙ Config files need to be created or updated'
+               : '✔ Config files are up to date')
+
+  const panel = h('div', { class: 'preflight-panel' },
+    title,
+    sensorRow,
+    ...(oxygenNote   ? [oxygenNote]   : []),
+    ...configCards,
+    ...(boundaryCard ? [boundaryCard] : []),
+    resultMsg,
+    btnRow,
+  )
+
+  bodyEl.appendChild(panel)
 }
 
 async function doAbort (dep, sk, badge, btnRun, btnAbort) {
   await abortRun(dep, sk)
-  btnRun.classList.remove('hidden')
-  btnAbort.classList.add('hidden')
-  badge.className   = 'status-badge failed'
-  badge.textContent = '✖ FAILED'
+  const el = stageEls[sk] || { badge, btnRun, btnAbort }
+  el.btnRun.classList.remove('hidden')
+  el.btnAbort.classList.add('hidden')
+  el.badge.className   = 'status-badge failed'
+  el.badge.textContent = '✖ FAILED'
+  delete stageEls[sk]
 }
 
 function appendLog (logEl, line) {
   const span = document.createElement('span')
   span.className = logColor(line)
   span.textContent = line + '\n'
+  const isAtBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 50
   logEl.appendChild(span)
-  logEl.scrollTop = logEl.scrollHeight
+  if (isAtBottom) logEl.scrollTop = logEl.scrollHeight
 }
 
 /* ── Reports page ────────────────────────────────────────────────────────────*/
@@ -639,22 +1044,171 @@ async function renderReports () {
   if (dep) {
     try {
       const pd = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/plots`)
-      const all = [...pd.pngs, ...pd.profile_pngs]
+      // Deployment-wide interactive plots first, then per-profile plots
+      const all = [
+        ...(pd.htmls        || []),
+        ...(pd.pngs         || []),
+        ...(pd.profile_htmls || []),
+        ...(pd.profile_pngs  || []),
+      ]
       if (!all.length) {
-        plotGrid.appendChild(h('div', { class: 'empty-state' }, 'No plots generated yet.'))
+        plotGrid.appendChild(h('div', { class: 'reports-empty' },
+          h('div', { class: 'reports-empty-icon' }, '📈'),
+          h('div', { class: 'reports-empty-title' }, 'No plots generated yet'),
+          h('div', { class: 'reports-empty-hint' }, 'Run the ', h('code', {}, 'Report + Plots'), ' stage to generate plots.')))
       } else {
-        all.forEach(fp => {
-          const name  = fp.split(/[\\/]/).pop()
-          const src   = `${API}/api/file?path=${encodeURIComponent(fp)}`
-          const thumb = h('div', { class: 'plot-thumb', onclick: () => window.APP.shellOpen(fp) },
-            h('img', { src, alt: name, loading: 'lazy' }),
-            h('div', { class: 'plot-thumb-name' }, name)
-          )
+        // Scale each iframe to fill its preview box, and re-scale on resize
+        function _scaleIframe (previewEl) {
+          const iframe = previewEl.querySelector('.plot-thumb-iframe')
+          if (!iframe) return
+          const scale = previewEl.offsetWidth / 960
+          iframe.style.transform = `scale(${scale})`
+        }
+        const scaleObserver = new ResizeObserver(entries => {
+          entries.forEach(e => _scaleIframe(e.target))
+        })
+
+        // Lazy-load iframes as they scroll into view
+        const iframeObserver = new IntersectionObserver((entries) => {
+          entries.forEach(entry => {
+            if (!entry.isIntersecting) return
+            const iframe = entry.target.querySelector('iframe[data-src]')
+            if (iframe) { iframe.src = iframe.dataset.src; iframe.removeAttribute('data-src') }
+            iframeObserver.unobserve(entry.target)
+          })
+        }, { rootMargin: '200px 0px' })
+
+        all.forEach((fp, idx) => {
+          const name   = fp.split(/[\\/]/).pop()
+          const isHtml = fp.endsWith('.html')
+          const label  = _plotLabel(name)
+          const url    = `${API}/api/file?path=${encodeURIComponent(fp)}`
+          let thumb
+
+          if (isHtml) {
+            // Embed a scaled-down iframe so the actual chart is visible in the card
+            const iframe = h('iframe', {
+              'data-src': url,         // loaded lazily by intersection observer
+              class: 'plot-thumb-iframe',
+              scrolling: 'no',
+              tabindex: '-1',
+            })
+            const preview = h('div', { class: 'plot-thumb-preview' }, iframe)
+            thumb = h('div', {
+              class: 'plot-thumb plot-thumb-html',
+              onclick: () => openPlotViewer(all, idx),
+            },
+              preview,
+              h('div', { class: 'plot-thumb-name' }, label)
+            )
+            iframeObserver.observe(thumb)
+            // Scale iframe to match card width now, and whenever card resizes
+            requestAnimationFrame(() => _scaleIframe(preview))
+            scaleObserver.observe(preview)
+          } else {
+            thumb = h('div', { class: 'plot-thumb', onclick: () => openPlotViewer(all, idx) },
+              h('img', { src: url, alt: name, loading: 'lazy' }),
+              h('div', { class: 'plot-thumb-name' }, label)
+            )
+          }
           plotGrid.appendChild(thumb)
         })
       }
     } catch {}
   }
+}
+
+/* ── Plot card helpers ───────────────────────────────────────────────────────*/
+function _plotLabel (filename) {
+  const name = filename.replace(/\.(html|png)$/, '')
+  // Per-profile: uvi_02_20260429T141417Z_dbd_profiles → "Profile · 2026-04-29 14:14"
+  const profMatch = name.match(/(\d{8}T\d{6})Z?.*_profiles?$/)
+  if (profMatch) {
+    const dt = profMatch[1]
+    return `Profile · ${dt.slice(0,4)}-${dt.slice(4,6)}-${dt.slice(6,8)} ${dt.slice(9,11)}:${dt.slice(11,13)}`
+  }
+  const MAP = {
+    timeseries:                   'Time Series',
+    qc_flag_summary:              'QC Flag Summary',
+    ts_diagram:                   'T–S Diagram',
+    section_temperature:          'Section: Temperature',
+    section_salinity:             'Section: Salinity',
+    section_oxygen_concentration: 'Section: O₂ Concentration',
+  }
+  return MAP[name] || name.replace(/_/g, ' ')
+}
+
+
+/* ── Plot lightbox viewer ────────────────────────────────────────────────────*/
+let _plotViewer = null
+
+function openPlotViewer (files, startIdx) {
+  if (_plotViewer) _plotViewer.close()
+
+  let idx = startIdx
+  const total = files.length
+
+  const overlay  = h('div', { class: 'plot-viewer-overlay' })
+  const modal    = h('div', { class: 'plot-viewer-modal' })
+  const btnClose = h('button', { class: 'plot-viewer-close', title: 'Close (Esc)' }, '✕')
+  const counter  = h('div', { class: 'plot-viewer-counter' })
+  const imgWrap  = h('div', { class: 'plot-viewer-img-wrap' })
+  const label    = h('div', { class: 'plot-viewer-label' })
+  const btnPrev  = h('button', { class: 'plot-viewer-nav plot-viewer-prev', title: 'Previous (←)' }, '‹')
+  const btnNext  = h('button', { class: 'plot-viewer-nav plot-viewer-next', title: 'Next (→)' }, '›')
+
+  modal.append(btnClose, counter, btnPrev, imgWrap, btnNext, label)
+  overlay.appendChild(modal)
+  document.body.appendChild(overlay)
+
+  function show (i) {
+    idx = (i + total) % total
+    const fp     = files[idx]
+    const name   = fp.split(/[\\/]/).pop()
+    const isHtml = fp.endsWith('.html')
+    const url    = `${API}/api/file?path=${encodeURIComponent(fp)}`
+
+    imgWrap.innerHTML = ''
+    modal.classList.toggle('plot-viewer-modal--html', isHtml)
+
+    if (isHtml) {
+      const iframe = h('iframe', {
+        src: url,
+        class: 'plot-viewer-iframe',
+        allowfullscreen: true,
+      })
+      imgWrap.appendChild(iframe)
+    } else {
+      const img = h('img', { src: url, alt: name, class: 'plot-viewer-img' })
+      imgWrap.appendChild(img)
+    }
+
+    label.textContent   = name.replace('.html', '').replace('.png', '').replace(/_/g, ' ')
+    counter.textContent = `${idx + 1} / ${total}`
+    btnPrev.disabled    = (total === 1)
+    btnNext.disabled    = (total === 1)
+  }
+
+  function close () {
+    document.removeEventListener('keydown', onKey)
+    overlay.remove()
+    _plotViewer = null
+  }
+
+  function onKey (e) {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); show(idx + 1) }
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp'  ) { e.preventDefault(); show(idx - 1) }
+    if (e.key === 'Escape') close()
+  }
+
+  btnClose.addEventListener('click', close)
+  btnPrev.addEventListener('click',  () => show(idx - 1))
+  btnNext.addEventListener('click',  () => show(idx + 1))
+  overlay.addEventListener('click',  e => { if (e.target === overlay) close() })
+  document.addEventListener('keydown', onKey)
+
+  show(startIdx)
+  _plotViewer = { close }
 }
 
 function switchTab (e) {
@@ -702,7 +1256,7 @@ async function renderMetadata () {
   page.appendChild(grid)
 
   // Group entries by top-level subdirectory
-  const groupLabels = { science_profile: 'Profile', science_trajectory: 'Trajectory' }
+  const groupLabels = { science_profile: 'Profile', science_trajectory: 'Trajectory (Science)', trajectory_flight: 'Trajectory (Flight)' }
   const groups = {}
   entries.forEach(([rel, json]) => {
     const group = rel.split(/[\\/]/)[0]
@@ -872,85 +1426,75 @@ async function _metaCopyAllFromDep (dep, glider) {
   }
 }
 
-/* Import JSON files from disk paths ─────────────────────────────────────────*/
+/* Import JSON files from disk — two side-by-side drop zones ─────────────────*/
 function _metaImportJsonFiles (dep) {
-  const SUBDIRS   = ['science_profile', 'science_trajectory']
-  const fileItems = []   // {name, path, size, subdir, status, msg?}
+  // Per-subdir file lists
+  const fileItems = { science_profile: [], science_trajectory: [], trajectory_flight: [] }
+  const renderFns = {}   // subdir → renderList fn, populated by makeZone
 
-  const errorEl    = h('div', { class: 'import-error' })
-  const countEl    = h('div', { class: 'import-count' })
-  const fileListEl = h('div', { class: 'import-file-list' })
+  function makeZone (subdir) {
+    const items  = fileItems[subdir]
+    const listEl  = h('div', { class: 'import-file-list' })
+    const errorEl = h('div', { class: 'import-error' })
 
-  const defaultSubdir = h('select', { class: 'form-input',
-    onchange: e => {
-      fileItems.filter(i => i.status === 'queued').forEach(i => { i.subdir = e.target.value })
+    function renderList () {
+      listEl.innerHTML = ''
+      items.forEach(item => {
+        const icon = { queued: '…', copying: '…', done: '✓', error: '✗' }[item.status] || '?'
+        listEl.appendChild(h('div', { class: 'import-file-item' },
+          h('span', { class: `import-status import-status-${item.status}` }, icon),
+          h('span', { class: 'import-fname' }, item.name),
+          item.msg ? h('span', { class: 'import-item-msg' }, item.msg) : null))
+      })
+    }
+    renderFns[subdir] = renderList
+
+    function handleFiles (files) {
+      errorEl.textContent = ''
+      const valid   = files.filter(f => f.name.toLowerCase().endsWith('.json'))
+      const skipped = files.length - valid.length
+      if (skipped) errorEl.textContent = `${skipped} skipped (not .json)`
+      valid.forEach(f => {
+        if (!items.find(i => i.name === f.name))
+          items.push({ name: f.name, path: f.path || '', size: f.size, subdir, status: 'queued' })
+      })
       renderList()
-    }},
-    ...SUBDIRS.map(s => h('option', { value: s }, s)))
+    }
 
-  function renderList () {
-    fileListEl.innerHTML = ''
-    fileItems.forEach(item => {
-      const icon = { queued: '…', copying: '…', done: '✓', error: '✗' }[item.status] || '?'
-      const sel = h('select', { class: 'import-subdir-sel',
-        onchange: e => { item.subdir = e.target.value }},
-        ...SUBDIRS.map(s => {
-          const o = h('option', { value: s }, s)
-          if (s === item.subdir) o.selected = true
-          return o
-        }))
-      if (item.status !== 'queued') sel.disabled = true
-      fileListEl.appendChild(h('div', { class: 'import-file-item' },
-        h('span', { class: `import-status import-status-${item.status}` }, icon),
-        h('span', { class: 'import-fname' }, item.name),
-        sel,
-        item.msg ? h('span', { class: 'import-item-msg' }, item.msg) : null))
-    })
-    const done  = fileItems.filter(i => i.status === 'done').length
-    const total = fileItems.length
-    countEl.textContent = total ? `${done} / ${total} imported` : ''
+    const fileInput = h('input', { type: 'file', multiple: true, accept: '.json', style: 'display:none',
+      onchange: e => { handleFiles(Array.from(e.target.files)); e.target.value = '' }})
+
+    const dropzone = h('div', { class: 'import-dropzone import-dropzone-sm' },
+      h('div', { class: 'import-drop-icon' }, '↑'),
+      h('div', { class: 'import-drop-text' }, 'Drop .json files here'),
+      h('label', { class: 'btn-secondary import-browse-btn' }, 'Browse…', fileInput))
+
+    dropzone.addEventListener('dragover',  e => { e.preventDefault(); dropzone.classList.add('drag-over') })
+    dropzone.addEventListener('dragleave', e => { if (!dropzone.contains(e.relatedTarget)) dropzone.classList.remove('drag-over') })
+    dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('drag-over'); handleFiles(Array.from(e.dataTransfer.files)) })
+
+    return h('div', { class: 'import-zone' },
+      h('div', { class: 'import-zone-label' }, subdir),
+      dropzone, errorEl, listEl)
   }
-
-  function handleFiles (files) {
-    errorEl.textContent = ''
-    const valid   = files.filter(f => f.name.toLowerCase().endsWith('.json'))
-    const skipped = files.length - valid.length
-    if (skipped) errorEl.textContent = `${skipped} file(s) skipped — only .json files accepted`
-    valid.forEach(f => {
-      if (!fileItems.find(i => i.name === f.name))
-        fileItems.push({ name: f.name, path: f.path || '', size: f.size,
-          subdir: defaultSubdir.value, status: 'queued' })
-    })
-    renderList()
-  }
-
-  const fileInput = h('input', { type: 'file', multiple: true, accept: '.json', style: 'display:none',
-    onchange: e => { handleFiles(Array.from(e.target.files)); e.target.value = '' }})
-  const dropzone = h('div', { class: 'import-dropzone' },
-    h('div', { class: 'import-drop-icon' }, '↑'),
-    h('div', { class: 'import-drop-text' }, 'Drop JSON config files here'),
-    h('div', { class: 'import-drop-ext' }, '.json'),
-    h('div', { class: 'import-drop-or' }, 'or'),
-    h('label', { class: 'btn-secondary import-browse-btn' }, 'Browse…', fileInput))
-  dropzone.addEventListener('dragover',  e => { e.preventDefault(); dropzone.classList.add('drag-over') })
-  dropzone.addEventListener('dragleave', e => { if (!dropzone.contains(e.relatedTarget)) dropzone.classList.remove('drag-over') })
-  dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('drag-over'); handleFiles(Array.from(e.dataTransfer.files)) })
 
   const statusEl  = h('div', { class: 'modal-status' })
   const importBtn = h('button', { class: 'btn-success' }, 'Import')
 
   importBtn.onclick = async () => {
-    const queued = fileItems.filter(i => i.status === 'queued')
-    if (!queued.length) { statusEl.textContent = 'No files to import.'; statusEl.style.color = '#e74c3c'; return }
+    const allItems = [...fileItems.science_profile, ...fileItems.science_trajectory]
+    const queued   = allItems.filter(i => i.status === 'queued')
+    if (!queued.length) { statusEl.textContent = 'Drop files into one or both zones first.'; statusEl.style.color = '#e74c3c'; return }
 
     const paths = queued.map(i => i.path).filter(Boolean)
     if (!paths.length) {
       queued.forEach(i => { i.status = 'error'; i.msg = 'Open in Electron app to import files' })
-      renderList(); return
+      Object.values(renderFns).forEach(fn => fn()); return
     }
 
     queued.forEach(i => { i.status = 'copying' })
-    renderList(); importBtn.disabled = true
+    Object.values(renderFns).forEach(fn => fn())
+    importBtn.disabled = true
 
     try {
       const r = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/import-files`, {
@@ -959,11 +1503,11 @@ function _metaImportJsonFiles (dep) {
         body:    JSON.stringify({ files: queued.map(i => ({ path: i.path, subdir: i.subdir })) }),
       })
       r.results.forEach(res => {
-        const item = fileItems.find(i => i.path === res.path)
+        const item = allItems.find(i => i.path === res.path)
         if (item) { item.status = res.ok ? 'done' : 'error'; if (!res.ok) item.msg = res.error }
       })
-      renderList()
-      const doneCount = fileItems.filter(i => i.status === 'done').length
+      Object.values(renderFns).forEach(fn => fn())
+      const doneCount = allItems.filter(i => i.status === 'done').length
       if (doneCount) {
         statusEl.textContent = `${doneCount} file(s) imported.`
         statusEl.style.color = '#7ec8a0'
@@ -975,7 +1519,8 @@ function _metaImportJsonFiles (dep) {
       }
     } catch (e) {
       queued.forEach(i => { if (i.status === 'copying') { i.status = 'error'; i.msg = e.message } })
-      renderList(); importBtn.disabled = false
+      Object.values(renderFns).forEach(fn => fn())
+      importBtn.disabled = false
     }
   }
 
@@ -986,10 +1531,10 @@ function _metaImportJsonFiles (dep) {
         h('h2', {}, 'Import JSON Config Files'),
         h('button', { class: 'modal-close', onclick: closeModal }, '×')),
       h('div', { class: 'modal-body' },
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Import files to folder'),
-          defaultSubdir),
-        dropzone, errorEl, countEl, fileListEl),
+        h('div', { class: 'import-zones' },
+          makeZone('science_profile'),
+          makeZone('science_trajectory'),
+          makeZone('trajectory_flight'))),
       h('div', { class: 'modal-footer' },
         statusEl,
         h('button', { class: 'btn-secondary', onclick: closeModal }, 'Cancel'),
@@ -999,7 +1544,7 @@ function _metaImportJsonFiles (dep) {
 
 /* Create a new blank JSON config file ───────────────────────────────────────*/
 function _metaNewFileModal (dep) {
-  const SUBDIRS = ['science_profile', 'science_trajectory']
+  const SUBDIRS = ['science_profile', 'science_trajectory', 'trajectory_flight']
 
   const nameInput = h('input', { class: 'form-input', type: 'text', placeholder: 'e.g. instruments.json' })
   const subdirSel = h('select', { class: 'form-input' },
@@ -1231,8 +1776,9 @@ async function showManageSensorSets (dep) {
 
   // Mutable working copies
   const selected = {
-    profile:    new Set(data.profile),
-    trajectory: new Set(data.trajectory),
+    profile:            new Set(data.profile),
+    trajectory:         new Set(data.trajectory),
+    trajectory_flight:  new Set(data.trajectory_flight),
   }
 
   let activeTab   = 'profile'
@@ -1355,7 +1901,8 @@ async function showManageSensorSets (dep) {
   // Tab buttons + pane container
   const paneContainer = h('div', { id: 'ss-pane-container' })
 
-  const tabs = ['profile', 'trajectory'].map(key => {
+  const TAB_LABELS = { profile: 'Profile', trajectory: 'Trajectory (Science)', trajectory_flight: 'Trajectory (Flight)' }
+  const tabs = ['profile', 'trajectory', 'trajectory_flight'].map(key => {
     const btn = h('button', {
       class: 'ss-tab' + (key === activeTab ? ' active' : ''),
       onclick: () => {
@@ -1365,7 +1912,7 @@ async function showManageSensorSets (dep) {
         paneContainer.innerHTML = ''
         paneContainer.appendChild(buildPane(key))
       }
-    }, key === 'profile' ? 'Profile' : 'Trajectory')
+    }, TAB_LABELS[key])
     return btn
   })
 
@@ -1386,12 +1933,13 @@ async function showManageSensorSets (dep) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            profile:    [...selected.profile].sort(),
-            trajectory: [...selected.trajectory].sort(),
+            profile:           [...selected.profile].sort(),
+            trajectory:        [...selected.trajectory].sort(),
+            trajectory_flight: [...selected.trajectory_flight].sort(),
           })
         })
         saveBtn.disabled = false; saveBtn.textContent = 'Save'
-        statusEl.textContent = `Saved — ${r.profile_count} profile, ${r.traj_count} trajectory sensors. Run "Build Sensor Defs" to apply.`
+        statusEl.textContent = `Saved — ${r.profile_count} profile, ${r.traj_count} traj (sci), ${r.traj_flight_count} traj (flt) sensors. Run "Build Sensor Defs" to apply.`
         statusEl.style.color = '#7ec8a0'
       } catch (e) {
         saveBtn.disabled = false; saveBtn.textContent = 'Save'
@@ -1506,37 +2054,197 @@ function renderMetaEdit (rel, originalText, content, dep) {
 }
 
 /* ── DAT Browser page ────────────────────────────────────────────────────────*/
+/* ── Files page (Raw binary + DAT) ──────────────────────────────────────────*/
 async function renderDatBrowser () {
   const dep  = state.deployment
   const page = document.getElementById('page-dat-browser')
   page.innerHTML = ''
 
   page.appendChild(h('div', { class: 'page-header' },
-    h('h1', {}, 'DAT Browser'),
-    h('p',  {}, dep ? `Merged DAT files for ${dep}` : 'Select a deployment.')
+    h('h1', {}, 'Files'),
+    h('p',  {}, dep ? `Raw and processed data files for ${dep}` : 'Select a deployment.')
   ))
 
   if (!dep) return
 
-  let dd
-  try { dd = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/dat-files`) }
-  catch { page.appendChild(h('div', { class: 'empty-state' }, 'Could not load DAT files.')); return }
+  // Tab bar
+  let activeTab = 'raw'
+  const tabBody = h('div', { class: 'files-tab-body' })
 
-  if (!dd.files.length) {
-    page.appendChild(h('div', { class: 'empty-state' }, `No DAT files found in:\n${dd.dir}`))
-    return
+  function setTab (key) {
+    activeTab = key
+    tabBar.querySelectorAll('.files-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === key))
+    tabBody.innerHTML = ''
+    if      (key === 'raw')        renderRawTab(dep, tabBody)
+    else if (key === 'dat')        renderDatTab(dep, tabBody)
+    else if (key === 'profile-nc') renderProfileNcTab(dep, tabBody)
+    else if (key === 'traj-nc')    renderTrajNcTab(dep, tabBody)
+    else if (key === 'qc-output')  renderQcOutputTab(dep, tabBody)
   }
 
-  const fileList = h('div', { class: 'dat-file-list' })
-  const preview  = h('div', { class: 'dat-preview' }, 'Select a file to preview its header.')
-  const layout   = h('div', { class: 'dat-layout' }, fileList, preview)
-  page.appendChild(layout)
+  const tabBar = h('div', { class: 'files-tab-bar' },
+    h('button', { class: 'files-tab active', 'data-tab': 'raw',        onclick: () => setTab('raw')        }, 'Raw Files'),
+    h('button', { class: 'files-tab',        'data-tab': 'dat',        onclick: () => setTab('dat')        }, 'DAT Files'),
+    h('button', { class: 'files-tab',        'data-tab': 'profile-nc', onclick: () => setTab('profile-nc') }, 'Profile NC'),
+    h('button', { class: 'files-tab',        'data-tab': 'traj-nc',    onclick: () => setTab('traj-nc')    }, 'Trajectory NC'),
+    h('button', { class: 'files-tab',        'data-tab': 'qc-output',  onclick: () => setTab('qc-output')  }, 'QC Output'),
+  )
 
-  dd.files.forEach((name, i) => {
-    const item = h('div', { class: 'dat-file-item', onclick: () => previewDat(dd.dir, name, item, fileList, preview) }, name)
-    fileList.appendChild(item)
-  })
+  page.appendChild(tabBar)
+  page.appendChild(tabBody)
+  setTab('raw')
 }
+
+
+async function renderRawTab (dep, container) {
+  container.innerHTML = ''
+
+  // Load file list
+  let data
+  try { data = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/raw-files`) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load raw files: ' + e.message)); return }
+
+  const files = data.files  // [{name, size, ext}]
+
+  // Summary badges by extension
+  const extCounts = {}
+  files.forEach(f => { extCounts[f.ext] = (extCounts[f.ext] || 0) + 1 })
+  const totalSize  = files.reduce((s, f) => s + f.size, 0)
+  const summaryEl  = h('div', { class: 'raw-summary' },
+    ...Object.entries(extCounts).sort().map(([ext, n]) =>
+      h('span', { class: 'raw-ext-badge' }, `${ext.slice(1).toUpperCase()}: ${n}`)),
+    h('span', { class: 'raw-total-size' }, files.length ? `— ${_fmtBytes(totalSize)} total` : '')
+  )
+
+  // Drop zone (reuses existing import machinery)
+  const ALLOWED = new Set(['.dbd', '.ebd', '.sbd', '.tbd', '.mbd', '.nbd'])
+  const errorEl   = h('div', { class: 'import-error' })
+  const statusEl  = h('div', { class: 'raw-import-status' })
+
+  async function doAddFiles (fsFiles) {
+    errorEl.textContent = ''
+    const valid   = fsFiles.filter(f => ALLOWED.has('.' + f.name.split('.').pop().toLowerCase()))
+    const skipped = fsFiles.length - valid.length
+    if (skipped) errorEl.textContent = `${skipped} file(s) skipped — only ${[...ALLOWED].join(' ')} accepted`
+    if (!valid.length) return
+
+    const paths = valid.map(f => f.path).filter(Boolean)
+    if (!paths.length) { errorEl.textContent = 'Open in Electron app to copy files.'; return }
+
+    statusEl.textContent = `Copying ${paths.length} file(s)…`
+    try {
+      const r = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/import-raw`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths }),
+      })
+      const done = r.results.filter(x => x.ok).length
+      const errs = r.results.filter(x => !x.ok)
+      statusEl.textContent = `${done} file(s) copied.`
+      if (errs.length) errorEl.textContent = errs.map(e => `${e.path}: ${e.error}`).join('\n')
+    } catch (e) {
+      errorEl.textContent = 'Copy failed: ' + e.message
+    }
+    // Refresh
+    renderRawTab(dep, container)
+  }
+
+  const fileInput = h('input', { type: 'file', multiple: true, style: 'display:none',
+    onchange: e => { doAddFiles(Array.from(e.target.files)); e.target.value = '' } })
+  const dropzone = h('div', { class: 'import-dropzone import-dropzone-sm' },
+    h('div', { class: 'import-drop-icon' }, '↑'),
+    h('div', { class: 'import-drop-text' }, 'Drop files or browse to add more'),
+    h('div', { class: 'import-drop-ext' }, '.dbd  .ebd  .sbd  .tbd  .mbd  .nbd'),
+    h('label', { class: 'btn-secondary import-browse-btn', style: 'margin-top:6px' }, 'Browse…', fileInput))
+  dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over') })
+  dropzone.addEventListener('dragleave', e => { if (!dropzone.contains(e.relatedTarget)) dropzone.classList.remove('drag-over') })
+  dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('drag-over'); doAddFiles(Array.from(e.dataTransfer.files)) })
+
+  // File list
+  const listEl = h('div', { class: 'raw-file-list' })
+
+  function buildFileRows (fileArr) {
+    listEl.innerHTML = ''
+    if (!fileArr.length) {
+      listEl.appendChild(h('div', { class: 'raw-empty' }, `No binary files in incoming_data/${dep}/`))
+      return
+    }
+    fileArr.forEach(f => {
+      const extClass = `raw-ext-${f.ext.slice(1).toLowerCase()}`
+      const row = h('div', { class: 'raw-file-row' },
+        h('span', { class: `raw-ext-tag ${extClass}` }, f.ext.slice(1).toUpperCase()),
+        h('span', { class: 'raw-file-name' }, f.name),
+        h('span', { class: 'raw-file-size' }, _fmtBytes(f.size)),
+        h('button', { class: 'btn-danger-sm',
+          onclick: async () => {
+            if (!confirm(`Delete ${f.name}?`)) return
+            try {
+              await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/raw-files/${encodeURIComponent(f.name)}`, { method: 'DELETE' })
+              renderRawTab(dep, container)
+            } catch (e) { alert('Delete failed: ' + e.message) }
+          }
+        }, '✕')
+      )
+      listEl.appendChild(row)
+    })
+  }
+
+  buildFileRows(files)
+
+  container.appendChild(h('div', { class: 'raw-controls' }, summaryEl, dropzone, errorEl, statusEl))
+  container.appendChild(listEl)
+}
+
+
+async function renderDatTab (dep, container) {
+  container.innerHTML = ''
+
+  let data
+  try { data = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/dat-files`) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load DAT files: ' + e.message)); return }
+
+  // Sub-tabs: merged_data and flight_data
+  let activeSub = 'merged_data'
+  const subBody = h('div', { class: 'dat-sub-body' })
+
+  function setSubTab (key) {
+    activeSub = key
+    subBar.querySelectorAll('.dat-sub-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.sub === key))
+    buildDatView(key)
+  }
+
+  const subBar = h('div', { class: 'dat-sub-bar' },
+    h('button', { class: 'dat-sub-tab active', 'data-sub': 'merged_data', onclick: () => setSubTab('merged_data') },
+      `merged_data (${data.merged_data.files.length})`),
+    h('button', { class: 'dat-sub-tab', 'data-sub': 'flight_data', onclick: () => setSubTab('flight_data') },
+      `flight_data (${data.flight_data.files.length})`),
+  )
+
+  function buildDatView (subdir) {
+    subBody.innerHTML = ''
+    const { files, dir } = data[subdir]
+    if (!files.length) {
+      subBody.appendChild(h('div', { class: 'empty-state' }, `No DAT files in:\n${dir}`))
+      return
+    }
+    const fileList = h('div', { class: 'dat-file-list' })
+    const preview  = h('div', { class: 'dat-preview' }, 'Select a file to preview its header.')
+    subBody.appendChild(h('div', { class: 'dat-layout' }, fileList, preview))
+    files.forEach(f => {
+      const item = h('div', { class: 'dat-file-item' },
+        h('span', { class: 'dat-file-name' }, f.name),
+        h('span', { class: 'dat-file-size' }, _fmtBytes(f.size)))
+      item.addEventListener('click', () => previewDat(dir, f.name, item, fileList, preview))
+      fileList.appendChild(item)
+    })
+  }
+
+  container.appendChild(subBar)
+  container.appendChild(subBody)
+  setSubTab('merged_data')
+}
+
 
 async function previewDat (dir, name, item, fileList, preview) {
   fileList.querySelectorAll('.dat-file-item').forEach(el => el.classList.remove('active'))
@@ -1547,19 +2255,254 @@ async function previewDat (dir, name, item, fileList, preview) {
     const resp = await fetch(`${API}/api/file?path=${encodeURIComponent(fp)}`)
     if (!resp.ok) throw new Error(resp.statusText)
     const text = await resp.text()
-    // Show first 80 lines
     preview.textContent = text.split('\n').slice(0, 80).join('\n')
   } catch (e) {
     preview.textContent = 'Error loading file: ' + e.message
   }
 }
 
+
+/* ── NC file sections (Stages 2a / 2b / 2c / 4) ─────────────────────────────*/
+function renderNcSection (title, stageLabel, data, container) {
+  const { files = [], dir = '', exists = false } = data
+  const totalSize = files.reduce((s, f) => s + f.size, 0)
+
+  // Section header row
+  const canOpen = exists && window.APP && window.APP.shellOpen
+  container.appendChild(h('div', { class: 'nc-section-header' },
+    h('div', { class: 'nc-section-meta' },
+      h('span', { class: 'nc-section-title' }, title),
+      h('span', { class: 'nc-section-stage' }, stageLabel),
+      files.length
+        ? h('span', { class: 'nc-section-count' }, `${files.length} files · ${_fmtBytes(totalSize)}`)
+        : h('span', { class: 'nc-section-count nc-section-empty' }, 'no files yet'),
+    ),
+    h('div', { class: 'nc-section-path' },
+      h('code', { class: 'nc-dir-path', title: dir }, dir),
+      canOpen
+        ? h('button', { class: 'btn-secondary btn-xs',
+            onclick: () => window.APP.shellOpen(dir) }, 'Open ↗')
+        : null,
+    ),
+  ))
+
+  if (!files.length) {
+    container.appendChild(h('div', { class: 'nc-empty' },
+      exists ? 'No .nc files in this directory.' : 'Directory does not exist yet — run the stage first.'))
+    return
+  }
+
+  const listEl = h('div', { class: 'nc-file-list' })
+  files.forEach(f => {
+    const mtime = f.mtime ? new Date(f.mtime * 1000).toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    }) : ''
+    listEl.appendChild(h('div', { class: 'nc-file-row' },
+      h('span', { class: 'nc-file-ext' }, 'NC'),
+      h('span', { class: 'nc-file-name' }, f.name),
+      h('span', { class: 'nc-file-mtime' }, mtime),
+      h('span', { class: 'nc-file-size' }, _fmtBytes(f.size)),
+    ))
+  })
+  container.appendChild(listEl)
+}
+
+async function _fetchNcFiles (dep) {
+  return apiFetch(`/api/deployment/${encodeURIComponent(dep)}/nc-files`)
+}
+
+async function renderProfileNcTab (dep, container) {
+  container.innerHTML = ''
+  let data
+  try { data = await _fetchNcFiles(dep) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load files: ' + e.message)); return }
+  renderNcSection('Profile NC', 'Stage 2a', data.profile, container)
+}
+
+async function renderTrajNcTab (dep, container) {
+  container.innerHTML = ''
+  let data
+  try { data = await _fetchNcFiles(dep) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load files: ' + e.message)); return }
+  renderNcSection('Science Trajectory NC', 'Stage 2b', data.traj_sci, container)
+  renderNcSection('Flight Trajectory NC',  'Stage 2c', data.traj_flt, container)
+}
+
+async function renderQcOutputTab (dep, container) {
+  container.innerHTML = ''
+  let data
+  try { data = await _fetchNcFiles(dep) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load files: ' + e.message)); return }
+  renderNcSection('QC Output', 'Stage 4', data.qc, container)
+}
+
+/* ── Logs page ───────────────────────────────────────────────────────────────*/
+function formatBytes (bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+async function showLogFileViewer (entry) {
+  const ac = new AbortController()
+
+  function closeViewer () { ac.abort(); overlay.remove() }
+
+  const overlay = h('div', { class: 'modal-overlay',
+    onclick: e => { if (e.target === overlay) closeViewer() }
+  })
+  const modal = h('div', { class: 'modal log-viewer-modal' })
+
+  const titleBadge = h('span', {
+    class: `badge ${entry.result === 'pass' ? 'done' : 'failed'}`,
+    style: 'margin-right:8px'
+  }, entry.result === 'pass' ? '✔ Pass' : '✖ Fail')
+
+  const hdr = h('div', { class: 'modal-header' },
+    h('h2', {}, titleBadge, `${entry.dep}  /  ${state.stageInfo[entry.stage]?.label || entry.stage}  —  ${entry.timestamp}`),
+    h('button', { class: 'modal-close', onclick: closeViewer }, '×')
+  )
+
+  const logPane = h('div', { class: 'log-pane log-viewer-pane' })
+  logPane.textContent = 'Loading…'
+
+  modal.appendChild(hdr)
+  modal.appendChild(logPane)
+  overlay.appendChild(modal)
+  document.body.appendChild(overlay)
+
+  try {
+    const d = await apiFetch(`/api/logs/read?path=${encodeURIComponent(entry.path)}`, { signal: ac.signal })
+    if (!overlay.isConnected) return   // X was clicked while loading — discard result
+    logPane.textContent = ''
+    // Use a single pre for efficient rendering (avoids per-line DOM churn on large logs)
+    const lines = d.content.split('\n')
+    const pre   = document.createElement('pre')
+    pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-all;'
+    // Apply colour to error/warning lines; bundle into a fragment for a single reflow
+    const frag = document.createDocumentFragment()
+    for (const line of lines) {
+      const cls = logColor(line)
+      if (cls) {
+        const span = document.createElement('span')
+        span.className = cls
+        span.textContent = line + '\n'
+        frag.appendChild(span)
+      } else {
+        frag.appendChild(document.createTextNode(line + '\n'))
+      }
+    }
+    pre.appendChild(frag)
+    logPane.appendChild(pre)
+    logPane.scrollTop = 0   // start at the top for archived logs
+  } catch (e) {
+    if (e.name === 'AbortError' || !overlay.isConnected) return
+    logPane.textContent = `Error loading log: ${e.message}`
+  }
+}
+
+async function renderLogs () {
+  const page = document.getElementById('page-logs')
+  page.innerHTML = ''
+
+  const header = h('div', { class: 'page-header' },
+    h('h1', {}, 'Run Logs'),
+    h('p',  {}, 'History of every pipeline stage run — pass and fail.')
+  )
+  const body = h('div', { class: 'page-body' })
+  page.appendChild(header)
+  page.appendChild(body)
+
+  let logs
+  try {
+    const d = await apiFetch('/api/logs')
+    logs = d.logs
+  } catch (e) {
+    body.appendChild(h('p', { style: 'color:#c0392b;padding:8px' }, `Error loading logs: ${e.message}`))
+    return
+  }
+
+  if (!logs.length) {
+    body.appendChild(h('div', { class: 'logs-empty' },
+      h('div', { class: 'logs-empty-icon' }, '📋'),
+      h('div', {}, 'No run logs yet.'),
+      h('div', { style: 'font-size:12px;margin-top:4px;color:#aab' }, 'Logs are saved automatically after each stage run.')
+    ))
+    return
+  }
+
+  // Filter bar
+  const allDeps = [...new Set(logs.map(l => l.dep))].sort()
+  const filterSel = h('select', { class: 'log-filter-sel' })
+  filterSel.appendChild(h('option', { value: '' }, 'All deployments'))
+  allDeps.forEach(d => filterSel.appendChild(h('option', { value: d }, d)))
+  if (state.deployment) filterSel.value = state.deployment
+
+  const filterRow = h('div', { class: 'log-filter-row' },
+    h('label', { style: 'font-size:12px;color:#607d8b;margin-right:6px' }, 'Deployment:'),
+    filterSel
+  )
+  body.appendChild(filterRow)
+
+  // Table container (re-rendered on filter change)
+  const tableWrap = h('div', {})
+  body.appendChild(tableWrap)
+
+  function renderTable () {
+    tableWrap.innerHTML = ''
+    const dep = filterSel.value
+    const filtered = dep ? logs.filter(l => l.dep === dep) : logs
+
+    if (!filtered.length) {
+      tableWrap.appendChild(h('p', { style: 'color:#8a9bac;margin-top:12px' }, 'No logs for this deployment yet.'))
+      return
+    }
+
+    const table = h('table', { class: 'log-table' })
+    table.appendChild(h('thead', {},
+      h('tr', {},
+        h('th', {}, 'Result'),
+        h('th', {}, 'Stage'),
+        h('th', {}, 'Deployment'),
+        h('th', {}, 'Date / Time'),
+        h('th', {}, 'Size'),
+        h('th', {}, '')
+      )
+    ))
+    const tbody = h('tbody', {})
+    filtered.forEach(entry => {
+      const badge = h('span', {
+        class: `badge ${entry.result === 'pass' ? 'done' : 'failed'}`
+      }, entry.result === 'pass' ? '✔ Pass' : '✖ Fail')
+
+      const viewBtn = h('button', { class: 'btn-secondary btn-sm' }, 'View')
+      viewBtn.onclick = () => showLogFileViewer(entry)
+
+      tbody.appendChild(h('tr', {},
+        h('td', {}, badge),
+        h('td', {}, state.stageInfo[entry.stage]?.label || entry.stage),
+        h('td', { style: 'font-family:monospace;font-size:11px' }, entry.dep),
+        h('td', { style: 'font-family:monospace;font-size:11px' }, entry.timestamp),
+        h('td', { style: 'color:#8a9bac;font-size:11px' }, formatBytes(entry.size)),
+        h('td', {}, viewBtn)
+      ))
+    })
+    table.appendChild(tbody)
+    tableWrap.appendChild(table)
+  }
+
+  filterSel.onchange = renderTable
+  renderTable()
+}
+
 /* ── Navigation ──────────────────────────────────────────────────────────────*/
 const pageRenderers = {
-  dashboard:   renderDashboard,
-  pipeline:    renderPipeline,
-  reports:     renderReports,
-  metadata:    renderMetadata,
+  dashboard:     renderDashboard,
+  pipeline:      renderPipeline,
+  logs:          renderLogs,
+  reports:       renderReports,
+  metadata:      renderMetadata,
   'dat-browser': renderDatBrowser,
 }
 
@@ -1587,13 +2530,25 @@ async function init () {
   if (!deployments.length) {
     sel.appendChild(h('option', { value: '' }, 'No deployments'))
   } else {
+    // Blank "choose" option so nothing is selected until the user picks
+    sel.appendChild(h('option', { value: '' }, '— select deployment —'))
     deployments.forEach(dep => sel.appendChild(h('option', { value: dep }, dep)))
-    state.deployment = deployments[0]
-    sel.value = state.deployment
+
+    // Restore last deployment from localStorage (e.g. after a page refresh)
+    const lastDep = localStorage.getItem('lastDeployment')
+    if (lastDep && deployments.includes(lastDep)) {
+      state.deployment = lastDep
+      sel.value = lastDep
+    } else {
+      // First launch (or stored deployment no longer exists) — stay on dashboard
+      state.deployment = null
+      sel.value = ''
+    }
   }
 
   sel.addEventListener('change', e => {
-    state.deployment = e.target.value
+    state.deployment = e.target.value || null
+    if (state.deployment) localStorage.setItem('lastDeployment', state.deployment)
     navigate(state.page)
   })
 

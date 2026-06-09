@@ -18,6 +18,7 @@ incoming_data/
 dat_files/
 deployments/
 gncutils_slocum_nc_output/
+master_cac/
 
 # ── Sample / scratch data files ───────────────────────────────────────────────
 erddap_uvi02_sample.csv

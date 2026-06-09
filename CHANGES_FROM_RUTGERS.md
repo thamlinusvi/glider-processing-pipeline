@@ -1,8 +1,13 @@
-# Changes from Rutgers rugliderqc Scripts
+# Changes from Rutgers / RUCOOL Vendored Repos
 
 This document describes all modifications made to the original
-[RUCOOL rugliderqc](https://github.com/rucool/rugliderqc) scripts and QC
-configuration files to support the UVI glider processing pipeline.
+[RUCOOL rugliderqc](https://github.com/rucool/rugliderqc) and
+[RUCOOL gncutils](https://github.com/rucool/gncutils) scripts and configuration
+files to support the UVI glider processing pipeline.
+
+These repos are vendored directly (no submodules) because the code has been
+modified and we do not want to receive upstream updates that would overwrite
+our changes.
 
 ---
 
@@ -159,14 +164,271 @@ def identify_nans(dataset, varname, pressure_da=None):
 
 ---
 
+### 6. `rugliderqc/scripts/check_duplicate_timestamps.py`
+
+**Type:** Bug fix — latent crash on datasets with duplicate timestamp pairs
+
+**Root cause:**
+The script builds a sorted list of all `.nc` files once, then iterates through
+it by index comparing each file `i` against `i+1`. When it finds that file `i+1`'s
+timestamps are a subset of file `i`'s, it renames `i+1` to `i+1.duplicate` on disk.
+On the very next iteration, `i+1` becomes the new "current" file `f` — but it has
+already been renamed, so `xr.open_dataset(f)` raises `FileNotFoundError`. The
+`except OSError` handler caught this and set `status = 1`, causing `sys.exit(1)`,
+which broke the `&&` pipeline chain and stopped all subsequent QC steps from running.
+
+The bug was latent because it only triggers when a deployment actually has at least
+one consecutive duplicate-timestamp pair. Deployments with no duplicates never hit
+the rename path, so the bug was never observed during initial testing. The
+`uvi_02-20260429T1420` deployment had 5 such pairs (from field events — aborted
+dives, segment restarts) which surfaced the bug for the first time.
+
+**What changed:**
+Added an existence check at the top of the inner loop so that files already renamed
+to `.duplicate` by a previous iteration are silently skipped rather than treated as
+read errors. Also added `ds.close()` in the `OSError` and `IndexError` handlers to
+prevent dataset handle leaks.
+
+```python
+# ORIGINAL — no guard; tries to open already-renamed file, sets status = 1
+for i, f in enumerate(ncfiles):
+    logging.debug(f'{f}')
+    try:
+        ds = xr.open_dataset(f, decode_times=False)
+    except OSError as e:
+        logging.error('Error reading file {:s} ({:})'.format(ncfiles[i], e))
+        status = 1
+        continue
+
+    try:
+        f2 = ncfiles[i + 1]
+        ds2 = xr.open_dataset(f2, decode_times=False)
+    except OSError as e:
+        logging.error('Error reading file {:s} ({:})'.format(ncfiles[i + 1], e))
+        status = 1
+        continue
+    except IndexError:
+        continue
+```
+
+```python
+# PIPELINE — skip already-renamed files silently; close ds on early exit
+for i, f in enumerate(ncfiles):
+    logging.debug(f'{f}')
+
+    # File may have been renamed to .duplicate by a previous iteration — skip silently
+    if not os.path.isfile(f):
+        continue
+
+    try:
+        ds = xr.open_dataset(f, decode_times=False)
+    except OSError as e:
+        logging.error('Error reading file {:s} ({:})'.format(ncfiles[i], e))
+        status = 1
+        continue
+
+    try:
+        f2 = ncfiles[i + 1]
+        # Next file may have been renamed to .duplicate by a previous iteration — skip silently
+        if not os.path.isfile(f2):
+            ds.close()
+            continue
+        ds2 = xr.open_dataset(f2, decode_times=False)
+    except OSError as e:
+        logging.error('Error reading file {:s} ({:})'.format(ncfiles[i + 1], e))
+        ds.close()
+        status = 1
+        continue
+    except IndexError:
+        ds.close()
+        continue
+```
+
+---
+
+### 7. `rugliderqc/scripts/ctd_hysteresis_test.py` (additional fix beyond RBR changes)
+
+**Type:** Bug fix — latent exit-code failure on deployments with no-science profiles
+
+**Root cause:**
+Three locations set `status = 1` for expected data conditions that are logged at
+DEBUG level (indicating the author considered them normal operation):
+- A test variable (`conductivity` or `temperature`) not found in the current file
+- No data found for the test variable in the current file
+- A test variable not found in the paired down/up profile file
+
+Any deployment with profiles that lack science variables (e.g. pure navigation
+profiles from aborted dives) triggers all three for every such file, causing
+`sys.exit(1)` at the end and breaking the `&&` pipeline chain.  The script's
+summary correctly reports these as "not evaluated profiles" — the data handling
+is fine, only the exit code was wrong.
+
+**What changed:**
+Removed `status = 1` from the three DEBUG-level skip paths.  Legitimate errors
+(OSError reading a file, missing config file, zero files found) still set
+`status = 1` and fail correctly.
+
+```python
+# ORIGINAL — sets status=1 for expected missing-variable conditions
+except KeyError:
+    logging.debug('{:s} not found in file {:s})'.format(testvar, ncfiles[i]))
+    status = 1
+    continue
+
+if len(data_idx) == 0:
+    logging.debug('{:s} data not found in file {:s})'.format(testvar, ncfiles[i]))
+    status = 1
+    continue
+
+except KeyError:  # paired file
+    logging.debug('{:s} not found in file {:s})'.format(testvar, f2))
+    status = 1
+    ...
+
+# PIPELINE — skip silently, no status change
+except KeyError:
+    logging.debug('{:s} not found in file {:s})'.format(testvar, ncfiles[i]))
+    continue  # no status = 1
+
+if len(data_idx) == 0:
+    logging.debug('{:s} data not found in file {:s})'.format(testvar, ncfiles[i]))
+    continue  # no status = 1
+
+except KeyError:  # paired file
+    logging.debug('{:s} not found in file {:s})'.format(testvar, f2))
+    ...     # no status = 1
+```
+
+---
+
+### 8. `rugliderqc/scripts/time_shift.py` (additional fix beyond RBR changes)
+
+**Type:** Bug fix — latent exit-code failures on deployments with no-science profiles or no time-shift config
+
+**Root cause:**
+Three separate `status = 1` assignments had the same pattern as the `ctd_hysteresis_test.py` fix
+(Section 7) — expected data conditions logged at DEBUG/WARNING level were incorrectly treated as
+pipeline failures:
+
+1. **No `time_shift.yml` config file** (line 213, WARNING level): Any deployment that doesn't need
+   time shifting (no DO or pH sensors) will not have a `time_shift.yml`.  The original code set
+   `status = 1` and continued, but since status was already 1, the script exited with code 1 and
+   broke the pipeline chain.  A missing config file is a valid deployment state, not an error.
+
+2. **`testvar` KeyError in current file** (DEBUG level): Same pattern as ctd_hysteresis_test.py —
+   `testvar` (e.g. `oxygen_concentration`) not present in a no-science profile, logged at DEBUG
+   level but setting `status = 1`.
+
+3. **Empty `data_idx`** (DEBUG level): No non-NaN data for `testvar` in the current file, also
+   logged at DEBUG but setting `status = 1`.
+
+**What changed:**
+- Removed `status = 1` from the missing-config-file case; it now logs the warning and skips the
+  deployment via `continue` (same behaviour, no pipeline failure).
+- Removed `status = 1` from the two DEBUG-level skip paths (KeyError and empty data_idx).
+  Legitimate errors (OSError reading files, OSError reading source_file attribute) still set
+  `status = 1` correctly.
+
+```python
+# ORIGINAL — sets status=1 for missing config file and expected missing-variable conditions
+if not os.path.isfile(config_file):
+    logging.warning('Time shifts not calculated because deployment config file '
+                    'not specified: {:s}.'.format(config_file))
+    status = 1
+    continue
+
+except KeyError:
+    logging.debug('{:s} not found in file {:s})'.format(testvar, f))
+    status = 1
+    continue
+
+if len(data_idx) == 0:
+    logging.debug('{:s} data not found in file {:s})'.format(testvar, f))
+    status = 1
+    continue
+
+# PIPELINE — skip silently where appropriate, no status change
+if not os.path.isfile(config_file):
+    logging.warning('Time shifts not calculated because deployment config file '
+                    'not specified: {:s}.'.format(config_file))
+    # No config file is expected for deployments without time-shiftable sensors
+    continue  # no status = 1
+
+except KeyError:
+    # Variable absent in this file (e.g. a no-science profile) — skip silently
+    logging.debug('{:s} not found in file {:s})'.format(testvar, f))
+    continue  # no status = 1
+
+if len(data_idx) == 0:
+    # No data for this variable in this file — skip silently
+    logging.debug('{:s} data not found in file {:s})'.format(testvar, f))
+    continue  # no status = 1
+```
+
+---
+
+### 9. `rugliderqc/scripts/check_science_variables.py`
+
+**Type:** Bug fix — nosci files silently recreated after rename, propagating through all downstream scripts
+
+**Root cause:**
+The script renames files without science variables to `<filename>.nosci` (line 169), which is correct —
+all downstream scripts glob `*.nc` and would skip `*.nc.nosci` files automatically. However, `ds.to_netcdf(f)`
+at line 180 runs unconditionally for **all** files in the loop, both with and without science variables.
+For a just-renamed nosci file, writing back to `f` (the original `.nc` path) **recreates** the file that
+was just renamed. After `check_science_variables` finishes, both the `.nosci` and the `.nc` version exist
+in `qc_queue`. Every downstream script then picks up the `.nc` version and processes it, producing:
+
+- 24 `"No pressure variable found"` warnings in `glider_qartod_qc`
+- 8 `"not evaluated"` profiles in `ctd_hysteresis_test`
+- Silent skips (KeyError / empty data_idx) in `time_shift`
+- Wasted processing time (~20 minutes across all scripts for 24 files)
+
+The bug was present in the original Rutgers code. It only became visible at UVI because the
+`uvi_02-20260429T1420` deployment had 24 pure-navigation (`*_dbd.nc`) profiles with no science data,
+compared to none in the uvi_01 test deployment.
+
+The `stages.py` entrypoint already accounts for leftover `.nosci` files with a clean-before-run
+`rm -f qc_queue/*` step; the design was always that `.nosci` files would be excluded and cleaned
+up on the next run. The rename just never worked end-to-end because of the unconditional write.
+
+**What changed:**
+Added `continue` after the nosci rename/log/count block so that `ds.to_netcdf(f)` is never reached
+for files without science variables.
+
+```python
+# ORIGINAL — ds.to_netcdf(f) runs unconditionally, recreating the .nc file after the rename
+if len(ds_sci_vars) == 0:
+    os.rename(f, f'{f}.nosci')
+    logging.info('Science variables not found in file: {:s}'.format(f))
+    summary += 1
+else:
+    modified = check_zeros(ctd_vars, ds, modified, 'conductivity', 'temperature')
+    modified = check_zeros(oxygen_vars, ds, modified, 'oxygen_concentration', 'optode_water_temperature')
+
+ds.to_netcdf(f)   # <-- runs for BOTH branches; recreates .nc for nosci files
+
+# PIPELINE — continue skips the write-back for nosci files
+if len(ds_sci_vars) == 0:
+    os.rename(f, f'{f}.nosci')
+    logging.info('Science variables not found in file: {:s}'.format(f))
+    summary += 1
+    continue   # Skip ds.to_netcdf — writing back to f would recreate the .nc file
+else:
+    modified = check_zeros(ctd_vars, ds, modified, 'conductivity', 'temperature')
+    modified = check_zeros(oxygen_vars, ds, modified, 'oxygen_concentration', 'optode_water_temperature')
+
+ds.to_netcdf(f)   # only reached for files that have science variables
+```
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |
 |---|---|
-| `check_science_variables.py` | Unchanged |
 | `interpolate_depth.py` | Unchanged |
 | `move_nc_files.py` | Unchanged |
-| `check_duplicate_timestamps.py` | Unchanged |
 | `manual_qcflag.py` | Unchanged |
 | `data_gap_check.py` | Unchanged |
 | `ioos_qc_mods/qartod.py` | Unchanged (same patch as Rutgers original) |
@@ -282,6 +544,61 @@ sci_water_pressure:
 
 ---
 
+---
+
+## gncutils Changes
+
+### 1. `gncutils/gncutils/writers/BaseTrajectoryNetCDFWriter.py`
+
+**Type:** Defensive — UTF-8 BOM tolerance
+
+**What changed:**
+Four `open()` calls that read JSON config files (`sensor_defs.json`,
+`deployment.json`, `global_attributes.json`, `instruments.json`) used the
+default system encoding. On Windows, files saved by tools like Notepad are
+often written with a UTF-8 BOM (`\xef\xbb\xbf`). Python's default `json.load()`
+treats the BOM as the first character and raises `"Expecting value: line 1
+column 1 (char 0)"`, causing the NetCDF writer to silently skip the affected
+config (logging an error but continuing with empty/default values).
+
+All four reads were updated to use `encoding='utf-8-sig'`, which automatically
+strips the BOM when present and is a no-op for files without one.
+
+```python
+# ORIGINAL (all four reads)
+with open(self._sensor_defs_config_path, 'r') as fid:
+    self._config_sensor_defs = json.load(fid)
+
+with open(self._deployment_config_path, 'r') as fid:
+    deployment_configs = json.load(fid)
+
+with open(self._global_attributes_path, 'r') as fid:
+    global_atts = json.load(fid)
+
+with open(self._instruments_config_path, 'r') as fid:
+    instrument_configs = json.load(fid)
+```
+
+```python
+# PIPELINE (utf-8-sig on all four reads)
+with open(self._sensor_defs_config_path, 'r', encoding='utf-8-sig') as fid:
+    self._config_sensor_defs = json.load(fid)
+
+with open(self._deployment_config_path, 'r', encoding='utf-8-sig') as fid:
+    deployment_configs = json.load(fid)
+
+with open(self._global_attributes_path, 'r', encoding='utf-8-sig') as fid:
+    global_atts = json.load(fid)
+
+with open(self._instruments_config_path, 'r', encoding='utf-8-sig') as fid:
+    instrument_configs = json.load(fid)
+```
+
+**Lines changed:** `_load_sensor_defs()` (line 963) and `_read_configs()`
+(lines 1064, 1072, 1081).
+
+---
+
 ## Docker Changes
 
 ### `Dockerfile`
@@ -308,8 +625,12 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `scripts/time_shift.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/summarize_qartod_flags.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
 | `scripts/add_derived_variables.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
+| `scripts/check_duplicate_timestamps.py` | Bug fix | Latent crash when renamed `.duplicate` file re-opened as "current" in next iteration; set `status=1` and broke pipeline chain |
+| `scripts/check_science_variables.py` | Bug fix | `ds.to_netcdf(f)` ran unconditionally, recreating the `.nc` file that was just renamed to `.nosci`; all 24 nosci profiles propagated through every downstream script |
 | `config/global_regional/global_configs.yml` | RBR support + date range fix | Added `sci_water_pressure`; window ended 2021 |
 | `config/global_regional/usvi_configs.yml` | RBR support + added density QC | Added `sci_water_pressure` and `density` streams |
 | `config/gross_flatline/rbr_legato3_ctd_gross_flatline.yml` | RBR support | Added `sci_water_pressure` flat_line_test |
 | `config/deployment_specific/qctests.yml` | Documentation + default fix | Comments added; `add_derived_variables` default → False |
 | `Dockerfile` | Build fix | Anaconda ToS acceptance required by recent Miniconda |
+| **gncutils** | | |
+| `gncutils/writers/BaseTrajectoryNetCDFWriter.py` | BOM tolerance | 4 JSON reads updated to `utf-8-sig`; BOM-prefixed files (e.g. from Notepad) were silently skipping config |

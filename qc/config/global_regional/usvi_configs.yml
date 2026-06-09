@@ -8,8 +8,8 @@ contexts:
       temperature:
         qartod:
           climatology_test:
-            suspect_span: [22, 32]
-            fail_span: [15, 35]
+            suspect_span: [4.5, 31]
+            fail_span: [4, 32]
           spike_test:
             suspect_threshold: 0.2
             fail_threshold: 1.0
@@ -19,8 +19,8 @@ contexts:
       conductivity:
         qartod:
           climatology_test:
-            suspect_span: [3, 5.5]
-            fail_span: [2, 6]
+            suspect_span: [3.1, 5.9]
+            fail_span: [3, 6]
           spike_test:
             suspect_threshold: 0.01
             fail_threshold: 0.1
@@ -30,8 +30,8 @@ contexts:
       salinity:
         qartod:
           climatology_test:
-            suspect_span: [33, 37.5]
-            fail_span: [30, 40]
+            suspect_span: [32, 38.0]
+            fail_span: [30, 38.5]
           spike_test:
             suspect_threshold: 0.01
             fail_threshold: 0.2
@@ -63,8 +63,8 @@ contexts:
       density:
         qartod:
           climatology_test:
-            suspect_span: [1023, 1027]
-            fail_span: [1020, 1030]
+            suspect_span: [1017, 1034]
+            fail_span: [1015, 1035]
           spike_test:
             suspect_threshold: 0.025
             fail_threshold: 0.3

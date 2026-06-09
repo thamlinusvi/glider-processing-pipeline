@@ -210,7 +210,8 @@ def main(args):
                 logging.warning(
                     'Time shifts not calculated because deployment config file not specified: {:s}.'.format(
                         config_file))
-                status = 1
+                # No config file is expected for deployments without time-shiftable sensors
+                # (e.g. no DO or pH).  Skip gracefully rather than failing the pipeline.
                 continue
 
             config_dict = loadconfig(config_file)
@@ -286,8 +287,8 @@ def main(args):
                         try:
                             ds[testvar]
                         except KeyError:
+                            # Variable absent in this file (e.g. a no-science profile) — skip silently
                             logging.debug('{:s} not found in file {:s})'.format(testvar, f))
-                            status = 1
                             continue
 
                         # support both 'pressure' (standard) and 'sci_water_pressure' (gncutils default)
@@ -307,8 +308,8 @@ def main(args):
                         data_idx, pressure_idx = identify_nans(ds, testvar, press_da)
 
                         if len(data_idx) == 0:
+                            # No data for this variable in this file — skip silently
                             logging.debug('{:s} data not found in file {:s})'.format(testvar, f))
-                            status = 1
                             continue
 
                         # make a copy of the data and apply QARTOD QC flags

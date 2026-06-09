@@ -17,7 +17,11 @@ def logfile_basename():
 
 def logfile_deploymentname(deployment, dataset_type, cdm_data_type, mode):
     user = pwd.getpwuid(os.getuid())[0]
-    logfilename = '-'.join([user, datetime.now().strftime('%Y%m%d') + '_' + deployment,
+    # Use QC_RUN_TS from the environment when set — the pipeline stage runner exports it
+    # so every QC script in the same run lands on the same per-run log file.
+    # Fall back to a fresh timestamp when scripts are invoked manually outside the pipeline.
+    run_ts = os.environ.get('QC_RUN_TS') or datetime.now().strftime('%Y%m%dT%H%M%S')
+    logfilename = '-'.join([user, run_ts + '_' + deployment,
                             dataset_type, cdm_data_type, mode, 'qc']) + '.log'
 
     return logfilename

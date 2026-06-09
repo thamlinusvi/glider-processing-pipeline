@@ -169,6 +169,7 @@ def main(args):
                     os.rename(f, f'{f}.nosci')
                     logging.info('Science variables not found in file: {:s}'.format(f))
                     summary += 1
+                    continue  # Skip ds.to_netcdf — writing back to f would recreate the .nc file
                 else:
                     # Set CTD values to fill values where conductivity and temperature both = 0.00
                     # Try all versions of CTD variable names

@@ -80,6 +80,11 @@ def main(args):
             duplicates = 0
             for i, f in enumerate(ncfiles):
                 logging.debug(f'{f}')
+
+                # File may have been renamed to .duplicate by a previous iteration — skip silently
+                if not os.path.isfile(f):
+                    continue
+
                 try:
                     ds = xr.open_dataset(f, decode_times=False)
                 except OSError as e:
@@ -90,12 +95,18 @@ def main(args):
                 # find the next file and compare timestamps
                 try:
                     f2 = ncfiles[i + 1]
+                    # Next file may have been renamed to .duplicate by a previous iteration — skip silently
+                    if not os.path.isfile(f2):
+                        ds.close()
+                        continue
                     ds2 = xr.open_dataset(f2, decode_times=False)
                 except OSError as e:
                     logging.error('Error reading file {:s} ({:})'.format(ncfiles[i + 1], e))
+                    ds.close()
                     status = 1
                     continue
                 except IndexError:
+                    ds.close()
                     continue
 
                 if set(ds2.time.values).issubset(ds.time.values):

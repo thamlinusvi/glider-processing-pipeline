@@ -241,8 +241,8 @@ def main(args):
                     try:
                         ds[testvar]
                     except KeyError:
+                        # Variable absent in this file (e.g. a no-science profile) — skip silently
                         logging.debug('{:s} not found in file {:s})'.format(testvar, ncfiles[i]))
-                        status = 1
                         continue
 
                     qc_varname = f'{testvar}_hysteresis_test'
@@ -252,8 +252,8 @@ def main(args):
                     data_idx, flag_vals = initialize_flags(ds, testvar)
 
                     if len(data_idx) == 0:
+                        # No data for this variable in this file — skip silently
                         logging.debug('{:s} data not found in file {:s})'.format(testvar, ncfiles[i]))
-                        status = 1
                         continue
 
                     # apply qartod QC to pressure
@@ -315,8 +315,8 @@ def main(args):
                         try:
                             ds2[testvar]
                         except KeyError:
+                            # Variable absent in paired file — skip silently, mark not evaluated
                             logging.debug('{:s} not found in file {:s})'.format(testvar, f2))
-                            status = 1
                             # TODO should we be checking the next file? example ru30_20210510T015902Z_sbd.nc
                             # leave flag values on the first file as NOT_EVALUATED/UNKNOWN (2) and set the attributes
                             add_da(ds, flag_vals, attrs, testvar, qc_varname)

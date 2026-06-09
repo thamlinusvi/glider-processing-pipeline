@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime
 
-STAGES = ['dbd_to_dat', 'dat_to_profile_nc', 'dat_to_trajectory_nc', 'fix_metadata', 'qc', 'report']
+STAGES = ['dbd_to_dat', 'dbd_to_dat_flight', 'dat_to_profile_nc', 'dat_to_trajectory_nc', 'dat_to_trajectory_flight_nc', 'fix_metadata', 'preflight', 'qc', 'report']
 
 STATUS_NOT_RUN  = 'not_run'
 STATUS_RUNNING  = 'running'
