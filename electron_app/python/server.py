@@ -57,10 +57,21 @@ _TRAJ_WORKERS = min(24, (os.cpu_count() or 2) * 4)
 
 # ── NC worker functions (called from ThreadPoolExecutor) ──────────────────────
 def _nc_read_surf(fpath):
-    """Read time/lat/lon from one trajectory NC file. Thread-safe."""
+    """Read time/lat/lon from one trajectory NC file. Thread-safe.
+    Tries netCDF4 first (faster), falls back to xarray."""
+    import numpy as np
+
+    def _align(a, n):
+        a = np.asarray(a, dtype=np.float64).ravel()
+        if a.size == n:
+            return a
+        out = np.full(n, np.nan)
+        out[:min(a.size, n)] = a[:min(a.size, n)]
+        return out
+
+    # ── netCDF4 path ──────────────────────────────────────────────────────────
     try:
         import netCDF4 as _nc4
-        import numpy as np
         with _nc4.Dataset(fpath, 'r') as ds:
             vs = ds.variables
             if 'time' not in vs:
@@ -69,18 +80,28 @@ def _nc_read_surf(fpath):
             if t.size == 0:
                 return None
             n = t.size
+            lat = np.ma.filled(vs['latitude'][:],  np.nan) if 'latitude'  in vs else np.full(n, np.nan)
+            lon = np.ma.filled(vs['longitude'][:], np.nan) if 'longitude' in vs else np.full(n, np.nan)
+            return {'t': t, 'lat': _align(lat, n), 'lon': _align(lon, n)}
+    except ImportError:
+        pass   # netCDF4 not available — fall through to xarray
+    except Exception:
+        return None
 
-            def _v(name):
-                if name not in vs:
-                    return np.full(n, np.nan)
-                a = np.ma.filled(vs[name][:], np.nan).astype(np.float64).ravel()
-                if a.size == n:
-                    return a
-                out = np.full(n, np.nan)
-                out[:min(a.size, n)] = a[:min(a.size, n)]
-                return out
-
-            return {'t': t, 'lat': _v('latitude'), 'lon': _v('longitude')}
+    # ── xarray fallback ───────────────────────────────────────────────────────
+    try:
+        import xarray as xr
+        ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+        if 'time' not in ds:
+            ds.close(); return None
+        t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
+        if t.size == 0:
+            ds.close(); return None
+        n   = t.size
+        lat = np.asarray(ds['latitude'].values,  dtype=np.float64) if 'latitude'  in ds else np.full(n, np.nan)
+        lon = np.asarray(ds['longitude'].values, dtype=np.float64) if 'longitude' in ds else np.full(n, np.nan)
+        ds.close()
+        return {'t': t, 'lat': _align(lat, n), 'lon': _align(lon, n)}
     except Exception:
         return None
 
@@ -89,10 +110,21 @@ _TRAJ_PHYS_VARS = ['latitude', 'longitude', 'm_pitch', 'm_roll', 'm_heading',
                     'm_battery', 'm_coulomb_amphr', 'm_vacuum', 'm_depth']
 
 def _nc_read_traj(fpath):
-    """Read all flight variables from one trajectory NC file. Thread-safe."""
+    """Read all flight variables from one trajectory NC file. Thread-safe.
+    Tries netCDF4 first (faster), falls back to xarray."""
+    import numpy as np
+
+    def _align(a, n):
+        a = np.asarray(a, dtype=np.float64).ravel()
+        if a.size == n:
+            return a
+        out = np.full(n, np.nan)
+        out[:min(a.size, n)] = a[:min(a.size, n)]
+        return out
+
+    # ── netCDF4 path ──────────────────────────────────────────────────────────
     try:
         import netCDF4 as _nc4
-        import numpy as np
         with _nc4.Dataset(fpath, 'r') as ds:
             vs = ds.variables
             if 'time' not in vs:
@@ -100,22 +132,33 @@ def _nc_read_traj(fpath):
             t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
             if t.size == 0:
                 return None
-            n = t.size
-
-            def _v(name):
-                if name not in vs:
-                    return np.full(n, np.nan)
-                a = np.ma.filled(vs[name][:], np.nan).astype(np.float64).ravel()
-                if a.size == n:
-                    return a
-                out = np.full(n, np.nan)
-                out[:min(a.size, n)] = a[:min(a.size, n)]
-                return out
-
+            n      = t.size
             result = {'t': t}
             for v in _TRAJ_PHYS_VARS:
-                result[v] = _v(v)
+                raw = np.ma.filled(vs[v][:], np.nan) if v in vs else np.full(n, np.nan)
+                result[v] = _align(raw, n)
             return result
+    except ImportError:
+        pass
+    except Exception:
+        return None
+
+    # ── xarray fallback ───────────────────────────────────────────────────────
+    try:
+        import xarray as xr
+        ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+        if 'time' not in ds:
+            ds.close(); return None
+        t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
+        if t.size == 0:
+            ds.close(); return None
+        n      = t.size
+        result = {'t': t}
+        for v in _TRAJ_PHYS_VARS:
+            raw = np.asarray(ds[v].values, dtype=np.float64) if v in ds else np.full(n, np.nan)
+            result[v] = _align(raw, n)
+        ds.close()
+        return result
     except Exception:
         return None
 
