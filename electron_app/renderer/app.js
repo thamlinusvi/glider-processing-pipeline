@@ -1024,9 +1024,42 @@ async function renderReports () {
     h('p',  {}, dep ? `Deployment: ${dep}` : 'Select a deployment.')
   ))
 
+  let _reportLeafletMap = null   // persists between tab switches within this render
+
+  async function switchToVars () {
+    tabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'variables'))
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-variables'))
+    if (varsTab.dataset.loaded) return
+    varsTab.dataset.loaded = '1'
+    await renderNcVariablesTab(dep, varsTab)
+  }
+
+  async function switchToMap () {
+    tabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'map'))
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-map'))
+    if (mapTab.dataset.loaded) {
+      // Leaflet needs invalidateSize after container was hidden
+      setTimeout(() => { if (_reportLeafletMap) _reportLeafletMap.invalidateSize() }, 60)
+      return
+    }
+    mapTab.dataset.loaded = '1'
+    _reportLeafletMap = await renderTrajectoryMap(dep, mapTab)
+  }
+
+  async function switchToFlight () {
+    tabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'flight'))
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-flight'))
+    if (flightTab.dataset.loaded) return
+    flightTab.dataset.loaded = '1'
+    await renderFlightStats(dep, flightTab)
+  }
+
   const tabBar = h('div', { class: 'tab-bar' },
-    h('button', { class: 'tab-btn active', 'data-tab': 'report', onclick: switchTab }, 'QC Report'),
-    h('button', { class: 'tab-btn',        'data-tab': 'plots',  onclick: switchTab }, 'Plots')
+    h('button', { class: 'tab-btn active', 'data-tab': 'report',    onclick: switchTab     }, 'QC Report'),
+    h('button', { class: 'tab-btn',        'data-tab': 'plots',     onclick: switchTab     }, 'Plots'),
+    h('button', { class: 'tab-btn',        'data-tab': 'variables', onclick: switchToVars  }, 'Variables'),
+    h('button', { class: 'tab-btn',        'data-tab': 'map',       onclick: switchToMap   }, 'Map'),
+    h('button', { class: 'tab-btn',        'data-tab': 'flight',    onclick: switchToFlight}, 'Flight Stats'),
   )
   page.appendChild(tabBar)
 
@@ -1035,11 +1068,23 @@ async function renderReports () {
   const reportTab = h('div', { class: 'tab-panel active', id: 'tab-report' }, frame)
 
   // Plots tab
-  const plotGrid   = h('div', { class: 'plot-grid' })
-  const plotsTab   = h('div', { class: 'tab-panel', id: 'tab-plots' }, plotGrid)
+  const plotGrid = h('div', { class: 'plot-grid' })
+  const plotsTab = h('div', { class: 'tab-panel', id: 'tab-plots' }, plotGrid)
+
+  // Variables tab
+  const varsTab   = h('div', { class: 'tab-panel', id: 'tab-variables' })
+
+  // Map tab
+  const mapTab    = h('div', { class: 'tab-panel', id: 'tab-map'    })
+
+  // Flight Stats tab
+  const flightTab = h('div', { class: 'tab-panel', id: 'tab-flight' })
 
   page.appendChild(reportTab)
   page.appendChild(plotsTab)
+  page.appendChild(varsTab)
+  page.appendChild(mapTab)
+  page.appendChild(flightTab)
 
   if (dep) {
     try {
@@ -1210,6 +1255,333 @@ function openPlotViewer (files, startIdx) {
   show(startIdx)
   _plotViewer = { close }
 }
+
+/* ── NC Variables tab ────────────────────────────────────────────────────────*/
+async function renderNcVariablesTab (dep, container) {
+  container.innerHTML = '<div class="vars-loading">Loading variable listings…</div>'
+
+  let data
+  try { data = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/nc-variables`) }
+  catch (e) { container.innerHTML = `<div class="empty-state">Could not load variables: ${e.message}</div>`; return }
+
+  container.innerHTML = ''
+
+  const SECTIONS = [
+    { key: 'profile',  label: 'Profile NC',          stage: '2a' },
+    { key: 'traj_sci', label: 'Trajectory NC (Sci)',  stage: '2b' },
+    { key: 'traj_flt', label: 'Trajectory NC (Flt)',  stage: '2c' },
+    { key: 'qc',       label: 'QC Output NC',         stage: '4'  },
+  ]
+
+  const grid = h('div', { class: 'vars-grid' })
+
+  for (const { key, label, stage } of SECTIONS) {
+    const sec = data[key]
+    const card = h('div', { class: 'vars-card' })
+
+    // Card header
+    const stagePill = h('span', { class: 'nc-section-stage' }, `Stage ${stage}`)
+    card.appendChild(h('div', { class: 'vars-card-header' },
+      h('span', { class: 'vars-card-title' }, label),
+      stagePill
+    ))
+
+    if (!sec || !sec.exists) {
+      card.appendChild(h('div', { class: 'vars-empty' }, 'Directory not found — stage not yet run.'))
+    } else if (!sec.variables || !sec.variables.length) {
+      card.appendChild(h('div', { class: 'vars-empty' }, sec.error || 'No files found.'))
+    } else {
+      // Sample file label
+      card.appendChild(h('div', { class: 'vars-sample-file' }, `Sample: ${sec.file}`))
+
+      // Search box
+      const search = h('input', {
+        type: 'text', placeholder: `Search ${sec.variables.length} variables…`,
+        class: 'vars-search',
+      })
+      card.appendChild(search)
+
+      // Variable list
+      const list = h('div', { class: 'vars-list' })
+
+      function renderList (filter) {
+        list.innerHTML = ''
+        const q = filter.toLowerCase()
+        const filtered = sec.variables.filter(v =>
+          !q || v.name.toLowerCase().includes(q) || v.long_name.toLowerCase().includes(q)
+        )
+        if (!filtered.length) {
+          list.appendChild(h('div', { class: 'vars-empty' }, 'No matches.'))
+          return
+        }
+        for (const v of filtered) {
+          const isQcFlag = v.name.includes('_qartod_') || v.name.includes('_flag')
+          const row = h('div', { class: `vars-row${isQcFlag ? ' vars-row--qc' : ''}` },
+            h('span', { class: 'vars-name', title: v.name }, v.name),
+            h('span', { class: 'vars-units' }, v.units || '—'),
+            h('span', { class: 'vars-longname', title: v.long_name }, v.long_name || ''),
+          )
+          list.appendChild(row)
+        }
+      }
+
+      renderList('')
+      search.addEventListener('input', () => renderList(search.value))
+      card.appendChild(list)
+    }
+
+    grid.appendChild(card)
+  }
+
+  container.appendChild(grid)
+}
+
+
+/* ── Trajectory Map ──────────────────────────────────────────────────────────*/
+/** Dynamically loads Leaflet from CDN (no-op if already loaded). */
+async function loadLeaflet () {
+  if (!document.getElementById('leaflet-css')) {
+    const link = document.createElement('link')
+    link.id   = 'leaflet-css'
+    link.rel  = 'stylesheet'
+    link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
+    document.head.appendChild(link)
+  }
+  if (!window.L) {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script')
+      s.src     = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+      s.onload  = resolve
+      s.onerror = () => reject(new Error('Could not load Leaflet from CDN'))
+      document.head.appendChild(s)
+    })
+  }
+  return window.L
+}
+
+/**
+ * Render the interactive glider path map.
+ * Returns the Leaflet map object so the caller can call invalidateSize() on tab switch.
+ */
+async function renderTrajectoryMap (dep, container) {
+  container.innerHTML = ''
+  container.appendChild(h('div', { class: 'traj-loading' },
+    '⏳ Loading trajectory data from ' + dep + '…',
+    h('br', {}),
+    h('span', { style: 'font-size:11px;color:#546e7a' },
+      'First load reads all trajectory NC files and may take 1–3 minutes. Subsequent loads are instant.')
+  ))
+
+  let trajData
+  try {
+    trajData = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/trajectory-report`)
+  } catch (e) {
+    container.innerHTML = ''
+    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load trajectory data: ' + e.message))
+    return null
+  }
+
+  container.innerHTML = ''
+
+  const { surfacings, stats } = trajData
+  const lats  = surfacings.lats  || []
+  const lons  = surfacings.lons  || []
+  const times = surfacings.times || []
+
+  // ── Header bar ─────────────────────────────────────────────────────────────
+  const kmzBtn = h('button', { class: 'btn-secondary',
+    onclick: () => {
+      const a = document.createElement('a')
+      a.href     = `${API}/api/deployment/${encodeURIComponent(dep)}/kmz`
+      a.download = `${dep}_glider_track.kmz`
+      document.body.appendChild(a); a.click(); a.remove()
+    }
+  }, '⬇ Download KMZ')
+
+  const headerBar = h('div', { class: 'traj-header-bar' },
+    h('span', { class: 'traj-stat-chip' }, `${stats.n_surfacings} GPS surfacings`),
+    h('span', { class: 'traj-stat-chip' }, `${stats.n_records.toLocaleString()} records`),
+    h('span', { class: 'traj-stat-chip' }, `${stats.n_files} traj files`),
+    kmzBtn,
+  )
+  container.appendChild(headerBar)
+
+  if (!lats.length) {
+    container.appendChild(h('div', { class: 'empty-state' },
+      'No GPS surfacings found in trajectory data.'))
+    return null
+  }
+
+  // ── Map container ──────────────────────────────────────────────────────────
+  const mapDiv = h('div', { id: 'traj-map-canvas', class: 'traj-map-canvas' })
+  container.appendChild(mapDiv)
+
+  let leafletMap = null
+  try {
+    const L = await loadLeaflet()
+
+    leafletMap = L.map(mapDiv)
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 18,
+    }).addTo(leafletMap)
+
+    // Draw track polyline
+    const latLngs = lats.map((lat, i) => [lat, lons[i]])
+    L.polyline(latLngs, { color: '#f97316', weight: 2, opacity: 0.8 }).addTo(leafletMap)
+
+    // Markers for each surfacing (subsample if many — only show every Nth)
+    const MAX_MARKERS = 300
+    const step = Math.max(1, Math.ceil(lats.length / MAX_MARKERS))
+    lats.forEach((lat, i) => {
+      if (i % step !== 0 && i !== lats.length - 1) return
+      const isFirst = (i === 0)
+      const isLast  = (i === lats.length - 1)
+      const color   = isFirst ? '#22c55e' : isLast ? '#ef4444' : '#3b82f6'
+      const size    = (isFirst || isLast) ? 14 : 10
+      const icon = L.divIcon({
+        className: '',
+        html: `<div style="background:${color};border:2px solid rgba(255,255,255,0.9);
+                           border-radius:50%;width:${size}px;height:${size}px;
+                           box-shadow:0 1px 3px rgba(0,0,0,0.4)"></div>`,
+        iconSize:   [size, size],
+        iconAnchor: [size / 2, size / 2],
+      })
+      const popupHtml = `<b>Surfacing ${i + 1} of ${lats.length}</b><br>${times[i] || ''}`
+      L.marker([lat, lons[i]], { icon }).bindPopup(popupHtml).addTo(leafletMap)
+    })
+
+    // Fit to track bounds
+    leafletMap.fitBounds(latLngs, { padding: [20, 20] })
+
+  } catch (e) {
+    const errEl = h('div', { class: 'empty-state' }, 'Map error: ' + e.message)
+    container.appendChild(errEl)
+  }
+
+  return leafletMap
+}
+
+
+/* ── Flight Stats ────────────────────────────────────────────────────────────*/
+/** Dynamically loads Plotly from CDN (no-op if already loaded). */
+async function loadPlotlyLib () {
+  if (window.Plotly) return window.Plotly
+  await new Promise((resolve, reject) => {
+    const s = document.createElement('script')
+    s.src     = 'https://cdn.plot.ly/plotly-2.35.2.min.js'
+    s.onload  = resolve
+    s.onerror = () => reject(new Error('Could not load Plotly from CDN'))
+    document.head.appendChild(s)
+  })
+  return window.Plotly
+}
+
+function _statCard (label, value) {
+  return h('div', { class: 'flight-stat-card' },
+    h('div', { class: 'flight-stat-value' }, value != null ? String(value) : 'N/A'),
+    h('div', { class: 'flight-stat-label' }, label),
+  )
+}
+
+async function renderFlightStats (dep, container) {
+  container.innerHTML = ''
+  container.appendChild(h('div', { class: 'traj-loading' },
+    '⏳ Loading trajectory data…'))
+
+  let trajData
+  try {
+    trajData = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/trajectory-report`)
+  } catch (e) {
+    container.innerHTML = ''
+    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load trajectory data: ' + e.message))
+    return
+  }
+
+  container.innerHTML = ''
+
+  const { timeseries, stats } = trajData
+  const times = timeseries.time
+
+  // ── Summary stat cards ─────────────────────────────────────────────────────
+  const fmtV = (v, d = 2) => v == null ? 'N/A' : Number(v).toFixed(d)
+
+  container.appendChild(h('div', { class: 'flight-stats-grid' },
+    _statCard('GPS Surfacings',   stats.n_surfacings),
+    _statCard('Records',          stats.n_records.toLocaleString()),
+    _statCard('Battery Min',      fmtV(stats.battery_v.min, 2) + ' V'),
+    _statCard('Battery Max',      fmtV(stats.battery_v.max, 2) + ' V'),
+    _statCard('Amp-Hours Used',   stats.total_ah_used != null ? fmtV(stats.total_ah_used, 1) + ' Ah' : 'N/A'),
+    _statCard('Mean Pitch',       fmtV(stats.pitch_deg.mean, 1) + '°'),
+    _statCard('Mean Roll',        fmtV(stats.roll_deg.mean,  1) + '°'),
+    _statCard('Mean Vacuum',      fmtV(stats.vacuum_inhg.mean, 2) + ' inHg'),
+  ))
+
+  const chartsWrap = h('div', { class: 'flight-charts' })
+  container.appendChild(chartsWrap)
+
+  // ── Plotly charts ──────────────────────────────────────────────────────────
+  const DARK = {
+    paper_bgcolor: '#131c27',
+    plot_bgcolor:  '#0f1720',
+    font:          { color: '#9ab4cc', size: 11 },
+    margin:        { l: 56, r: 16, t: 10, b: 48 },
+    xaxis:         { type: 'date', gridcolor: '#1e2d40', zerolinecolor: '#1e2d40' },
+    showlegend:    true,
+    legend:        { orientation: 'h', y: 1.08, font: { size: 11 } },
+  }
+
+  function addChart (title, traces) {
+    const div = h('div', { class: 'flight-chart' })
+    chartsWrap.appendChild(h('div', { class: 'flight-chart-wrap' },
+      h('div', { class: 'flight-chart-title' }, title),
+      div))
+    return div
+  }
+
+  try {
+    const Plotly = await loadPlotlyLib()
+
+    const cfg = { responsive: true, displayModeBar: false }
+
+    // Pitch & Roll
+    const prDiv = addChart('Pitch & Roll (degrees)')
+    Plotly.newPlot(prDiv, [
+      { x: times, y: timeseries.pitch, name: 'Pitch', type: 'scattergl', mode: 'lines',
+        line: { color: '#60a5fa', width: 1 } },
+      { x: times, y: timeseries.roll,  name: 'Roll',  type: 'scattergl', mode: 'lines',
+        line: { color: '#f97316', width: 1 } },
+    ], { ...DARK, yaxis: { ...DARK.xaxis, title: { text: 'deg', standoff: 4 } } }, cfg)
+
+    // Battery Voltage
+    const battDiv = addChart('Battery Voltage (V)')
+    Plotly.newPlot(battDiv, [
+      { x: times, y: timeseries.battery, name: 'Battery', type: 'scattergl', mode: 'lines',
+        line: { color: '#4ade80', width: 1 } },
+    ], { ...DARK, showlegend: false,
+         yaxis: { ...DARK.xaxis, title: { text: 'V', standoff: 4 } } }, cfg)
+
+    // Cumulative Amp-Hours
+    const ahDiv = addChart('Cumulative Amp-Hours')
+    Plotly.newPlot(ahDiv, [
+      { x: times, y: timeseries.coulomb, name: 'Amp-hrs', type: 'scattergl', mode: 'lines',
+        line: { color: '#facc15', width: 1 } },
+    ], { ...DARK, showlegend: false,
+         yaxis: { ...DARK.xaxis, title: { text: 'Ah', standoff: 4 } } }, cfg)
+
+    // Vacuum (hull integrity)
+    const vacDiv = addChart('Vacuum (inHg) — Hull Integrity')
+    Plotly.newPlot(vacDiv, [
+      { x: times, y: timeseries.vacuum, name: 'Vacuum', type: 'scattergl', mode: 'lines',
+        line: { color: '#c084fc', width: 1 } },
+    ], { ...DARK, showlegend: false,
+         yaxis: { ...DARK.xaxis, title: { text: 'inHg', standoff: 4 } } }, cfg)
+
+  } catch (e) {
+    chartsWrap.appendChild(h('div', { class: 'empty-state' }, 'Could not render charts: ' + e.message))
+  }
+}
+
 
 function switchTab (e) {
   const tabName = e.currentTarget.dataset.tab
@@ -2081,6 +2453,7 @@ async function renderDatBrowser () {
     else if (key === 'profile-nc') renderProfileNcTab(dep, tabBody)
     else if (key === 'traj-nc')    renderTrajNcTab(dep, tabBody)
     else if (key === 'qc-output')  renderQcOutputTab(dep, tabBody)
+    else if (key === 'cac')        renderCacTab(tabBody)
   }
 
   const tabBar = h('div', { class: 'files-tab-bar' },
@@ -2089,6 +2462,7 @@ async function renderDatBrowser () {
     h('button', { class: 'files-tab',        'data-tab': 'profile-nc', onclick: () => setTab('profile-nc') }, 'Profile NC'),
     h('button', { class: 'files-tab',        'data-tab': 'traj-nc',    onclick: () => setTab('traj-nc')    }, 'Trajectory NC'),
     h('button', { class: 'files-tab',        'data-tab': 'qc-output',  onclick: () => setTab('qc-output')  }, 'QC Output'),
+    h('button', { class: 'files-tab',        'data-tab': 'cac',        onclick: () => setTab('cac')        }, 'CAC Files'),
   )
 
   page.appendChild(tabBar)
@@ -2336,6 +2710,128 @@ async function renderQcOutputTab (dep, container) {
   catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load files: ' + e.message)); return }
   renderNcSection('QC Output', 'Stage 4', data.qc, container)
 }
+
+/* ── CAC Files tab ───────────────────────────────────────────────────────────*/
+async function renderCacTab (container) {
+  container.innerHTML = ''
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  const header = h('div', { class: 'cac-header' },
+    h('h2', { class: 'cac-title' }, 'CAC Files'),
+    h('p',  { class: 'cac-subtitle' },
+      'Slocum glider cache files (.cac / .ccc) used by Stage 1 to decode binary data. ' +
+      'Files are stored in master_cac/ and shared across all deployments.'
+    )
+  )
+  container.appendChild(header)
+
+  // ── File list ─────────────────────────────────────────────────────────────
+  const listWrap = h('div', { class: 'cac-list-wrap' })
+  container.appendChild(listWrap)
+
+  async function refreshList () {
+    listWrap.innerHTML = ''
+    let data
+    try { data = await apiFetch('/api/cac-files') }
+    catch (e) {
+      listWrap.appendChild(h('div', { class: 'empty-state' }, 'Could not load CAC files: ' + e.message))
+      return
+    }
+
+    const files = data.files
+    const dirEl = h('div', { class: 'cac-dir-path' }, data.dir)
+    const countEl = h('span', { class: 'cac-count' }, `${files.length} files`)
+    listWrap.appendChild(h('div', { class: 'cac-list-header' }, dirEl, countEl))
+
+    if (!files.length) {
+      listWrap.appendChild(h('div', { class: 'empty-state' }, 'No CAC files found. Upload some using the drop zone below.'))
+      return
+    }
+
+    const table = h('div', { class: 'cac-table' })
+    for (const f of files) {
+      const ext = f.name.split('.').pop().toUpperCase()
+      const mtime = new Date(f.mtime * 1000).toLocaleString()
+      const row = h('div', { class: 'cac-row' },
+        h('span', { class: `cac-ext cac-ext--${ext.toLowerCase()}` }, ext),
+        h('span', { class: 'cac-name' }, f.name),
+        h('span', { class: 'cac-mtime' }, mtime),
+        h('span', { class: 'cac-size' },  formatBytes(f.size)),
+        h('button', { class: 'btn-xs btn-danger-ghost', title: 'Delete', onclick: async () => {
+          if (!confirm(`Delete ${f.name}?`)) return
+          try {
+            await apiFetch(`/api/cac-files/${encodeURIComponent(f.name)}`, { method: 'DELETE' })
+            refreshList()
+          } catch (e) { alert('Delete failed: ' + e.message) }
+        }}, '✕')
+      )
+      table.appendChild(row)
+    }
+    listWrap.appendChild(table)
+  }
+
+  await refreshList()
+
+  // ── Drop zone ─────────────────────────────────────────────────────────────
+  const statusEl = h('div', { class: 'cac-upload-status hidden' })
+
+  const fileInput = h('input', {
+    type: 'file', multiple: true,
+    accept: '.cac,.ccc',
+    style: 'display:none',
+  })
+
+  async function uploadFiles (files) {
+    if (!files.length) return
+    statusEl.textContent = `Uploading ${files.length} file${files.length > 1 ? 's' : ''}…`
+    statusEl.className = 'cac-upload-status uploading'
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    try {
+      const resp = await fetch(`${API}/api/cac-files/upload`, { method: 'POST', body: fd })
+      const result = await resp.json()
+      if (result.ok) {
+        const n = result.saved.length
+        statusEl.textContent = `Saved ${n} file${n !== 1 ? 's' : ''}: ${result.saved.join(', ')}`
+        statusEl.className = 'cac-upload-status success'
+        refreshList()
+      } else {
+        statusEl.textContent = 'Upload failed'
+        statusEl.className = 'cac-upload-status error'
+      }
+    } catch (e) {
+      statusEl.textContent = 'Upload error: ' + e.message
+      statusEl.className = 'cac-upload-status error'
+    }
+  }
+
+  fileInput.addEventListener('change', () => { uploadFiles([...fileInput.files]); fileInput.value = '' })
+
+  const browseBtn = h('button', { class: 'btn-secondary cac-browse-btn',
+    onclick: () => fileInput.click()
+  }, '📂  Browse files')
+
+  const dropZone = h('div', { class: 'cac-drop-zone' },
+    h('div', { class: 'cac-drop-icon' }, '📥'),
+    h('div', { class: 'cac-drop-text' },
+      h('strong', {}, 'Drag & drop .cac / .ccc files here'),
+      h('span',   {}, ' or '),
+    ),
+    browseBtn,
+    fileInput,
+  )
+
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over') })
+  dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over') })
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault()
+    dropZone.classList.remove('drag-over')
+    uploadFiles([...e.dataTransfer.files])
+  })
+
+  container.appendChild(h('div', { class: 'cac-upload-section' }, dropZone, statusEl))
+}
+
 
 /* ── Logs page ───────────────────────────────────────────────────────────────*/
 function formatBytes (bytes) {

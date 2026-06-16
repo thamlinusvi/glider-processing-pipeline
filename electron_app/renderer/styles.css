@@ -1263,6 +1263,139 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── NC Variables tab ────────────────────────────────────────────────────────*/
+.vars-loading { padding: 32px; text-align: center; color: #6b7a8d; font-size: 13px; }
+
+.vars-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.vars-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e5e9f0;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.vars-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e5e9f0;
+  flex-shrink: 0;
+}
+.vars-card-title  { font-size: 13px; font-weight: 700; color: #1a2634; }
+
+.vars-sample-file {
+  padding: 5px 14px;
+  font-family: monospace;
+  font-size: 10px;
+  color: #6b7a8d;
+  background: #f0f4f8;
+  border-bottom: 1px solid #e5e9f0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.vars-search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 12px;
+  border: none;
+  border-bottom: 1px solid #e5e9f0;
+  font-size: 12px;
+  background: #fff;
+  color: #1a2634;
+  outline: none;
+  flex-shrink: 0;
+}
+.vars-search:focus { background: #fffbf0; }
+
+.vars-list {
+  overflow-y: auto;
+  flex: 1;
+  max-height: 380px;
+}
+
+.vars-row {
+  display: grid;
+  grid-template-columns: 2fr 80px 2fr;
+  gap: 6px;
+  padding: 5px 12px;
+  border-bottom: 1px solid #f0f4f8;
+  font-size: 11px;
+  align-items: baseline;
+}
+.vars-row:last-child { border-bottom: none; }
+.vars-row:hover { background: #f8fafc; }
+.vars-row--qc   { background: #fafbff; }
+.vars-row--qc:hover { background: #f0f4ff; }
+
+.vars-name     { font-family: monospace; font-size: 11px; color: #1a2634; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vars-units    { font-size: 10px; color: #3b82f6; font-weight: 600; white-space: nowrap; }
+.vars-longname { font-size: 11px; color: #6b7a8d; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.vars-empty { padding: 20px 16px; font-size: 12px; color: #9ca3af; font-style: italic; }
+
+/* ── CAC Files tab ───────────────────────────────────────────────────────────*/
+.cac-header       { padding: 20px 24px 10px; border-bottom: 1px solid #e5e9f0; }
+.cac-title        { margin: 0 0 4px; font-size: 18px; font-weight: 700; color: #1a2634; }
+.cac-subtitle     { margin: 0; font-size: 12px; color: #6b7a8d; line-height: 1.5; }
+
+.cac-list-wrap    { padding: 16px 24px 0; }
+.cac-list-header  { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.cac-dir-path     { font-family: monospace; font-size: 11px; color: #6b7a8d; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cac-count        { font-size: 11px; font-weight: 600; color: #3b82f6; white-space: nowrap; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 1px 8px; }
+
+.cac-table        { display: flex; flex-direction: column; gap: 2px; max-height: 380px; overflow-y: auto; border: 1px solid #e5e9f0; border-radius: 8px; background: #fff; }
+.cac-row          { display: grid; grid-template-columns: 40px 1fr 160px 80px 28px; align-items: center; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #f0f4f8; font-size: 12px; }
+.cac-row:last-child { border-bottom: none; }
+.cac-row:hover    { background: #f8fafc; }
+.cac-ext          { font-size: 9px; font-weight: 700; border-radius: 3px; padding: 2px 4px; text-align: center; letter-spacing: 0.03em; }
+.cac-ext--cac     { background: #dbeafe; color: #1d4ed8; border: 1px solid #bfdbfe; }
+.cac-ext--ccc     { background: #f3e8ff; color: #6d28d9; border: 1px solid #ddd6fe; }
+.cac-name         { font-family: monospace; font-size: 12px; color: #1a2634; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cac-mtime        { font-size: 11px; color: #6b7a8d; }
+.cac-size         { font-size: 11px; color: #6b7a8d; text-align: right; font-variant-numeric: tabular-nums; }
+.btn-danger-ghost { background: none; border: none; color: #dc2626; cursor: pointer; font-size: 13px; padding: 2px 5px; border-radius: 3px; line-height: 1; opacity: 0.5; }
+.btn-danger-ghost:hover { background: #fee2e2; opacity: 1; }
+
+/* Upload section */
+.cac-upload-section { padding: 16px 24px 24px; }
+.cac-drop-zone    {
+  border: 2px dashed #c5d3f5;
+  border-radius: 10px;
+  padding: 28px 24px;
+  text-align: center;
+  background: #f8faff;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.cac-drop-zone.drag-over { border-color: #3b82f6; background: #eff6ff; }
+.cac-drop-icon    { font-size: 32px; line-height: 1; }
+.cac-drop-text    { font-size: 13px; color: #4b5563; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: center; }
+.cac-browse-btn   { margin-top: 2px; }
+.cac-upload-status {
+  margin-top: 10px; padding: 8px 14px; border-radius: 6px; font-size: 12px;
+}
+.cac-upload-status.hidden    { display: none; }
+.cac-upload-status.uploading { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }
+.cac-upload-status.success   { background: #f0fdf4; border: 1px solid #86efac; color: #166534; }
+.cac-upload-status.error     { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
+
 /* DAT layout (shared by sub-tabs) */
 .dat-layout {
   display: grid;
@@ -1845,3 +1978,115 @@ button {
 }
 
 .preflight-badge-warn { background: #fff8e1; color: #f57f17; border: 1px solid #ffe082; }
+
+/* ── Trajectory Map tab ──────────────────────────────────────────────────────*/
+.traj-loading {
+  padding: 48px 24px;
+  text-align: center;
+  color: #6b7a8d;
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.traj-header-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-bottom: 1px solid #1e2d40;
+  flex-wrap: wrap;
+}
+
+.traj-stat-chip {
+  font-size: 11px;
+  color: #7fb3d3;
+  background: #141e2e;
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid #2a4060;
+}
+
+/* Map canvas — Leaflet needs a height or it renders 0px */
+.traj-map-canvas {
+  height: 520px;
+  width: 100%;
+  background: #0f1720;
+}
+
+/* Override Leaflet popup to match dark theme */
+#tab-map .leaflet-popup-content-wrapper {
+  background: #1a2d42;
+  color: #c8d8e8;
+  border: 1px solid #2a4060;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  font-size: 12px;
+}
+#tab-map .leaflet-popup-tip {
+  background: #1a2d42;
+}
+#tab-map .leaflet-popup-close-button {
+  color: #7fb3d3;
+}
+
+/* ── Flight Stats tab ────────────────────────────────────────────────────────*/
+.flight-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 10px;
+  padding: 16px 20px 8px;
+}
+
+.flight-stat-card {
+  background: #141e2e;
+  border: 1px solid #1e2d40;
+  border-radius: 8px;
+  padding: 12px 14px;
+  text-align: center;
+  transition: border-color 0.15s;
+}
+.flight-stat-card:hover { border-color: #3b82f6; }
+
+.flight-stat-value {
+  font-size: 17px;
+  font-weight: 700;
+  color: #7fb3d3;
+  font-family: 'Consolas', 'Courier New', monospace;
+  margin-bottom: 5px;
+  white-space: nowrap;
+}
+
+.flight-stat-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+  color: #4a6580;
+}
+
+.flight-charts {
+  padding: 8px 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.flight-chart-wrap {
+  border: 1px solid #1e2d40;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.flight-chart-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #7fb3d3;
+  padding: 7px 12px;
+  background: #0d1420;
+  border-bottom: 1px solid #1e2d40;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.flight-chart {
+  height: 195px;
+}

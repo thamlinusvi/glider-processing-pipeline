@@ -14,6 +14,7 @@ import json
 import glob
 import re
 import shutil
+import io
 import subprocess
 import threading
 import datetime
@@ -46,6 +47,9 @@ _lock  = threading.Lock()
 _live_logs  = {}
 # True while the process is still producing output; False once it's done/failed.
 _live_done  = {}   # key -> bool (True = finished)
+
+# Trajectory report cache: dep -> {'mtime': float, 'data': dict}
+_traj_report_cache = {}
 
 
 # ── CORS (no external package needed) ────────────────────────────────────────
@@ -545,6 +549,53 @@ def nc_files_list(dep):
     })
 
 
+@app.route('/api/deployment/<dep>/nc-variables')
+def nc_variables(dep):
+    """Return variable listings from a representative sample NC file for each stage output."""
+    import xarray as xr
+
+    year = dep.split('-')[1][:4] if '-' in dep else '2025'
+
+    dirs = {
+        'profile':  os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'profile'),
+        'traj_sci': os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science'),
+        'traj_flt': os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_flight'),
+        'qc':       os.path.join(BASE_DIR, 'deployments', year, dep,
+                                 'data', 'out', 'nc', 'sci-profile', 'delayed'),
+    }
+
+    result = {}
+    for key, d in dirs.items():
+        if not os.path.isdir(d):
+            result[key] = {'exists': False, 'variables': [], 'file': None}
+            continue
+        files = [f for f in sorted(os.listdir(d))
+                 if f.endswith('.nc') and 'qc_queue' not in f]
+        if not files:
+            result[key] = {'exists': True, 'variables': [], 'file': None}
+            continue
+        # Use a mid-deployment file for better variable coverage
+        sample = files[len(files) // 2]
+        try:
+            ds = xr.open_dataset(os.path.join(d, sample), decode_times=False)
+            variables = []
+            for vname in sorted(ds.data_vars):
+                attrs = ds[vname].attrs
+                variables.append({
+                    'name':      vname,
+                    'long_name': attrs.get('long_name', ''),
+                    'units':     attrs.get('units', ''),
+                    'dtype':     str(ds[vname].dtype),
+                    'dims':      list(ds[vname].dims),
+                })
+            ds.close()
+            result[key] = {'exists': True, 'variables': variables, 'file': sample}
+        except Exception as e:
+            result[key] = {'exists': True, 'variables': [], 'file': sample, 'error': str(e)}
+
+    return jsonify(result)
+
+
 @app.route('/api/deployment/<dep>/dat-files')
 def dat_files(dep):
     base = os.path.join(BASE_DIR, 'dat_files', dep)
@@ -955,6 +1006,280 @@ def create_deployment():
                         shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
 
     return jsonify({'ok': True, 'deployment': name})
+
+
+# ── CAC file manager ─────────────────────────────────────────────────────────
+CAC_DIR = os.path.join(BASE_DIR, 'master_cac')
+
+@app.route('/api/cac-files')
+def list_cac_files():
+    """List all files in master_cac/."""
+    os.makedirs(CAC_DIR, exist_ok=True)
+    files = []
+    for name in sorted(os.listdir(CAC_DIR)):
+        fp = os.path.join(CAC_DIR, name)
+        if os.path.isfile(fp):
+            st = os.stat(fp)
+            files.append({'name': name, 'size': st.st_size, 'mtime': st.st_mtime})
+    return jsonify({'files': files, 'dir': CAC_DIR})
+
+
+@app.route('/api/cac-files/upload', methods=['POST'])
+def upload_cac_files():
+    """Accept one or more uploaded files and save them to master_cac/."""
+    os.makedirs(CAC_DIR, exist_ok=True)
+    saved = []
+    skipped = []
+    for f in request.files.getlist('files'):
+        if not f.filename:
+            continue
+        name = os.path.basename(f.filename)
+        dest = os.path.join(CAC_DIR, name)
+        f.save(dest)
+        saved.append(name)
+    return jsonify({'ok': True, 'saved': saved, 'skipped': skipped})
+
+
+@app.route('/api/cac-files/<filename>', methods=['DELETE'])
+def delete_cac_file(filename):
+    """Delete a single file from master_cac/."""
+    fp = os.path.join(CAC_DIR, os.path.basename(filename))
+    if not os.path.isfile(fp):
+        return jsonify({'error': 'File not found'}), 404
+    os.remove(fp)
+    return jsonify({'ok': True})
+
+
+# ── Trajectory report + KMZ ───────────────────────────────────────────────────
+@app.route('/api/deployment/<dep>/trajectory-report')
+def trajectory_report(dep):
+    """
+    Read all trajectory-science NC files, extract key flight variables, and
+    return a JSON report with surfacing positions, subsampled timeseries, and
+    summary statistics.  Result is cached in memory keyed by dep + newest mtime.
+    """
+    import xarray as xr
+    import numpy as np
+
+    traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
+    if not os.path.isdir(traj_dir):
+        return jsonify({'error': f'Trajectory directory not found: {traj_dir}'}), 404
+
+    files = sorted(f for f in os.listdir(traj_dir) if f.endswith('.nc'))
+    if not files:
+        return jsonify({'error': 'No trajectory NC files found'}), 404
+
+    try:
+        newest_mtime = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+    except Exception:
+        newest_mtime = 0.0
+
+    cached = _traj_report_cache.get(dep)
+    if cached and cached.get('mtime', -1) >= newest_mtime:
+        return jsonify(cached['data'])
+
+    print(f'[server] building trajectory report for {dep}: {len(files)} files…', flush=True)
+
+    PHYS_VARS = ['latitude', 'longitude', 'm_pitch', 'm_roll', 'm_heading',
+                 'm_battery', 'm_coulomb_amphr', 'm_vacuum', 'm_depth']
+
+    t_chunks   = []
+    var_chunks = {v: [] for v in PHYS_VARS}
+    skipped    = 0
+
+    for fname in files:
+        fpath = os.path.join(traj_dir, fname)
+        try:
+            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+            if 'time' not in ds:
+                ds.close(); skipped += 1; continue
+            t = np.asarray(ds['time'].values, dtype=np.float64)
+            if t.size == 0:
+                ds.close(); skipped += 1; continue
+            t_chunks.append(t)
+            for v in PHYS_VARS:
+                if v in ds:
+                    arr = np.asarray(ds[v].values, dtype=np.float64)
+                    if arr.shape[0] != t.size:          # pad/truncate to time length
+                        arr2 = np.full(t.size, np.nan)
+                        n = min(arr.shape[0], t.size)
+                        arr2[:n] = arr[:n]
+                        arr = arr2
+                else:
+                    arr = np.full(t.size, np.nan)
+                var_chunks[v].append(arr)
+            ds.close()
+        except Exception as exc:
+            print(f'[server] skipping {fname}: {exc}', flush=True)
+            skipped += 1
+            continue
+
+    if not t_chunks:
+        return jsonify({'error': 'No usable data found in trajectory NC files'}), 404
+
+    # Concatenate and sort by time
+    t_all    = np.concatenate(t_chunks)
+    sort_idx = np.argsort(t_all, kind='stable')
+    t_all    = t_all[sort_idx]
+
+    vars_all = {}
+    for v in PHYS_VARS:
+        if var_chunks[v]:
+            vars_all[v] = np.concatenate(var_chunks[v])[sort_idx]
+        else:
+            vars_all[v] = np.full(t_all.size, np.nan)
+
+    n_total = t_all.size
+
+    # Unix-epoch seconds -> ISO-8601 string
+    def to_iso(epoch_arr):
+        out = []
+        for ts in epoch_arr:
+            try:
+                out.append(datetime.datetime.utcfromtimestamp(float(ts)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+            except (ValueError, OSError, OverflowError):
+                out.append('')
+        return out
+
+    # GPS surfacings: both lat and lon are finite and non-zero
+    lat_all = vars_all['latitude']
+    lon_all = vars_all['longitude']
+    valid   = np.isfinite(lat_all) & np.isfinite(lon_all) & (lat_all != 0.0) & (lon_all != 0.0)
+
+    # Subsample timeseries to at most 10 000 points
+    MAX_TS = 10_000
+    if n_total > MAX_TS:
+        sub_idx = np.round(np.linspace(0, n_total - 1, MAX_TS)).astype(int)
+    else:
+        sub_idx = np.arange(n_total)
+
+    RAD2DEG = 180.0 / np.pi
+
+    def sub_to_list(arr, scale=1.0, decimals=4):
+        v = arr[sub_idx] * scale
+        return [None if not np.isfinite(x) else round(float(x), decimals) for x in v]
+
+    timeseries = {
+        'time':    to_iso(t_all[sub_idx]),
+        'pitch':   sub_to_list(vars_all['m_pitch'],         RAD2DEG, 2),
+        'roll':    sub_to_list(vars_all['m_roll'],          RAD2DEG, 2),
+        'heading': sub_to_list(vars_all['m_heading'],       RAD2DEG, 2),
+        'battery': sub_to_list(vars_all['m_battery'],       1.0,     3),
+        'coulomb': sub_to_list(vars_all['m_coulomb_amphr'], 1.0,     3),
+        'vacuum':  sub_to_list(vars_all['m_vacuum'],        1.0,     3),
+        'depth':   sub_to_list(vars_all['m_depth'],         1.0,     2),
+    }
+
+    def safe_stats(arr, scale=1.0):
+        v = arr[np.isfinite(arr)] * scale
+        if v.size == 0:
+            return {'min': None, 'max': None, 'mean': None}
+        return {'min':  round(float(np.min(v)),  3),
+                'max':  round(float(np.max(v)),  3),
+                'mean': round(float(np.mean(v)), 3)}
+
+    coulomb_valid = vars_all['m_coulomb_amphr'][np.isfinite(vars_all['m_coulomb_amphr'])]
+    total_ah = (round(float(np.max(coulomb_valid) - np.min(coulomb_valid)), 2)
+                if coulomb_valid.size > 1 else None)
+
+    data = {
+        'surfacings': {
+            'times': to_iso(t_all[valid]),
+            'lats':  [round(float(x), 6) for x in lat_all[valid]],
+            'lons':  [round(float(x), 6) for x in lon_all[valid]],
+            'count': int(valid.sum()),
+        },
+        'timeseries': timeseries,
+        'stats': {
+            'n_files':       len(files),
+            'n_skipped':     skipped,
+            'n_records':     int(n_total),
+            'n_surfacings':  int(valid.sum()),
+            'pitch_deg':     safe_stats(vars_all['m_pitch'],         RAD2DEG),
+            'roll_deg':      safe_stats(vars_all['m_roll'],          RAD2DEG),
+            'battery_v':     safe_stats(vars_all['m_battery']),
+            'coulomb_ah':    safe_stats(vars_all['m_coulomb_amphr']),
+            'total_ah_used': total_ah,
+            'vacuum_inhg':   safe_stats(vars_all['m_vacuum']),
+        },
+    }
+
+    _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': data}
+    print(f'[server] trajectory report done: {n_total:,} records, '
+          f'{int(valid.sum())} surfacings, {skipped} files skipped', flush=True)
+    return jsonify(data)
+
+
+@app.route('/api/deployment/<dep>/kmz')
+def download_kmz(dep):
+    """Generate and stream a KMZ file of the glider track (GPS surfacings)."""
+    import zipfile
+
+    cached = _traj_report_cache.get(dep)
+    if not cached:
+        return jsonify({'error': 'Trajectory report not yet loaded — open the Map tab first.'}), 404
+
+    surf  = cached['data'].get('surfacings', {})
+    lats  = surf.get('lats',  [])
+    lons  = surf.get('lons',  [])
+    times = surf.get('times', [])
+
+    if not lats:
+        return jsonify({'error': 'No GPS surfacings available for KMZ export'}), 404
+
+    # KML track LineString
+    coord_lines = '\n'.join(f'          {lon},{lat},0' for lat, lon in zip(lats, lons))
+
+    # KML Placemark per surfacing
+    pms = []
+    for i, (lat, lon, t) in enumerate(zip(lats, lons, times), 1):
+        pms.append(f'''    <Placemark>
+      <name>#{i}</name>
+      <description>{t}</description>
+      <styleUrl>#dot</styleUrl>
+      <Point><coordinates>{lon},{lat},0</coordinates></Point>
+    </Placemark>''')
+
+    kml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>{dep} Glider Track</name>
+    <Style id="track">
+      <LineStyle><color>ffff8800</color><width>2</width></LineStyle>
+      <PolyStyle><fill>0</fill></PolyStyle>
+    </Style>
+    <Style id="dot">
+      <IconStyle>
+        <color>ff0066ff</color><scale>0.55</scale>
+        <Icon><href>http://maps.google.com/mapfiles/kml/shapes/shaded_dot.png</href></Icon>
+      </IconStyle>
+      <LabelStyle><scale>0</scale></LabelStyle>
+    </Style>
+    <Placemark>
+      <name>Track</name>
+      <styleUrl>#track</styleUrl>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>
+{coord_lines}
+        </coordinates>
+      </LineString>
+    </Placemark>
+{''.join(pms)}
+  </Document>
+</kml>'''
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('doc.kml', kml.encode('utf-8'))
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype='application/vnd.google-earth.kmz',
+        as_attachment=True,
+        download_name=f'{dep}_glider_track.kmz',
+    )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
