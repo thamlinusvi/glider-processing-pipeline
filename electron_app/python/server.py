@@ -1050,6 +1050,114 @@ def delete_cac_file(filename):
     return jsonify({'ok': True})
 
 
+# ── Trajectory surfacings (lightweight — lat/lon/time only) ───────────────────
+_surf_cache = {}   # dep -> {'mtime': float, 'data': dict}
+
+@app.route('/api/deployment/<dep>/surfacings')
+def surfacings(dep):
+    """
+    Fast endpoint: read only latitude, longitude, and time from every
+    trajectory-science NC file.  Returns GPS surfacing positions (non-NaN
+    lat & lon) plus the total record count.  Cached by newest file mtime.
+    """
+    import xarray as xr
+    import numpy as np
+
+    traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
+    if not os.path.isdir(traj_dir):
+        return jsonify({'error': f'Trajectory directory not found: {traj_dir}'}), 404
+
+    files = sorted(f for f in os.listdir(traj_dir) if f.endswith('.nc'))
+    if not files:
+        return jsonify({'error': 'No trajectory NC files found'}), 404
+
+    try:
+        newest_mtime = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+    except Exception:
+        newest_mtime = 0.0
+
+    cached = _surf_cache.get(dep)
+    if cached and cached.get('mtime', -1) >= newest_mtime:
+        return jsonify(cached['data'])
+
+    print(f'[server] building surfacings for {dep}: {len(files)} files…', flush=True)
+
+    t_chunks   = []
+    lat_chunks = []
+    lon_chunks = []
+    n_records  = 0
+
+    for fname in files:
+        fpath = os.path.join(traj_dir, fname)
+        try:
+            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+            if 'time' not in ds:
+                ds.close(); continue
+            t   = np.asarray(ds['time'].values,     dtype=np.float64)
+            lat = np.asarray(ds.get('latitude',  xr.DataArray([np.nan])).values, dtype=np.float64)
+            lon = np.asarray(ds.get('longitude', xr.DataArray([np.nan])).values, dtype=np.float64)
+            ds.close()
+
+            n = t.size
+            if n == 0:
+                continue
+            n_records += n
+
+            # Pad/trim lat & lon to match time length
+            def _align(arr):
+                if arr.size == n:
+                    return arr
+                out = np.full(n, np.nan)
+                m = min(arr.size, n)
+                out[:m] = arr[:m]
+                return out
+
+            t_chunks.append(t)
+            lat_chunks.append(_align(lat))
+            lon_chunks.append(_align(lon))
+        except Exception as exc:
+            print(f'[server] surfacings: skipping {fname}: {exc}', flush=True)
+            continue
+
+    if not t_chunks:
+        return jsonify({'error': 'No usable data found'}), 404
+
+    t_all   = np.concatenate(t_chunks)
+    lat_all = np.concatenate(lat_chunks)
+    lon_all = np.concatenate(lon_chunks)
+
+    # Sort by time
+    sort_idx = np.argsort(t_all, kind='stable')
+    t_all   = t_all[sort_idx]
+    lat_all = lat_all[sort_idx]
+    lon_all = lon_all[sort_idx]
+
+    # GPS surfacings: finite, non-zero lat & lon
+    valid = np.isfinite(lat_all) & np.isfinite(lon_all) & (lat_all != 0.0) & (lon_all != 0.0)
+
+    def _to_iso(epoch_arr):
+        out = []
+        for ts in epoch_arr:
+            try:
+                out.append(datetime.datetime.utcfromtimestamp(float(ts)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+            except (ValueError, OSError, OverflowError):
+                out.append('')
+        return out
+
+    data = {
+        'times':     _to_iso(t_all[valid]),
+        'lats':      [round(float(x), 6) for x in lat_all[valid]],
+        'lons':      [round(float(x), 6) for x in lon_all[valid]],
+        'count':     int(valid.sum()),
+        'n_records': int(n_records),
+        'n_files':   len(files),
+    }
+
+    _surf_cache[dep] = {'mtime': newest_mtime, 'data': data}
+    print(f'[server] surfacings done: {int(valid.sum())} GPS fixes from {len(files)} files', flush=True)
+    return jsonify(data)
+
+
 # ── Trajectory report + KMZ ───────────────────────────────────────────────────
 @app.route('/api/deployment/<dep>/trajectory-report')
 def trajectory_report(dep):
@@ -1215,14 +1323,21 @@ def download_kmz(dep):
     """Generate and stream a KMZ file of the glider track (GPS surfacings)."""
     import zipfile
 
-    cached = _traj_report_cache.get(dep)
-    if not cached:
-        return jsonify({'error': 'Trajectory report not yet loaded — open the Map tab first.'}), 404
-
-    surf  = cached['data'].get('surfacings', {})
-    lats  = surf.get('lats',  [])
-    lons  = surf.get('lons',  [])
-    times = surf.get('times', [])
+    # Prefer the lightweight surfacings cache; fall back to full trajectory cache
+    surf_cached = _surf_cache.get(dep)
+    traj_cached = _traj_report_cache.get(dep)
+    if surf_cached:
+        sd    = surf_cached['data']
+        lats  = sd.get('lats',  [])
+        lons  = sd.get('lons',  [])
+        times = sd.get('times', [])
+    elif traj_cached:
+        sd    = traj_cached['data'].get('surfacings', {})
+        lats  = sd.get('lats',  [])
+        lons  = sd.get('lons',  [])
+        times = sd.get('times', [])
+    else:
+        return jsonify({'error': 'No data cached — open the Map tab first.'}), 404
 
     if not lats:
         return jsonify({'error': 'No GPS surfacings available for KMZ export'}), 404

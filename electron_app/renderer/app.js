@@ -1366,27 +1366,26 @@ async function loadLeaflet () {
 async function renderTrajectoryMap (dep, container) {
   container.innerHTML = ''
   container.appendChild(h('div', { class: 'traj-loading' },
-    '⏳ Loading trajectory data from ' + dep + '…',
+    '⏳ Loading GPS surfacings from ' + dep + '…',
     h('br', {}),
     h('span', { style: 'font-size:11px;color:#546e7a' },
-      'First load reads all trajectory NC files and may take 1–3 minutes. Subsequent loads are instant.')
+      'First load reads all trajectory NC files and may take a minute. Subsequent loads are instant.')
   ))
 
-  let trajData
+  let surf
   try {
-    trajData = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/trajectory-report`)
+    surf = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/surfacings`)
   } catch (e) {
     container.innerHTML = ''
-    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load trajectory data: ' + e.message))
+    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load surfacing data: ' + e.message))
     return null
   }
 
   container.innerHTML = ''
 
-  const { surfacings, stats } = trajData
-  const lats  = surfacings.lats  || []
-  const lons  = surfacings.lons  || []
-  const times = surfacings.times || []
+  const lats  = surf.lats  || []
+  const lons  = surf.lons  || []
+  const times = surf.times || []
 
   // ── Header bar ─────────────────────────────────────────────────────────────
   const kmzBtn = h('button', { class: 'btn-secondary',
@@ -1399,9 +1398,9 @@ async function renderTrajectoryMap (dep, container) {
   }, '⬇ Download KMZ')
 
   const headerBar = h('div', { class: 'traj-header-bar' },
-    h('span', { class: 'traj-stat-chip' }, `${stats.n_surfacings} GPS surfacings`),
-    h('span', { class: 'traj-stat-chip' }, `${stats.n_records.toLocaleString()} records`),
-    h('span', { class: 'traj-stat-chip' }, `${stats.n_files} traj files`),
+    h('span', { class: 'traj-stat-chip' }, `${surf.count} GPS surfacings`),
+    h('span', { class: 'traj-stat-chip' }, `${(surf.n_records || 0).toLocaleString()} records`),
+    h('span', { class: 'traj-stat-chip' }, `${surf.n_files} traj files`),
     kmzBtn,
   )
   container.appendChild(headerBar)
