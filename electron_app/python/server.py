@@ -18,6 +18,7 @@ import io
 import subprocess
 import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.normpath(sys.argv[1]) if len(sys.argv) > 1 else \
@@ -50,6 +51,102 @@ _live_done  = {}   # key -> bool (True = finished)
 
 # Trajectory report cache: dep -> {'mtime': float, 'data': dict}
 _traj_report_cache = {}
+
+# Number of threads for parallel NC reads (I/O-bound — more threads = faster)
+_TRAJ_WORKERS = min(24, (os.cpu_count() or 2) * 4)
+
+# ── NC worker functions (called from ThreadPoolExecutor) ──────────────────────
+def _nc_read_surf(fpath):
+    """Read time/lat/lon from one trajectory NC file. Thread-safe."""
+    try:
+        import netCDF4 as _nc4
+        import numpy as np
+        with _nc4.Dataset(fpath, 'r') as ds:
+            vs = ds.variables
+            if 'time' not in vs:
+                return None
+            t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
+            if t.size == 0:
+                return None
+            n = t.size
+
+            def _v(name):
+                if name not in vs:
+                    return np.full(n, np.nan)
+                a = np.ma.filled(vs[name][:], np.nan).astype(np.float64).ravel()
+                if a.size == n:
+                    return a
+                out = np.full(n, np.nan)
+                out[:min(a.size, n)] = a[:min(a.size, n)]
+                return out
+
+            return {'t': t, 'lat': _v('latitude'), 'lon': _v('longitude')}
+    except Exception:
+        return None
+
+
+_TRAJ_PHYS_VARS = ['latitude', 'longitude', 'm_pitch', 'm_roll', 'm_heading',
+                    'm_battery', 'm_coulomb_amphr', 'm_vacuum', 'm_depth']
+
+def _nc_read_traj(fpath):
+    """Read all flight variables from one trajectory NC file. Thread-safe."""
+    try:
+        import netCDF4 as _nc4
+        import numpy as np
+        with _nc4.Dataset(fpath, 'r') as ds:
+            vs = ds.variables
+            if 'time' not in vs:
+                return None
+            t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
+            if t.size == 0:
+                return None
+            n = t.size
+
+            def _v(name):
+                if name not in vs:
+                    return np.full(n, np.nan)
+                a = np.ma.filled(vs[name][:], np.nan).astype(np.float64).ravel()
+                if a.size == n:
+                    return a
+                out = np.full(n, np.nan)
+                out[:min(a.size, n)] = a[:min(a.size, n)]
+                return out
+
+            result = {'t': t}
+            for v in _TRAJ_PHYS_VARS:
+                result[v] = _v(v)
+            return result
+    except Exception:
+        return None
+
+
+# ── Disk cache helpers ────────────────────────────────────────────────────────
+def _disk_cache_path(dep, name):
+    return os.path.join(_dep_dir(dep), 'cache', f'{name}.json')
+
+
+def _load_disk_cache(dep, name, newest_mtime):
+    """Return cached data dict if the on-disk JSON is still valid, else None."""
+    path = _disk_cache_path(dep, name)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        if obj.get('newest_mtime', -1) >= newest_mtime:
+            return obj['data']
+    except Exception:
+        pass
+    return None
+
+
+def _save_disk_cache(dep, name, newest_mtime, data):
+    """Persist computed data to a JSON file on disk."""
+    path = _disk_cache_path(dep, name)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'newest_mtime': newest_mtime, 'data': data}, f)
+    except Exception as exc:
+        print(f'[server] warning: could not write disk cache {path}: {exc}', flush=True)
 
 
 # ── CORS (no external package needed) ────────────────────────────────────────
@@ -1060,7 +1157,6 @@ def surfacings(dep):
     trajectory-science NC file.  Returns GPS surfacing positions (non-NaN
     lat & lon) plus the total record count.  Cached by newest file mtime.
     """
-    import xarray as xr
     import numpy as np
 
     traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
@@ -1080,44 +1176,27 @@ def surfacings(dep):
     if cached and cached.get('mtime', -1) >= newest_mtime:
         return jsonify(cached['data'])
 
-    print(f'[server] building surfacings for {dep}: {len(files)} files…', flush=True)
+    # 1 — disk cache (survives server restarts)
+    disk_data = _load_disk_cache(dep, 'surfacings', newest_mtime)
+    if disk_data:
+        _surf_cache[dep] = {'mtime': newest_mtime, 'data': disk_data}
+        print(f'[server] surfacings: loaded from disk cache', flush=True)
+        return jsonify(disk_data)
 
-    t_chunks   = []
-    lat_chunks = []
-    lon_chunks = []
-    n_records  = 0
+    # 2 — parallel read with ThreadPoolExecutor
+    import numpy as np
+    print(f'[server] surfacings: reading {len(files)} files with {_TRAJ_WORKERS} threads…', flush=True)
 
-    for fname in files:
-        fpath = os.path.join(traj_dir, fname)
-        try:
-            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
-            if 'time' not in ds:
-                ds.close(); continue
-            t   = np.asarray(ds['time'].values,     dtype=np.float64)
-            lat = np.asarray(ds.get('latitude',  xr.DataArray([np.nan])).values, dtype=np.float64)
-            lon = np.asarray(ds.get('longitude', xr.DataArray([np.nan])).values, dtype=np.float64)
-            ds.close()
+    file_paths = [os.path.join(traj_dir, f) for f in files]
+    t_chunks, lat_chunks, lon_chunks = [], [], []
 
-            n = t.size
-            if n == 0:
+    with ThreadPoolExecutor(max_workers=_TRAJ_WORKERS) as ex:
+        for result in ex.map(_nc_read_surf, file_paths):
+            if result is None:
                 continue
-            n_records += n
-
-            # Pad/trim lat & lon to match time length
-            def _align(arr):
-                if arr.size == n:
-                    return arr
-                out = np.full(n, np.nan)
-                m = min(arr.size, n)
-                out[:m] = arr[:m]
-                return out
-
-            t_chunks.append(t)
-            lat_chunks.append(_align(lat))
-            lon_chunks.append(_align(lon))
-        except Exception as exc:
-            print(f'[server] surfacings: skipping {fname}: {exc}', flush=True)
-            continue
+            t_chunks.append(result['t'])
+            lat_chunks.append(result['lat'])
+            lon_chunks.append(result['lon'])
 
     if not t_chunks:
         return jsonify({'error': 'No usable data found'}), 404
@@ -1126,13 +1205,11 @@ def surfacings(dep):
     lat_all = np.concatenate(lat_chunks)
     lon_all = np.concatenate(lon_chunks)
 
-    # Sort by time
     sort_idx = np.argsort(t_all, kind='stable')
-    t_all   = t_all[sort_idx]
-    lat_all = lat_all[sort_idx]
-    lon_all = lon_all[sort_idx]
+    t_all    = t_all[sort_idx]
+    lat_all  = lat_all[sort_idx]
+    lon_all  = lon_all[sort_idx]
 
-    # GPS surfacings: finite, non-zero lat & lon
     valid = np.isfinite(lat_all) & np.isfinite(lon_all) & (lat_all != 0.0) & (lon_all != 0.0)
 
     def _to_iso(epoch_arr):
@@ -1149,11 +1226,12 @@ def surfacings(dep):
         'lats':      [round(float(x), 6) for x in lat_all[valid]],
         'lons':      [round(float(x), 6) for x in lon_all[valid]],
         'count':     int(valid.sum()),
-        'n_records': int(n_records),
+        'n_records': int(t_all.size),
         'n_files':   len(files),
     }
 
     _surf_cache[dep] = {'mtime': newest_mtime, 'data': data}
+    _save_disk_cache(dep, 'surfacings', newest_mtime, data)
     print(f'[server] surfacings done: {int(valid.sum())} GPS fixes from {len(files)} files', flush=True)
     return jsonify(data)
 
@@ -1166,7 +1244,6 @@ def trajectory_report(dep):
     return a JSON report with surfacing positions, subsampled timeseries, and
     summary statistics.  Result is cached in memory keyed by dep + newest mtime.
     """
-    import xarray as xr
     import numpy as np
 
     traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
@@ -1186,56 +1263,41 @@ def trajectory_report(dep):
     if cached and cached.get('mtime', -1) >= newest_mtime:
         return jsonify(cached['data'])
 
-    print(f'[server] building trajectory report for {dep}: {len(files)} files…', flush=True)
+    # 1 — disk cache
+    disk_data = _load_disk_cache(dep, 'trajectory_report', newest_mtime)
+    if disk_data:
+        _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': disk_data}
+        print(f'[server] trajectory report: loaded from disk cache', flush=True)
+        return jsonify(disk_data)
 
-    PHYS_VARS = ['latitude', 'longitude', 'm_pitch', 'm_roll', 'm_heading',
-                 'm_battery', 'm_coulomb_amphr', 'm_vacuum', 'm_depth']
+    # 2 — parallel read
+    import numpy as np
+    print(f'[server] trajectory report: reading {len(files)} files with {_TRAJ_WORKERS} threads…', flush=True)
 
+    file_paths = [os.path.join(traj_dir, f) for f in files]
     t_chunks   = []
-    var_chunks = {v: [] for v in PHYS_VARS}
+    var_chunks = {v: [] for v in _TRAJ_PHYS_VARS}
     skipped    = 0
 
-    for fname in files:
-        fpath = os.path.join(traj_dir, fname)
-        try:
-            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
-            if 'time' not in ds:
-                ds.close(); skipped += 1; continue
-            t = np.asarray(ds['time'].values, dtype=np.float64)
-            if t.size == 0:
-                ds.close(); skipped += 1; continue
-            t_chunks.append(t)
-            for v in PHYS_VARS:
-                if v in ds:
-                    arr = np.asarray(ds[v].values, dtype=np.float64)
-                    if arr.shape[0] != t.size:          # pad/truncate to time length
-                        arr2 = np.full(t.size, np.nan)
-                        n = min(arr.shape[0], t.size)
-                        arr2[:n] = arr[:n]
-                        arr = arr2
-                else:
-                    arr = np.full(t.size, np.nan)
-                var_chunks[v].append(arr)
-            ds.close()
-        except Exception as exc:
-            print(f'[server] skipping {fname}: {exc}', flush=True)
-            skipped += 1
-            continue
+    with ThreadPoolExecutor(max_workers=_TRAJ_WORKERS) as ex:
+        for result in ex.map(_nc_read_traj, file_paths):
+            if result is None:
+                skipped += 1
+                continue
+            t_chunks.append(result['t'])
+            for v in _TRAJ_PHYS_VARS:
+                var_chunks[v].append(result[v])
 
     if not t_chunks:
         return jsonify({'error': 'No usable data found in trajectory NC files'}), 404
 
-    # Concatenate and sort by time
     t_all    = np.concatenate(t_chunks)
     sort_idx = np.argsort(t_all, kind='stable')
     t_all    = t_all[sort_idx]
 
     vars_all = {}
-    for v in PHYS_VARS:
-        if var_chunks[v]:
-            vars_all[v] = np.concatenate(var_chunks[v])[sort_idx]
-        else:
-            vars_all[v] = np.full(t_all.size, np.nan)
+    for v in _TRAJ_PHYS_VARS:
+        vars_all[v] = np.concatenate(var_chunks[v])[sort_idx] if var_chunks[v] else np.full(t_all.size, np.nan)
 
     n_total = t_all.size
 
@@ -1313,6 +1375,7 @@ def trajectory_report(dep):
     }
 
     _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': data}
+    _save_disk_cache(dep, 'trajectory_report', newest_mtime, data)
     print(f'[server] trajectory report done: {n_total:,} records, '
           f'{int(valid.sum())} surfacings, {skipped} files skipped', flush=True)
     return jsonify(data)
