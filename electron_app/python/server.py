@@ -18,6 +18,13 @@ import io
 import subprocess
 import threading
 import datetime
+import time
+import secrets
+import hashlib
+import base64
+import ssl
+import urllib.parse
+import urllib.request as _urlreq
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Path setup ────────────────────────────────────────────────────────────────
@@ -40,8 +47,9 @@ from pipeline.state  import (
 app = Flask(__name__)
 
 # Active subprocesses: {(deployment, stage): Popen}
-_procs = {}
-_lock  = threading.Lock()
+_procs       = {}
+_lock        = threading.Lock()
+_prev_status = {}   # status snapshot taken just before a run starts, restored on abort
 
 # Live log buffer for reconnect — populated line-by-line while any stage runs.
 # Key: (dep, stage)  Value: list of log lines (strings)
@@ -52,8 +60,14 @@ _live_done  = {}   # key -> bool (True = finished)
 # Trajectory report cache: dep -> {'mtime': float, 'data': dict}
 _traj_report_cache = {}
 
-# Number of threads for parallel NC reads (I/O-bound — more threads = faster)
-_TRAJ_WORKERS = min(24, (os.cpu_count() or 2) * 4)
+# Number of threads for parallel NC reads.
+# Keep conservative on Windows — HDF5 is not thread-safe across concurrent
+# Dataset opens (can cause segfaults with >1 concurrent reader).
+_TRAJ_WORKERS = 1
+
+# Serialise all HDF5/netCDF4 file opens across threads.  Even with
+# _TRAJ_WORKERS=1 this ensures safety if the value is ever raised.
+_nc_lock = threading.Lock()
 
 # ── NC worker functions (called from ThreadPoolExecutor) ──────────────────────
 def _nc_read_surf(fpath):
@@ -72,17 +86,18 @@ def _nc_read_surf(fpath):
     # ── netCDF4 path ──────────────────────────────────────────────────────────
     try:
         import netCDF4 as _nc4
-        with _nc4.Dataset(fpath, 'r') as ds:
-            vs = ds.variables
-            if 'time' not in vs:
-                return None
-            t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
-            if t.size == 0:
-                return None
-            n = t.size
-            lat = np.ma.filled(vs['latitude'][:],  np.nan) if 'latitude'  in vs else np.full(n, np.nan)
-            lon = np.ma.filled(vs['longitude'][:], np.nan) if 'longitude' in vs else np.full(n, np.nan)
-            return {'t': t, 'lat': _align(lat, n), 'lon': _align(lon, n)}
+        with _nc_lock:                          # serialise HDF5 opens
+            with _nc4.Dataset(fpath, 'r') as ds:
+                vs = ds.variables
+                if 'time' not in vs:
+                    return None
+                t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
+                if t.size == 0:
+                    return None
+                n = t.size
+                lat = np.ma.filled(vs['latitude'][:],  np.nan) if 'latitude'  in vs else np.full(n, np.nan)
+                lon = np.ma.filled(vs['longitude'][:], np.nan) if 'longitude' in vs else np.full(n, np.nan)
+                return {'t': t, 'lat': _align(lat, n), 'lon': _align(lon, n)}
     except ImportError:
         pass   # netCDF4 not available — fall through to xarray
     except Exception:
@@ -91,16 +106,17 @@ def _nc_read_surf(fpath):
     # ── xarray fallback ───────────────────────────────────────────────────────
     try:
         import xarray as xr
-        ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
-        if 'time' not in ds:
-            ds.close(); return None
-        t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
-        if t.size == 0:
-            ds.close(); return None
-        n   = t.size
-        lat = np.asarray(ds['latitude'].values,  dtype=np.float64) if 'latitude'  in ds else np.full(n, np.nan)
-        lon = np.asarray(ds['longitude'].values, dtype=np.float64) if 'longitude' in ds else np.full(n, np.nan)
-        ds.close()
+        with _nc_lock:                          # xarray may also use HDF5
+            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+            if 'time' not in ds:
+                ds.close(); return None
+            t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
+            if t.size == 0:
+                ds.close(); return None
+            n   = t.size
+            lat = np.asarray(ds['latitude'].values,  dtype=np.float64) if 'latitude'  in ds else np.full(n, np.nan)
+            lon = np.asarray(ds['longitude'].values, dtype=np.float64) if 'longitude' in ds else np.full(n, np.nan)
+            ds.close()
         return {'t': t, 'lat': _align(lat, n), 'lon': _align(lon, n)}
     except Exception:
         return None
@@ -125,19 +141,20 @@ def _nc_read_traj(fpath):
     # ── netCDF4 path ──────────────────────────────────────────────────────────
     try:
         import netCDF4 as _nc4
-        with _nc4.Dataset(fpath, 'r') as ds:
-            vs = ds.variables
-            if 'time' not in vs:
-                return None
-            t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
-            if t.size == 0:
-                return None
-            n      = t.size
-            result = {'t': t}
-            for v in _TRAJ_PHYS_VARS:
-                raw = np.ma.filled(vs[v][:], np.nan) if v in vs else np.full(n, np.nan)
-                result[v] = _align(raw, n)
-            return result
+        with _nc_lock:                          # serialise HDF5 opens
+            with _nc4.Dataset(fpath, 'r') as ds:
+                vs = ds.variables
+                if 'time' not in vs:
+                    return None
+                t = np.ma.filled(vs['time'][:], np.nan).astype(np.float64).ravel()
+                if t.size == 0:
+                    return None
+                n      = t.size
+                result = {'t': t}
+                for v in _TRAJ_PHYS_VARS:
+                    raw = np.ma.filled(vs[v][:], np.nan) if v in vs else np.full(n, np.nan)
+                    result[v] = _align(raw, n)
+                return result
     except ImportError:
         pass
     except Exception:
@@ -146,18 +163,19 @@ def _nc_read_traj(fpath):
     # ── xarray fallback ───────────────────────────────────────────────────────
     try:
         import xarray as xr
-        ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
-        if 'time' not in ds:
-            ds.close(); return None
-        t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
-        if t.size == 0:
-            ds.close(); return None
-        n      = t.size
-        result = {'t': t}
-        for v in _TRAJ_PHYS_VARS:
-            raw = np.asarray(ds[v].values, dtype=np.float64) if v in ds else np.full(n, np.nan)
-            result[v] = _align(raw, n)
-        ds.close()
+        with _nc_lock:                          # xarray may also use HDF5
+            ds = xr.open_dataset(fpath, decode_times=False, mask_and_scale=True)
+            if 'time' not in ds:
+                ds.close(); return None
+            t = np.asarray(ds['time'].values, dtype=np.float64).ravel()
+            if t.size == 0:
+                ds.close(); return None
+            n      = t.size
+            result = {'t': t}
+            for v in _TRAJ_PHYS_VARS:
+                raw = np.asarray(ds[v].values, dtype=np.float64) if v in ds else np.full(n, np.nan)
+                result[v] = _align(raw, n)
+            ds.close()
         return result
     except Exception:
         return None
@@ -259,6 +277,48 @@ def dep_state(dep):
     return jsonify({'state': state, 'nc_count': nc_count, 'nc_dir': nc_dir})
 
 
+@app.route('/api/deployments/health')
+def deployments_health():
+    """Return lightweight health indicators for every deployment (one call for the dashboard)."""
+    deps = _find_deployments()
+    result = {}
+    for dep in deps:
+        glider     = dep.split('-')[0]
+        config_base = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
+        raw_dir    = os.path.join(BASE_DIR, 'incoming_data', dep)
+        merged_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'merged_data')
+        flight_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'flight_data')
+        nc_dir     = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'profile')
+
+        raw_count  = len(os.listdir(raw_dir))  if os.path.isdir(raw_dir)    else 0
+        dat_merged = len(glob.glob(os.path.join(merged_dir, '*.dat'))) if os.path.isdir(merged_dir) else 0
+        dat_flight = len(glob.glob(os.path.join(flight_dir, '*.dat'))) if os.path.isdir(flight_dir) else 0
+        nc_profile = len(glob.glob(os.path.join(nc_dir, '*.nc')))      if os.path.isdir(nc_dir)     else 0
+
+        required   = ['deployment.json', 'global_attributes.json', 'instruments.json', 'sensor_defs.json']
+        meta_ok    = all(os.path.isfile(os.path.join(config_base, 'science_profile', f)) for f in required)
+
+        sd_valid = False
+        sd_path  = os.path.join(config_base, 'science_profile', 'sensor_defs.json')
+        if os.path.isfile(sd_path):
+            try:
+                with open(sd_path, encoding='utf-8-sig') as f:
+                    sd = json.load(f)
+                sd_valid = any(isinstance(v, dict) and v.get('is_dimension') for v in sd.values())
+            except Exception:
+                pass
+
+        result[dep] = {
+            'raw_files':         raw_count,
+            'dat_merged':        dat_merged,
+            'dat_flight':        dat_flight,
+            'metadata_complete': meta_ok,
+            'sensor_defs_valid': sd_valid,
+            'nc_profile':        nc_profile,
+        }
+    return jsonify(result)
+
+
 @app.route('/api/deployment/<dep>/set-status/<stage>', methods=['POST'])
 def set_status(dep, stage):
     status = (request.json or {}).get('status', STATUS_NOT_RUN)
@@ -283,6 +343,53 @@ def _container_name(dep, stage):
     """Stable Docker container name for a (deployment, stage) pair."""
     safe = re.sub(r'[^a-zA-Z0-9_.-]', '-', f'glider-{dep}-{stage}')
     return safe[:128]   # Docker name limit
+
+
+# ── Docker Desktop helpers ─────────────────────────────────────────────────────
+
+_DOCKER_DESKTOP_EXE = r'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+
+
+@app.route('/api/docker/status')
+def docker_status():
+    try:
+        r = subprocess.run(['docker', 'info'],
+                           capture_output=True, text=True, timeout=6)
+        return jsonify({'running': r.returncode == 0})
+    except Exception:
+        return jsonify({'running': False})
+
+
+@app.route('/api/docker/start', methods=['POST'])
+def docker_start():
+    if not os.path.exists(_DOCKER_DESKTOP_EXE):
+        return jsonify({'ok': False, 'error': f'Docker Desktop not found at {_DOCKER_DESKTOP_EXE}'}), 404
+    try:
+        subprocess.Popen([_DOCKER_DESKTOP_EXE])
+        return jsonify({'ok': True})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/docker/wait')
+def docker_wait():
+    """SSE: polls every 3 s until Docker responds, or 120 s timeout."""
+    import time as _time
+    def _gen():
+        deadline = _time.time() + 120
+        while _time.time() < deadline:
+            try:
+                r = subprocess.run(['docker', 'info'],
+                                   capture_output=True, text=True, timeout=6)
+                ready = r.returncode == 0
+            except Exception:
+                ready = False
+            yield f"data: {json.dumps({'ready': ready})}\n\n"
+            if ready:
+                return
+            _time.sleep(3)
+        yield f"data: {json.dumps({'ready': False, 'timeout': True})}\n\n"
+    return Response(_gen(), mimetype='text/event-stream')
 
 
 @app.route('/api/deployment/<dep>/run/<stage>', methods=['POST'])
@@ -327,6 +434,10 @@ def run_stage(dep, stage):
     else:
         cname = None
 
+    # Snapshot current status so abort can restore it
+    prev = (load_state(dep_dir).get(stage) or {}).get('status', STATUS_NOT_RUN)
+    _prev_status[key] = prev
+
     set_stage_status(dep_dir, stage, STATUS_RUNNING)
 
     # Initialise live-log buffer for this run so reconnect can start immediately
@@ -365,12 +476,14 @@ def run_stage(dep, stage):
             status = STATUS_DONE if ok else STATUS_FAILED
             set_stage_status(dep_dir, stage, status)
             _save_run_log(dep, stage, start_ts, log_lines, ok)
+            _prev_status.pop(key, None)
             _live_done[key] = True
             yield f"data: {json.dumps({'type': 'done', 'success': ok, 'code': proc.returncode})}\n\n"
 
         except Exception as exc:
             set_stage_status(dep_dir, stage, STATUS_FAILED)
             _save_run_log(dep, stage, start_ts, log_lines, False)
+            _prev_status.pop(key, None)
             _live_done[key] = True
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         finally:
@@ -398,8 +511,9 @@ def abort_stage(dep, stage):
     cname = _container_name(dep, stage)
     subprocess.run(['docker', 'kill', cname],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    set_stage_status(_dep_dir(dep), stage, STATUS_FAILED)
-    return jsonify({'ok': True, 'killed': killed})
+    restored = _prev_status.pop(key, STATUS_NOT_RUN)
+    set_stage_status(_dep_dir(dep), stage, restored)
+    return jsonify({'ok': True, 'killed': killed, 'restored_status': restored})
 
 
 @app.route('/api/deployment/<dep>/stage-logs/<stage>')
@@ -499,8 +613,13 @@ def preflight_apply(dep):
         return jsonify({'error': 'pre_qaqc_config_check.py not found'}), 404
     dep_dir = _dep_dir(dep)
     try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False,
+                                        encoding='utf-8') as tf:
+            json.dump(data, tf)
+            tf_path = tf.name
         result = subprocess.run(
-            [sys.executable, script, BASE_DIR, dep, '--apply', json.dumps(data)],
+            [sys.executable, script, BASE_DIR, dep, '--apply-file', tf_path],
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
@@ -509,6 +628,10 @@ def preflight_apply(dep):
             timeout=30,
             env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'},
         )
+        try:
+            os.unlink(tf_path)
+        except OSError:
+            pass
         ok = (result.returncode == 0)
         if ok:
             set_stage_status(dep_dir, 'preflight', STATUS_DONE)
@@ -753,53 +876,129 @@ def dat_files(dep):
     return jsonify(result)
 
 
+@app.route('/api/deployment/<dep>/dat-count')
+def dat_count(dep):
+    base = os.path.join(BASE_DIR, 'dat_files', dep)
+    def _count(folder):
+        if not os.path.isdir(folder):
+            return 0
+        return sum(1 for f in os.listdir(folder) if f.lower().endswith('.dat'))
+    return jsonify({
+        'merged': _count(os.path.join(base, 'merged_data')),
+        'flight': _count(os.path.join(base, 'flight_data')),
+    })
+
+
 @app.route('/api/deployment/<dep>/dat-sensors')
 def dat_sensors(dep):
     """
-    Scan all DAT files in merged_data and return the union of sensor names.
-    Only reads the first ~20 lines of each file (the ASCII header), so it's
-    fast even for large datasets.
+    Scan DAT files and return sensor lists per source folder.
+    merged_data → used by Profile + Trajectory (Science)
+    flight_data → used by Trajectory (Flight)
+    Only reads the header of each file so it's fast for large datasets.
     """
-    dat_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'merged_data')
-    if not os.path.isdir(dat_dir):
-        return jsonify({'sensors': [], 'files_scanned': 0, 'error': 'No dat_files directory found'})
+    def _scan(dat_dir):
+        if not os.path.isdir(dat_dir):
+            return {'sensors': [], 'files_scanned': 0}
+        all_sensors, files_scanned, errors = set(), 0, []
+        for fname in sorted(os.listdir(dat_dir)):
+            if not fname.endswith('.dat'):
+                continue
+            fpath = os.path.join(dat_dir, fname)
+            try:
+                num_tags = 14
+                with open(fpath, 'r', errors='replace') as f:
+                    for i, raw in enumerate(f):
+                        line = raw.strip()
+                        if line.startswith('num_ascii_tags:'):
+                            try:
+                                num_tags = int(line.split(':', 1)[1].strip())
+                            except ValueError:
+                                pass
+                        if i == num_tags:
+                            all_sensors.update(line.split())
+                            break
+                        if i > 30:
+                            break
+                files_scanned += 1
+            except Exception as exc:
+                errors.append(f'{fname}: {exc}')
+        return {'sensors': sorted(all_sensors), 'files_scanned': files_scanned}
 
-    all_sensors = set()
-    files_scanned = 0
-    errors = []
-
-    for fname in sorted(os.listdir(dat_dir)):
-        if not fname.endswith('.dat'):
-            continue
-        fpath = os.path.join(dat_dir, fname)
-        try:
-            num_tags = 14  # Slocum default; overridden by header value
-            with open(fpath, 'r', errors='replace') as f:
-                for i, raw in enumerate(f):
-                    line = raw.strip()
-                    # Pick up num_ascii_tags if present
-                    if line.startswith('num_ascii_tags:'):
-                        try:
-                            num_tags = int(line.split(':', 1)[1].strip())
-                        except ValueError:
-                            pass
-                    # Sensor names line immediately follows the header block
-                    if i == num_tags:
-                        names = line.split()
-                        all_sensors.update(names)
-                        break
-                    # Safety: stop if we've read far past a normal header
-                    if i > 30:
-                        break
-            files_scanned += 1
-        except Exception as exc:
-            errors.append(f'{fname}: {exc}')
-
+    base = os.path.join(BASE_DIR, 'dat_files', dep)
     return jsonify({
-        'sensors':       sorted(all_sensors),
-        'files_scanned': files_scanned,
-        'errors':        errors[:5],  # cap error list
+        'merged': _scan(os.path.join(base, 'merged_data')),
+        'flight': _scan(os.path.join(base, 'flight_data')),
     })
+
+
+# ── NetCDF config validation ──────────────────────────────────────────────────
+_STAGE_CONFIG_SUBDIR = {
+    'dat_to_profile_nc':           'science_profile',
+    'dat_to_trajectory_nc':        'science_trajectory',
+    'dat_to_trajectory_flight_nc': 'trajectory_flight',
+}
+_REQUIRED_NC_FILES = ['deployment.json', 'global_attributes.json', 'instruments.json', 'sensor_defs.json']
+_LLAT_VARS         = ['llat_time', 'llat_depth', 'llat_latitude', 'llat_longitude']
+
+
+def _validate_netcdf_config(config_dir):
+    issues = []
+    parsed = {}
+    for fname in _REQUIRED_NC_FILES:
+        path = os.path.join(config_dir, fname)
+        if not os.path.isfile(path):
+            issues.append({'file': fname, 'message': 'File not found'})
+            continue
+        try:
+            with open(path, encoding='utf-8-sig') as f:
+                parsed[fname] = json.load(f)
+        except json.JSONDecodeError as e:
+            issues.append({'file': fname, 'message': f'Invalid JSON: {e}'})
+
+    if 'deployment.json' in parsed:
+        dep_cfg = parsed['deployment.json']
+        if not ('trajectory_name' in dep_cfg or 'trajectory_datetime' in dep_cfg):
+            issues.append({'file': 'deployment.json', 'message': 'Missing trajectory_name (or trajectory_datetime)'})
+        if not isinstance(dep_cfg.get('platform'), dict):
+            issues.append({'file': 'deployment.json', 'message': 'Missing or invalid platform section'})
+
+    if 'instruments.json' in parsed:
+        if not isinstance(parsed['instruments.json'], list):
+            issues.append({'file': 'instruments.json', 'message': 'Must be a JSON array'})
+
+    if 'sensor_defs.json' in parsed:
+        sd = parsed['sensor_defs.json']
+        if not isinstance(sd, dict):
+            issues.append({'file': 'sensor_defs.json', 'message': 'Must be a JSON object'})
+        else:
+            dims = [k for k, v in sd.items() if isinstance(v, dict) and v.get('is_dimension')]
+            if not dims:
+                issues.append({'file': 'sensor_defs.json',
+                               'message': 'No record dimension (is_dimension: true) — run Build Sensor Defs'})
+            for var in _LLAT_VARS:
+                if var not in sd:
+                    issues.append({'file': 'sensor_defs.json', 'message': f'Missing required variable: {var}'})
+            obs_vars = [k for k, v in sd.items() if isinstance(v, dict) and v.get('dimension') == 'obs']
+            if obs_vars:
+                issues.append({'file': 'sensor_defs.json',
+                               'message': f'{len(obs_vars)} variable(s) use dimension "obs" instead of "time" — run Build Sensor Defs'})
+
+    return issues
+
+
+@app.route('/api/deployment/<dep>/validate-netcdf-config')
+def validate_netcdf_config(dep):
+    stage = request.args.get('stage', '')
+    subdir = _STAGE_CONFIG_SUBDIR.get(stage)
+    if not subdir:
+        return jsonify({'ok': True, 'issues': []})
+    glider     = dep.split('-')[0]
+    config_dir = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep, subdir)
+    if not os.path.isdir(config_dir):
+        return jsonify({'ok': False, 'issues': [{'file': subdir + '/', 'message': 'Config directory not found'}]})
+    issues = _validate_netcdf_config(config_dir)
+    return jsonify({'ok': len(issues) == 0, 'issues': issues})
 
 
 @app.route('/api/deployment/<dep>/metadata')
@@ -843,6 +1042,26 @@ def save_metadata(dep):
     with open(full_path, 'w') as fp:
         fp.write(content)
 
+    return jsonify({'ok': True})
+
+
+@app.route('/api/deployment/<dep>/metadata/delete', methods=['POST'])
+def delete_metadata(dep):
+    data     = request.json or {}
+    rel_path = data.get('path', '').replace('/', os.sep).replace('\\', os.sep)
+
+    glider     = dep.split('-')[0]
+    config_dir = os.path.realpath(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep))
+    full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
+
+    if not full_path.startswith(config_dir):
+        return jsonify({'error': 'Invalid path'}), 403
+    if not full_path.endswith('.json'):
+        return jsonify({'error': 'Only .json files allowed'}), 403
+    if not os.path.isfile(full_path):
+        return jsonify({'error': 'File not found'}), 404
+
+    os.remove(full_path)
     return jsonify({'ok': True})
 
 
@@ -1095,6 +1314,9 @@ def import_raw(dep):
             continue
 
         dst = os.path.join(dest, name)
+        if os.path.exists(dst):
+            results.append({'path': src, 'ok': False, 'error': 'Already exists', 'name': name})
+            continue
         try:
             shutil.copy2(src, dst)
             results.append({'path': src, 'ok': True, 'name': name, 'dest': dst})
@@ -1146,6 +1368,157 @@ def create_deployment():
                         shutil.copy2(os.path.join(src, f), os.path.join(dst, f))
 
     return jsonify({'ok': True, 'deployment': name})
+
+
+_NICKNAMES_FILE = os.path.join(BASE_DIR, 'config', 'deployment_nicknames.json')
+
+def _load_nicknames():
+    if os.path.isfile(_NICKNAMES_FILE):
+        try:
+            with open(_NICKNAMES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_nicknames(data):
+    os.makedirs(os.path.dirname(_NICKNAMES_FILE), exist_ok=True)
+    with open(_NICKNAMES_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+@app.route('/api/nicknames')
+def get_nicknames():
+    return jsonify(_load_nicknames())
+
+
+@app.route('/api/deployment/<dep>/nickname', methods=['POST'])
+def set_nickname(dep):
+    nickname = (request.json or {}).get('nickname', '').strip()
+    data = _load_nicknames()
+    if nickname:
+        data[dep] = nickname
+    else:
+        data.pop(dep, None)
+    _save_nicknames(data)
+    return jsonify({'ok': True, 'nickname': nickname or None})
+
+
+@app.route('/api/deployment/<dep>/rename', methods=['POST'])
+def rename_deployment(dep):
+    new_name = (request.json or {}).get('new_name', '').strip()
+    if not new_name:
+        return jsonify({'error': 'new_name required'}), 400
+    if new_name == dep:
+        return jsonify({'ok': True, 'name': dep})
+    if re.search(r'[<>:"/\\|?*\x00-\x1f]', new_name):
+        return jsonify({'error': 'Name contains invalid characters'}), 400
+
+    # Block rename while a stage is running for this deployment
+    running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
+    if running:
+        return jsonify({'error': 'A stage is currently running — stop it before renaming'}), 409
+
+    # incoming_data is the source of truth; must exist
+    old_inc = os.path.join(BASE_DIR, 'incoming_data', dep)
+    new_inc = os.path.join(BASE_DIR, 'incoming_data', new_name)
+    if not os.path.isdir(old_inc):
+        return jsonify({'error': f'Deployment folder not found: {old_inc}'}), 404
+    if os.path.exists(new_inc):
+        return jsonify({'error': f'"{new_name}" already exists'}), 409
+
+    renamed, skipped, errors = [], [], []
+
+    def _try_rename(old_path, new_path, label):
+        if os.path.isdir(old_path):
+            try:
+                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                os.rename(old_path, new_path)
+                renamed.append(label)
+            except Exception as exc:
+                errors.append(f'{label}: {exc}')
+        else:
+            skipped.append(label)
+
+    _try_rename(old_inc, new_inc, 'incoming_data')
+
+    # deployments/<year>/<dep>  (year may change if date part of name changes)
+    old_year = dep.split('-')[1][:4]      if '-' in dep      else '2025'
+    new_year = new_name.split('-')[1][:4] if '-' in new_name else old_year
+    _try_rename(
+        os.path.join(BASE_DIR, 'deployments', old_year, dep),
+        os.path.join(BASE_DIR, 'deployments', new_year, new_name),
+        'deployments',
+    )
+
+    # Flat directories that are keyed directly by deployment name
+    for folder in ('dat_files', 'gncutils_slocum_nc_output', 'post_processing', 'logs', 'ad2cp'):
+        _try_rename(
+            os.path.join(BASE_DIR, folder, dep),
+            os.path.join(BASE_DIR, folder, new_name),
+            folder,
+        )
+
+    # glider_config_files_json/<glider>/<dep>
+    old_glider = dep.split('-')[0]
+    new_glider = new_name.split('-')[0]
+    _try_rename(
+        os.path.join(BASE_DIR, 'glider_config_files_json', old_glider, dep),
+        os.path.join(BASE_DIR, 'glider_config_files_json', new_glider, new_name),
+        'glider_config_files_json',
+    )
+
+    if errors:
+        return jsonify({'error': '; '.join(errors), 'renamed': renamed, 'skipped': skipped}), 500
+
+    # Transfer nickname to the new name
+    nicks = _load_nicknames()
+    if dep in nicks:
+        nicks[new_name] = nicks.pop(dep)
+        _save_nicknames(nicks)
+
+    return jsonify({'ok': True, 'name': new_name, 'renamed': renamed, 'skipped': skipped})
+
+
+@app.route('/api/deployment/<dep>/delete', methods=['POST'])
+def delete_deployment(dep):
+    running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
+    if running:
+        return jsonify({'error': 'A stage is currently running — stop it before deleting'}), 409
+
+    glider   = dep.split('-')[0]
+    year     = dep.split('-')[1][:4] if '-' in dep else '2025'
+    deleted, skipped, errors = [], [], []
+
+    def _try_delete(path, label):
+        if os.path.isdir(path):
+            try:
+                shutil.rmtree(path)
+                deleted.append(label)
+            except Exception as exc:
+                errors.append(f'{label}: {exc}')
+        else:
+            skipped.append(label)
+
+    _try_delete(os.path.join(BASE_DIR, 'incoming_data', dep),                          'incoming_data')
+    _try_delete(os.path.join(BASE_DIR, 'deployments', year, dep),                      'deployments')
+    _try_delete(os.path.join(BASE_DIR, 'dat_files', dep),                              'dat_files')
+    _try_delete(os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep),              'gncutils_slocum_nc_output')
+    _try_delete(os.path.join(BASE_DIR, 'post_processing', dep),                        'post_processing')
+    _try_delete(os.path.join(BASE_DIR, 'logs', dep),                                   'logs')
+    _try_delete(os.path.join(BASE_DIR, 'ad2cp', dep),                                  'ad2cp')
+    _try_delete(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep),       'glider_config_files_json')
+
+    # Remove nickname entry
+    nicks = _load_nicknames()
+    if dep in nicks:
+        del nicks[dep]
+        _save_nicknames(nicks)
+
+    if errors:
+        return jsonify({'error': '; '.join(errors), 'deleted': deleted, 'skipped': skipped}), 500
+
+    return jsonify({'ok': True, 'deleted': deleted, 'skipped': skipped})
 
 
 # ── CAC file manager ─────────────────────────────────────────────────────────
@@ -1313,115 +1686,123 @@ def trajectory_report(dep):
         print(f'[server] trajectory report: loaded from disk cache', flush=True)
         return jsonify(disk_data)
 
-    # 2 — parallel read
+    # 2 — read files (serialised through _nc_lock to avoid HDF5 thread issues)
     import numpy as np
-    print(f'[server] trajectory report: reading {len(files)} files with {_TRAJ_WORKERS} threads…', flush=True)
+    import traceback as _tb
+    print(f'[server] trajectory report: reading {len(files)} files…', flush=True)
 
-    file_paths = [os.path.join(traj_dir, f) for f in files]
-    t_chunks   = []
-    var_chunks = {v: [] for v in _TRAJ_PHYS_VARS}
-    skipped    = 0
+    try:
+        file_paths = [os.path.join(traj_dir, f) for f in files]
+        t_chunks   = []
+        var_chunks = {v: [] for v in _TRAJ_PHYS_VARS}
+        skipped    = 0
 
-    with ThreadPoolExecutor(max_workers=_TRAJ_WORKERS) as ex:
-        for result in ex.map(_nc_read_traj, file_paths):
-            if result is None:
-                skipped += 1
-                continue
-            t_chunks.append(result['t'])
-            for v in _TRAJ_PHYS_VARS:
-                var_chunks[v].append(result[v])
+        with ThreadPoolExecutor(max_workers=_TRAJ_WORKERS) as ex:
+            for result in ex.map(_nc_read_traj, file_paths):
+                if result is None:
+                    skipped += 1
+                    continue
+                t_chunks.append(result['t'])
+                for v in _TRAJ_PHYS_VARS:
+                    var_chunks[v].append(result[v])
 
-    if not t_chunks:
-        return jsonify({'error': 'No usable data found in trajectory NC files'}), 404
+        if not t_chunks:
+            return jsonify({'error': 'No usable data found in trajectory NC files'}), 404
 
-    t_all    = np.concatenate(t_chunks)
-    sort_idx = np.argsort(t_all, kind='stable')
-    t_all    = t_all[sort_idx]
+        t_all    = np.concatenate(t_chunks)
+        sort_idx = np.argsort(t_all, kind='stable')
+        t_all    = t_all[sort_idx]
 
-    vars_all = {}
-    for v in _TRAJ_PHYS_VARS:
-        vars_all[v] = np.concatenate(var_chunks[v])[sort_idx] if var_chunks[v] else np.full(t_all.size, np.nan)
+        vars_all = {}
+        for v in _TRAJ_PHYS_VARS:
+            vars_all[v] = np.concatenate(var_chunks[v])[sort_idx] if var_chunks[v] else np.full(t_all.size, np.nan)
 
-    n_total = t_all.size
+        n_total = t_all.size
 
-    # Unix-epoch seconds -> ISO-8601 string
-    def to_iso(epoch_arr):
-        out = []
-        for ts in epoch_arr:
-            try:
-                out.append(datetime.datetime.utcfromtimestamp(float(ts)).strftime('%Y-%m-%dT%H:%M:%SZ'))
-            except (ValueError, OSError, OverflowError):
-                out.append('')
-        return out
+        # Unix-epoch seconds -> ISO-8601 string
+        def to_iso(epoch_arr):
+            out = []
+            for ts in epoch_arr:
+                try:
+                    out.append(datetime.datetime.utcfromtimestamp(float(ts)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+                except (ValueError, OSError, OverflowError):
+                    out.append('')
+            return out
 
-    # GPS surfacings: both lat and lon are finite and non-zero
-    lat_all = vars_all['latitude']
-    lon_all = vars_all['longitude']
-    valid   = np.isfinite(lat_all) & np.isfinite(lon_all) & (lat_all != 0.0) & (lon_all != 0.0)
+        # GPS surfacings: both lat and lon are finite and non-zero
+        lat_all = vars_all['latitude']
+        lon_all = vars_all['longitude']
+        valid   = np.isfinite(lat_all) & np.isfinite(lon_all) & (lat_all != 0.0) & (lon_all != 0.0)
 
-    # Subsample timeseries to at most 10 000 points
-    MAX_TS = 10_000
-    if n_total > MAX_TS:
-        sub_idx = np.round(np.linspace(0, n_total - 1, MAX_TS)).astype(int)
-    else:
-        sub_idx = np.arange(n_total)
+        # Subsample timeseries to at most 10 000 points
+        MAX_TS = 10_000
+        if n_total > MAX_TS:
+            sub_idx = np.round(np.linspace(0, n_total - 1, MAX_TS)).astype(int)
+        else:
+            sub_idx = np.arange(n_total)
 
-    RAD2DEG = 180.0 / np.pi
+        RAD2DEG = 180.0 / np.pi
 
-    def sub_to_list(arr, scale=1.0, decimals=4):
-        v = arr[sub_idx] * scale
-        return [None if not np.isfinite(x) else round(float(x), decimals) for x in v]
+        def sub_to_list(arr, scale=1.0, decimals=4):
+            v = arr[sub_idx] * scale
+            return [None if not np.isfinite(x) else round(float(x), decimals) for x in v]
 
-    timeseries = {
-        'time':    to_iso(t_all[sub_idx]),
-        'pitch':   sub_to_list(vars_all['m_pitch'],         RAD2DEG, 2),
-        'roll':    sub_to_list(vars_all['m_roll'],          RAD2DEG, 2),
-        'heading': sub_to_list(vars_all['m_heading'],       RAD2DEG, 2),
-        'battery': sub_to_list(vars_all['m_battery'],       1.0,     3),
-        'coulomb': sub_to_list(vars_all['m_coulomb_amphr'], 1.0,     3),
-        'vacuum':  sub_to_list(vars_all['m_vacuum'],        1.0,     3),
-        'depth':   sub_to_list(vars_all['m_depth'],         1.0,     2),
-    }
+        timeseries = {
+            'time':    to_iso(t_all[sub_idx]),
+            'pitch':   sub_to_list(vars_all['m_pitch'],         RAD2DEG, 2),
+            'roll':    sub_to_list(vars_all['m_roll'],          RAD2DEG, 2),
+            'heading': sub_to_list(vars_all['m_heading'],       RAD2DEG, 2),
+            'battery': sub_to_list(vars_all['m_battery'],       1.0,     3),
+            'coulomb': sub_to_list(vars_all['m_coulomb_amphr'], 1.0,     3),
+            'vacuum':  sub_to_list(vars_all['m_vacuum'],        1.0,     3),
+            'depth':   sub_to_list(vars_all['m_depth'],         1.0,     2),
+        }
 
-    def safe_stats(arr, scale=1.0):
-        v = arr[np.isfinite(arr)] * scale
-        if v.size == 0:
-            return {'min': None, 'max': None, 'mean': None}
-        return {'min':  round(float(np.min(v)),  3),
-                'max':  round(float(np.max(v)),  3),
-                'mean': round(float(np.mean(v)), 3)}
+        def safe_stats(arr, scale=1.0):
+            v = arr[np.isfinite(arr)] * scale
+            if v.size == 0:
+                return {'min': None, 'max': None, 'mean': None}
+            return {'min':  round(float(np.min(v)),  3),
+                    'max':  round(float(np.max(v)),  3),
+                    'mean': round(float(np.mean(v)), 3)}
 
-    coulomb_valid = vars_all['m_coulomb_amphr'][np.isfinite(vars_all['m_coulomb_amphr'])]
-    total_ah = (round(float(np.max(coulomb_valid) - np.min(coulomb_valid)), 2)
-                if coulomb_valid.size > 1 else None)
+        coulomb_valid = vars_all['m_coulomb_amphr'][np.isfinite(vars_all['m_coulomb_amphr'])]
+        total_ah = (round(float(np.max(coulomb_valid) - np.min(coulomb_valid)), 2)
+                    if coulomb_valid.size > 1 else None)
 
-    data = {
-        'surfacings': {
-            'times': to_iso(t_all[valid]),
-            'lats':  [round(float(x), 6) for x in lat_all[valid]],
-            'lons':  [round(float(x), 6) for x in lon_all[valid]],
-            'count': int(valid.sum()),
-        },
-        'timeseries': timeseries,
-        'stats': {
-            'n_files':       len(files),
-            'n_skipped':     skipped,
-            'n_records':     int(n_total),
-            'n_surfacings':  int(valid.sum()),
-            'pitch_deg':     safe_stats(vars_all['m_pitch'],         RAD2DEG),
-            'roll_deg':      safe_stats(vars_all['m_roll'],          RAD2DEG),
-            'battery_v':     safe_stats(vars_all['m_battery']),
-            'coulomb_ah':    safe_stats(vars_all['m_coulomb_amphr']),
-            'total_ah_used': total_ah,
-            'vacuum_inhg':   safe_stats(vars_all['m_vacuum']),
-        },
-    }
+        data = {
+            'surfacings': {
+                'times': to_iso(t_all[valid]),
+                'lats':  [round(float(x), 6) for x in lat_all[valid]],
+                'lons':  [round(float(x), 6) for x in lon_all[valid]],
+                'count': int(valid.sum()),
+            },
+            'timeseries': timeseries,
+            'stats': {
+                'n_files':       len(files),
+                'n_skipped':     skipped,
+                'n_records':     int(n_total),
+                'n_surfacings':  int(valid.sum()),
+                'pitch_deg':     safe_stats(vars_all['m_pitch'],         RAD2DEG),
+                'roll_deg':      safe_stats(vars_all['m_roll'],          RAD2DEG),
+                'battery_v':     safe_stats(vars_all['m_battery']),
+                'coulomb_ah':    safe_stats(vars_all['m_coulomb_amphr']),
+                'total_ah_used': total_ah,
+                'vacuum_inhg':   safe_stats(vars_all['m_vacuum']),
+            },
+        }
 
-    _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': data}
-    _save_disk_cache(dep, 'trajectory_report', newest_mtime, data)
-    print(f'[server] trajectory report done: {n_total:,} records, '
-          f'{int(valid.sum())} surfacings, {skipped} files skipped', flush=True)
-    return jsonify(data)
+        _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': data}
+        _save_disk_cache(dep, 'trajectory_report', newest_mtime, data)
+        print(f'[server] trajectory report done: {n_total:,} records, '
+              f'{int(valid.sum())} surfacings, {skipped} files skipped', flush=True)
+        return jsonify(data)
+
+    except Exception as exc:
+        err_msg = f'{type(exc).__name__}: {exc}'
+        print(f'[server] trajectory report ERROR: {err_msg}', flush=True)
+        print(_tb.format_exc(), flush=True)
+        return jsonify({'error': err_msg}), 500
 
 
 @app.route('/api/deployment/<dep>/kmz')
@@ -1501,6 +1882,2807 @@ def download_kmz(dep):
         as_attachment=True,
         download_name=f'{dep}_glider_track.kmz',
     )
+
+
+@app.route('/api/deployment/<dep>/generate-map-image', methods=['POST'])
+def generate_map_image_route(dep):
+    """Generate a static glider track map PNG from cached surfacing data."""
+    import base64, io
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Use in-memory cache if available, else load disk cache
+    cached = _surf_cache.get(dep)
+    if not cached:
+        traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
+        if os.path.isdir(traj_dir):
+            try:
+                files = [f for f in os.listdir(traj_dir) if f.endswith('.nc')]
+                if files:
+                    newest = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+                    disk = _load_disk_cache(dep, 'surfacings', newest)
+                    if disk:
+                        cached = {'data': disk}
+            except Exception:
+                pass
+
+    if not cached:
+        return jsonify({'error': 'No surfacing data cached. Open the Map tab first.'}), 404
+
+    lats = cached['data'].get('lats', [])
+    lons = cached['data'].get('lons', [])
+    if not lats:
+        return jsonify({'error': 'No GPS surfacing positions found'}), 404
+
+    dep_dir_path = _dep_dir(dep)
+    figs_dir = os.path.join(dep_dir_path, 'figs')
+    os.makedirs(figs_dir, exist_ok=True)
+    out_path = os.path.join(figs_dir, 'glider_track_map.png')
+
+    try:
+        fig, ax = plt.subplots(figsize=(10, 7))
+        ax.plot(lons, lats, '-', color='#3b82f6', linewidth=1.2, alpha=0.8)
+        ax.scatter([lons[0]], [lats[0]], c='#22c55e', s=120, zorder=5, label='Start')
+        ax.scatter([lons[-1]], [lats[-1]], c='#ef4444', s=120, zorder=5, label='End')
+        ax.set_xlabel('Longitude', fontsize=11)
+        ax.set_ylabel('Latitude', fontsize=11)
+        ax.set_title(f'Glider Track: {dep}', fontsize=13, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_aspect('equal', adjustable='box')
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return jsonify({'ok': True, 'filename': 'glider_track_map.png'})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/deployment/<dep>/flight-stats-report')
+def flight_stats_report_html(dep):
+    """Generate a self-contained HTML report for flight statistics."""
+    import base64, io
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import datetime as _datetime
+
+    # Load trajectory report data from cache
+    cached = _traj_report_cache.get(dep)
+    if not cached:
+        traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
+        if os.path.isdir(traj_dir):
+            try:
+                files = [f for f in os.listdir(traj_dir) if f.endswith('.nc')]
+                if files:
+                    newest = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+                    disk = _load_disk_cache(dep, 'trajectory_report', newest)
+                    if disk:
+                        cached = {'data': disk}
+            except Exception:
+                pass
+
+    if not cached:
+        html = ('<html><body style="font-family:sans-serif;padding:40px">'
+                '<h2>No flight data available</h2>'
+                '<p>Open the Flight Stats tab in the app first to load the data, then try again.</p>'
+                '</body></html>')
+        return Response(html, mimetype='text/html'), 404
+
+    data       = cached['data']
+    timeseries = data.get('timeseries', {})
+    stats      = data.get('stats', {})
+
+    def _b64(fig):
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=130, bbox_inches='tight',
+                    facecolor='#ffffff')
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode()
+
+    def _fv(v, d=2):
+        return 'N/A' if v is None else f'{v:.{d}f}'
+
+    times   = timeseries.get('time', [])
+    batt    = timeseries.get('battery_v', [])
+    pitch   = timeseries.get('pitch_deg', [])
+    roll    = timeseries.get('roll_deg', [])
+    vacuum  = timeseries.get('vacuum_inhg', [])
+
+    MUTED = '#64748b'
+    charts_html = ''
+    tick_n = max(1, len(times) // 8) if times else 1
+
+    if times and batt:
+        fig, ax = plt.subplots(figsize=(12, 3.2))
+        ax.plot(range(len(times)), batt, color='#3b82f6', linewidth=0.9)
+        ax.set_ylabel('Volts', color=MUTED, fontsize=10)
+        ax.set_title('Battery Voltage', fontsize=11)
+        ax.grid(True, alpha=0.25, linestyle='--')
+        ax.set_xticks(range(0, len(times), tick_n))
+        ax.set_xticklabels([times[i][:10] for i in range(0, len(times), tick_n)],
+                           rotation=28, ha='right', fontsize=9)
+        fig.tight_layout()
+        charts_html += f'<div class="chart"><h3>Battery Voltage</h3><img src="data:image/png;base64,{_b64(fig)}"></div>'
+
+    if times and pitch and roll:
+        fig, ax = plt.subplots(figsize=(12, 3.2))
+        ax.plot(range(len(times)), pitch, label='Pitch', color='#f97316', linewidth=0.9)
+        ax.plot(range(len(times)), roll,  label='Roll',  color='#8b5cf6', linewidth=0.9)
+        ax.axhline(0, color='#94a3b8', linewidth=0.5, linestyle='--')
+        ax.set_ylabel('Degrees', color=MUTED, fontsize=10)
+        ax.set_title('Pitch & Roll', fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.25, linestyle='--')
+        ax.set_xticks(range(0, len(times), tick_n))
+        ax.set_xticklabels([times[i][:10] for i in range(0, len(times), tick_n)],
+                           rotation=28, ha='right', fontsize=9)
+        fig.tight_layout()
+        charts_html += f'<div class="chart"><h3>Pitch &amp; Roll</h3><img src="data:image/png;base64,{_b64(fig)}"></div>'
+
+    if times and vacuum:
+        fig, ax = plt.subplots(figsize=(12, 3.2))
+        ax.plot(range(len(times)), vacuum, color='#22c55e', linewidth=0.9)
+        ax.set_ylabel('inHg', color=MUTED, fontsize=10)
+        ax.set_title('Internal Vacuum', fontsize=11)
+        ax.grid(True, alpha=0.25, linestyle='--')
+        ax.set_xticks(range(0, len(times), tick_n))
+        ax.set_xticklabels([times[i][:10] for i in range(0, len(times), tick_n)],
+                           rotation=28, ha='right', fontsize=9)
+        fig.tight_layout()
+        charts_html += f'<div class="chart"><h3>Internal Vacuum</h3><img src="data:image/png;base64,{_b64(fig)}"></div>'
+
+    sv = stats.get
+    stat_items = [
+        ('Records',        f"{sv('n_records', 'N/A'):,}" if isinstance(sv('n_records'), int) else 'N/A'),
+        ('Surfacings',     str(sv('n_surfacings', 'N/A'))),
+        ('Battery Min',    f"{_fv(sv('battery_v',{}).get('min'))} V"),
+        ('Battery Max',    f"{_fv(sv('battery_v',{}).get('max'))} V"),
+        ('Amp-Hours Used', f"{_fv(sv('total_ah_used'), 1)} Ah" if sv('total_ah_used') is not None else 'N/A'),
+        ('Mean Pitch',     f"{_fv(sv('pitch_deg',{}).get('mean'),1)}°"),
+        ('Mean Roll',      f"{_fv(sv('roll_deg', {}).get('mean'),1)}°"),
+        ('Mean Vacuum',    f"{_fv(sv('vacuum_inhg',{}).get('mean'))} inHg"),
+    ]
+    cards_html = ''.join(
+        f'<div class="card"><div class="val">{v}</div><div class="lbl">{l}</div></div>'
+        for l, v in stat_items)
+
+    now = _datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    html = f'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Flight Statistics — {dep}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8fafc;color:#1e293b;padding:24px}}
+.hdr{{background:linear-gradient(135deg,#1e3a5f,#2d6a9f);color:#fff;padding:22px 28px;border-radius:10px;margin-bottom:22px}}
+.hdr h1{{font-size:21px;font-weight:700;margin-bottom:3px}}.hdr p{{font-size:12px;opacity:.8}}
+.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:22px}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;text-align:center;box-shadow:0 1px 2px rgba(0,0,0,.04)}}
+.val{{font-size:20px;font-weight:700;color:#1e40af}}.lbl{{font-size:10px;color:#64748b;margin-top:3px;text-transform:uppercase;letter-spacing:.4px}}
+.chart{{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:14px;margin-bottom:14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}}
+.chart h3{{font-size:13px;color:#475569;margin-bottom:10px;font-weight:600}}
+.chart img{{width:100%;border-radius:4px}}
+.foot{{margin-top:28px;text-align:center;font-size:11px;color:#94a3b8}}
+</style></head><body>
+<div class="hdr"><h1>Flight Statistics Report</h1><p>{dep} &nbsp;·&nbsp; {now}</p></div>
+<div class="grid">{cards_html}</div>
+{charts_html}
+<div class="foot">UVI Glider Processing Pipeline &nbsp;·&nbsp; {now}</div>
+</body></html>'''
+
+    return Response(html, mimetype='text/html', headers={
+        'Content-Disposition': f'attachment; filename="flight_stats_{dep}.html"'})
+
+
+def _adcp_run_stats(run_dir):
+    """Compute summary statistics for one AD2CP run from existing output files.
+    Returns a nested dict; never raises."""
+    stats = {}
+    try:
+        import numpy as np
+    except ImportError:
+        return stats
+
+    # ── DAC ────────────────────────────────────────────────────────────────────
+    dac_path = os.path.join(run_dir, 'dac.npz')
+    if os.path.exists(dac_path):
+        try:
+            data    = np.load(dac_path, allow_pickle=True)
+            dac     = data['dac'].astype(float)
+            valid   = np.isfinite(dac[:, 0]) & np.isfinite(dac[:, 1])
+            n_total = len(dac)
+            n_valid = int(valid.sum())
+            if n_valid > 0:
+                spd  = np.sqrt(dac[valid, 0]**2 + dac[valid, 1]**2)
+                mu   = float(np.nanmean(dac[valid, 0]))
+                mv   = float(np.nanmean(dac[valid, 1]))
+                deg  = (90 - np.degrees(np.arctan2(mv, mu))) % 360
+                dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE',
+                        'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+                card = dirs[int((deg + 11.25) / 22.5) % 16]
+                stats['dac'] = {
+                    'n_total':   n_total,
+                    'n_valid':   n_valid,
+                    'mean_spd':  round(float(np.mean(spd)), 3),
+                    'max_spd':   round(float(np.max(spd)),  3),
+                    'direction': f'{card} ({deg:.0f}°)',
+                }
+        except Exception:
+            pass
+
+    # ── Bias-corrected currents ────────────────────────────────────────────────
+    bias_path = os.path.join(run_dir, 'currents_bias_corrected.nc')
+    if os.path.exists(bias_path):
+        try:
+            import xarray as xr
+            import pandas as pd
+            ds    = xr.open_dataset(bias_path, decode_times=False)
+            vel_E = ds['velocity_E_DAC_reference_sb_corrected'].values
+            vel_N = ds['velocity_N_DAC_reference_sb_corrected'].values
+            depth = ds.depth.values
+            t_raw = ds.time.values
+            ds.close()
+
+            spd   = np.sqrt(vel_E**2 + vel_N**2)
+            valid = np.isfinite(spd)
+
+            try:
+                t_pd    = pd.to_datetime(t_raw)
+                t_ok    = t_pd[pd.notnull(t_pd)]
+                t_start = str(t_ok.min().date()) if len(t_ok) else 'N/A'
+                t_end   = str(t_ok.max().date()) if len(t_ok) else 'N/A'
+            except Exception:
+                t_start = t_end = 'N/A'
+
+            dcov = valid.mean(axis=1)
+            good = dcov >= 0.5
+            dmin = int(round(float(depth[good].min()), 0)) if good.any() else int(round(float(depth.min()), 0))
+            dmax = int(round(float(depth[good].max()), 0)) if good.any() else int(round(float(depth.max()), 0))
+
+            stats['currents'] = {
+                'n_profiles': int(valid.any(axis=0).sum()),
+                'date_start': t_start,
+                'date_end':   t_end,
+                'depth_min':  dmin,
+                'depth_max':  dmax,
+                'fill_pct':   round(100 * float(valid.mean()), 1),
+                'mean_spd':   round(float(np.nanmean(spd)), 3),
+                'max_spd':    round(float(np.nanmax(spd)),  3),
+            }
+        except Exception:
+            pass
+
+    # ── Sub-tidal / tidal variance partition ───────────────────────────────────
+    sub_path = os.path.join(run_dir, 'currents_subtidal.nc')
+    if os.path.exists(sub_path):
+        try:
+            import xarray as xr
+            ds  = xr.open_dataset(sub_path, decode_times=False)
+            u_s = ds['velocity_E_subtidal'].values
+            v_s = ds['velocity_N_subtidal'].values
+            u_t = ds['velocity_E_tidal'].values
+            v_t = ds['velocity_N_tidal'].values
+            ds.close()
+            total_var = float(np.nanvar(u_s + u_t) + np.nanvar(v_s + v_t))
+            tidal_var = float(np.nanvar(u_t) + np.nanvar(v_t))
+            if total_var > 0:
+                tp = round(100 * tidal_var / total_var, 1)
+                stats['tidal'] = {'tidal_pct': tp, 'subtidal_pct': round(100 - tp, 1)}
+        except Exception:
+            pass
+
+    # ── Shear ──────────────────────────────────────────────────────────────────
+    shear_path = os.path.join(run_dir, 'shear_processed.nc')
+    if os.path.exists(shear_path):
+        try:
+            import xarray as xr
+            ds = xr.open_dataset(shear_path, decode_times=False)
+            if 'Sh_E' in ds and 'Sh_N' in ds:
+                sh_mag = np.sqrt(ds['Sh_E'].values**2 + ds['Sh_N'].values**2)
+                mx     = round(float(np.nanmax(sh_mag)), 5)
+                md     = None
+                if 'depth_offset' in ds.coords:
+                    d_off = ds['depth_offset'].values
+                    idx   = np.unravel_index(np.nanargmax(sh_mag), sh_mag.shape)
+                    md    = int(round(float(d_off[idx[1]]), 0))
+                stats['shear'] = {'max_shear': mx, 'max_shear_depth': md}
+            ds.close()
+        except Exception:
+            pass
+
+    return stats
+
+
+@app.route('/api/adcp/report-html')
+def adcp_report_html():
+    """Generate a self-contained HTML AD2CP report styled like the QC report."""
+    import base64
+    import datetime as _datetime
+
+    dep = request.args.get('dep', '')
+    run = request.args.get('run', '')
+    if not dep:
+        return jsonify({'error': 'dep required'}), 400
+
+    base = _adcp_base_dir(dep, False)
+    run_dirs = {}
+    if run:
+        sub = os.path.join(base, run)
+        if os.path.isdir(sub):
+            run_dirs = {run: sub}
+    else:
+        if os.path.isdir(base):
+            for entry in sorted(os.listdir(base)):
+                sub = os.path.join(base, entry)
+                if os.path.isdir(sub):
+                    run_dirs[entry] = sub
+
+    if not run_dirs:
+        return jsonify({'error': 'No runs found'}), 404
+
+    # Plot groups — matches the stage order in the pipeline
+    PLOT_GROUPS = [
+        ('Bias Correction',            [('bias_diagnostic.png',   'Bias Diagnostic')]),
+        ('Velocity &amp; Speed',       [('velocity_sections.png', 'Velocity Sections (East / North)'),
+                                        ('speed_section.png',     'Speed Section')]),
+        ('Shear &amp; Backscatter',    [('shear_sections.png',    'Shear Sections'),
+                                        ('backscatter.png',       'Backscatter (Acoustic Amplitude)')]),
+        ('Depth-Averaged Currents',    [('dac_timeseries.png',    'DAC Time Series'),
+                                        ('dac_map_cartopy.png',   'Current Vectors Map')]),
+        ('Tidal Analysis',             [('tidal_filter.png',      'Tidal Filter (40-h low-pass)')]),
+        ('Diagnostics',                [('eke.png',               'Eddy Kinetic Energy (EKE)'),
+                                        ('transport.png',         'Volume Transport'),
+                                        ('richardson_number.png', 'Richardson Number')]),
+    ]
+
+    STAGE_LABELS = {
+        'process_shear':    'Process Shear',
+        'compute_currents': 'Compute Currents',
+        'bias_correction':  'Bias Correction',
+        'generate_plots':   'Generate Plots',
+        'tidal_filter':     'Tidal Filter',
+        'diagnostics':      'Diagnostics',
+    }
+
+    def _embed(path):
+        try:
+            with open(path, 'rb') as f:
+                return base64.b64encode(f.read()).decode()
+        except Exception:
+            return None
+
+    def _stage_done(run_dir, stage):
+        files = _ADCP_OUTPUTS.get(stage, [])
+        return bool(files) and all(
+            os.path.exists(os.path.join(run_dir, f)) for f in files)
+
+    now = _datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    n_runs = len(run_dirs)
+
+    # TOC entries
+    toc_html = ''.join(
+        f'<a href="#run-{i+1}">{i+1}. {lbl}</a>'
+        for i, lbl in enumerate(run_dirs.keys()))
+
+    sections_html = ''
+    for i, (run_label, run_dir) in enumerate(run_dirs.items(), 1):
+        # Stage status badges
+        badges_html = ''
+        for stage_key, stage_lbl in STAGE_LABELS.items():
+            done = _stage_done(run_dir, stage_key)
+            cls  = 'stage-done' if done else 'stage-pend'
+            sym  = '&#10003;' if done else '&#8212;'
+            badges_html += f'<span class="stage-badge {cls}">{sym} {stage_lbl}</span>'
+
+        # Info cards: count existing files
+        nc_files  = [f for f in os.listdir(run_dir) if f.endswith('.nc')]  if os.path.isdir(run_dir) else []
+        png_files = [f for f in os.listdir(run_dir) if f.endswith('.png')] if os.path.isdir(run_dir) else []
+
+        info_html = (
+            f'<div class="info-card"><div class="label">Run Label</div>'
+            f'<div class="value" style="font-size:15px;font-family:monospace">{run_label}</div></div>'
+            f'<div class="info-card"><div class="label">NC Files</div>'
+            f'<div class="value">{len(nc_files)}</div></div>'
+            f'<div class="info-card"><div class="label">Plot Files</div>'
+            f'<div class="value">{len(png_files)}</div></div>'
+            f'<div class="info-card"><div class="label">Stages Complete</div>'
+            f'<div class="value">{sum(_stage_done(run_dir, s) for s in STAGE_LABELS)}'
+            f' / {len(STAGE_LABELS)}</div></div>'
+        )
+
+        # Scientific statistics
+        def _sc(label, value, unit='', small=False):
+            vs = ' style="font-size:15px"' if small else ''
+            uh = f'<span class="stat-unit"> {unit}</span>' if unit else ''
+            return (f'<div class="info-card"><div class="label">{label}</div>'
+                    f'<div class="value"{vs}>{value}{uh}</div></div>')
+
+        st = _adcp_run_stats(run_dir)
+        stats_html = ''
+
+        cr = st.get('currents')
+        if cr:
+            cards = (_sc('Start Date',      cr['date_start'], small=True)
+                   + _sc('End Date',        cr['date_end'],   small=True)
+                   + _sc('Profiles w/ Data', cr['n_profiles'])
+                   + _sc('Depth Range',     f"{cr['depth_min']} – {cr['depth_max']}", 'm', small=True)
+                   + _sc('Grid Fill',       cr['fill_pct'],   '%')
+                   + _sc('Mean Speed',      cr['mean_spd'],   'm/s')
+                   + _sc('Max Speed',       cr['max_spd'],    'm/s'))
+            stats_html += f'<h3>Current Record</h3><div class="info-grid" style="margin:0 0 16px">{cards}</div>'
+
+        dac_st = st.get('dac')
+        if dac_st:
+            cards = (_sc('Valid Dives',    f"{dac_st['n_valid']} / {dac_st['n_total']}")
+                   + _sc('Mean DAC Speed', dac_st['mean_spd'], 'm/s')
+                   + _sc('Max DAC Speed',  dac_st['max_spd'],  'm/s')
+                   + _sc('Mean Direction', dac_st['direction'], small=True))
+            stats_html += f'<h3>Depth-Averaged Currents</h3><div class="info-grid" style="margin:0 0 16px">{cards}</div>'
+
+        tidal_st = st.get('tidal')
+        if tidal_st and tidal_st.get('tidal_pct') is not None:
+            cards = (_sc('Tidal Variance',     tidal_st['tidal_pct'],    '%')
+                   + _sc('Sub-tidal Variance', tidal_st['subtidal_pct'], '%'))
+            stats_html += f'<h3>Tidal Partition (40-h filter)</h3><div class="info-grid" style="margin:0 0 16px">{cards}</div>'
+
+        shear_st = st.get('shear')
+        if shear_st:
+            cards = _sc('Max Shear', shear_st['max_shear'], 's⁻¹')
+            if shear_st.get('max_shear_depth') is not None:
+                cards += _sc('Depth of Max Shear', shear_st['max_shear_depth'], 'm')
+            stats_html += f'<h3>Shear</h3><div class="info-grid" style="margin:0 0 16px">{cards}</div>'
+
+        stats_section = (f'<div class="stats-section">{stats_html}</div>' if stats_html else '')
+
+        # Plot groups
+        plot_sections_html = ''
+        for group_title, plots in PLOT_GROUPS:
+            cards = ''
+            for fn, plot_label in plots:
+                b64 = _embed(os.path.join(run_dir, fn))
+                if b64:
+                    cards += (f'<div class="plot-card">'
+                              f'<div class="plot-name">{plot_label}</div>'
+                              f'<img src="data:image/png;base64,{b64}" alt="{plot_label}">'
+                              f'</div>')
+            if cards:
+                plot_sections_html += (f'<h3>{group_title}</h3>'
+                                       f'<div class="plot-grid">{cards}</div>')
+
+        if not plot_sections_html:
+            plot_sections_html = ('<div class="note">No plots have been generated for this run yet. '
+                                  'Run the Generate Plots, Tidal Filter, and Diagnostics stages first.</div>')
+
+        sections_html += f'''
+<section id="run-{i}">
+  <h2>{i}. Run: {run_label}</h2>
+  <div class="stage-row">{badges_html}</div>
+  <div class="info-grid" style="margin:14px 0 20px">{info_html}</div>
+  {stats_section}
+  {plot_sections_html}
+</section>'''
+
+    CSS = '''
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 14px;
+    background: #f0f2f5;
+    color: #2c3e50;
+    line-height: 1.5;
+}
+.page { max-width: 1200px; margin: 0 auto; padding: 20px; }
+header {
+    background: linear-gradient(135deg, #1a252f 0%, #2c3e50 100%);
+    color: #fff;
+    padding: 28px 30px 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+header h1 { font-size: 22px; font-weight: 300; letter-spacing: 1px; color: #bdc3c7; }
+header .subtitle { font-size: 24px; font-weight: 700; color: #3498db; margin: 4px 0 14px; font-family: monospace; }
+.meta-bar { display: flex; gap: 10px; flex-wrap: wrap; }
+.meta-bar span {
+    background: rgba(255,255,255,0.1);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    color: #bdc3c7;
+}
+.toc { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.toc a {
+    color: #3498db; text-decoration: none;
+    background: #eaf4fb; padding: 4px 14px;
+    border-radius: 20px; font-size: 12px;
+    border: 1px solid #d6eaf8;
+}
+.toc a:hover { background: #d6eaf8; }
+section {
+    background: #fff;
+    padding: 24px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+}
+h2 {
+    font-size: 17px; color: #2c3e50;
+    border-left: 4px solid #3498db;
+    padding-left: 12px; margin-bottom: 16px;
+}
+h3 {
+    font-size: 14px; font-weight: 700; color: #34495e;
+    margin: 20px 0 10px;
+    padding-bottom: 5px;
+    border-bottom: 2px solid #ecf0f1;
+}
+.info-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px;
+}
+.info-card {
+    background: #f8f9fa; border: 1px solid #e8e8e8;
+    border-radius: 6px; padding: 12px 16px;
+}
+.info-card .label { font-size: 11px; color: #7f8c8d; text-transform: uppercase; letter-spacing: 0.5px; }
+.info-card .value { font-size: 18px; font-weight: 700; color: #2c3e50; margin-top: 2px; }
+.stage-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.stage-badge { padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+.stage-done { background: #d5f5e3; color: #1a7a40; }
+.stage-pend { background: #f4f6f7; color: #95a5a6; border: 1px solid #e0e0e0; }
+.plot-grid {
+    display: flex; flex-direction: column; gap: 18px; margin-bottom: 4px;
+}
+.plot-card {
+    border: 1px solid #e8e8e8; border-radius: 6px; overflow: hidden;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+}
+.plot-name {
+    background: #f8f9fa; padding: 8px 14px; font-size: 12px; font-weight: 600;
+    color: #555; border-bottom: 1px solid #e8e8e8;
+    display: flex; align-items: center; justify-content: space-between;
+}
+.plot-name::after { content: '⤢'; font-size: 13px; color: #aaa; }
+.plot-card img {
+    width: 100%; display: block; cursor: zoom-in;
+    transition: opacity 0.15s;
+}
+.plot-card img:hover { opacity: 0.92; }
+/* Lightbox */
+.lb-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.88); z-index: 9999;
+    align-items: center; justify-content: center; cursor: zoom-out;
+}
+.lb-overlay.open { display: flex; }
+.lb-overlay img {
+    max-width: 96vw; max-height: 94vh;
+    border-radius: 4px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    cursor: default;
+}
+.lb-close {
+    position: fixed; top: 16px; right: 20px;
+    color: #fff; font-size: 28px; cursor: pointer;
+    background: none; border: none; line-height: 1;
+    opacity: 0.8;
+}
+.lb-close:hover { opacity: 1; }
+.stat-unit { font-size: 11px; color: #7f8c8d; font-weight: 400; }
+.stats-section { margin-bottom: 20px; }
+.note {
+    background: #eaf4fb; border-left: 4px solid #3498db;
+    padding: 10px 16px; border-radius: 0 6px 6px 0;
+    margin: 8px 0; font-size: 13px; color: #2c3e50;
+}
+footer {
+    text-align: center; padding: 20px; font-size: 11px; color: #95a5a6;
+}
+'''
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AD2CP Report &mdash; {dep}</title>
+  <style>{CSS}</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <h1>AD2CP Processing Report</h1>
+  <div class="subtitle">{dep}</div>
+  <div class="meta-bar">
+    <span>Generated: {now}</span>
+    <span>Runs: {n_runs}</span>
+  </div>
+</header>
+
+<div class="toc">{toc_html}</div>
+
+{sections_html}
+
+<footer>UVI Glider Processing Pipeline &mdash; {now}</footer>
+</div>
+
+<!-- Lightbox overlay -->
+<div class="lb-overlay" id="lb-overlay" onclick="closeLb(event)">
+  <button class="lb-close" onclick="closeLb()">&times;</button>
+  <img id="lb-img" src="" alt="">
+</div>
+<script>
+const overlay = document.getElementById('lb-overlay');
+const lbImg   = document.getElementById('lb-img');
+document.querySelectorAll('.plot-card img').forEach(img => {{
+  img.addEventListener('click', () => {{
+    lbImg.src = img.src;
+    lbImg.alt = img.alt;
+    overlay.classList.add('open');
+  }});
+}});
+function closeLb(e) {{
+  if (!e || e.target !== lbImg) overlay.classList.remove('open');
+}}
+document.addEventListener('keydown', e => {{ if (e.key === 'Escape') overlay.classList.remove('open'); }});
+</script>
+</body>
+</html>'''
+
+    if request.args.get('dl') == '1':
+        fname = f'adcp_report_{dep}{"_"+run if run else ""}.html'
+        return Response(html, mimetype='text/html', headers={
+            'Content-Disposition': f'attachment; filename="{fname}"'})
+    return Response(html, mimetype='text/html')
+
+
+# ── Cloud storage ─────────────────────────────────────────────────────────────
+_CLOUD_DIR         = os.path.join(BASE_DIR, 'config', 'cloud')
+_CLOUD_CREDS_PATH  = os.path.join(_CLOUD_DIR, 'credentials.json')
+_CLOUD_TOKENS_PATH = os.path.join(_CLOUD_DIR, 'tokens.json')
+_OAUTH_PENDING     = {}   # state -> {verifier}
+
+
+def _ssl_ctx():
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        return None
+
+
+def _http(url, method='GET', data=None, headers=None):
+    """Thin urllib wrapper with SSL handling for Windows."""
+    import urllib.error as _urlerr
+    req = _urlreq.Request(url, data=data, headers=headers or {}, method=method)
+    ctx = _ssl_ctx()
+    opener = _urlreq.build_opener(_urlreq.HTTPSHandler(context=ctx)) if ctx else _urlreq.build_opener()
+    try:
+        with opener.open(req) as r:
+            return json.loads(r.read().decode('utf-8'))
+    except _urlerr.HTTPError as exc:
+        body = exc.read().decode('utf-8', errors='replace')
+        try:
+            detail = json.loads(body).get('error', {})
+            msg = detail.get('message', body) if isinstance(detail, dict) else str(detail)
+        except Exception:
+            msg = body[:400]
+        raise Exception(f'HTTP {exc.code} {exc.reason}: {msg}') from None
+
+
+# Thresholds / chunk sizes for large-file uploads
+_GOOGLE_RESUMABLE_THRESHOLD = 5   * 1024 * 1024   # 5 MB  — use resumable above this
+_GOOGLE_CHUNK_SIZE          = 8   * 1024 * 1024   # 8 MB  chunks (multiple of 256 KB)
+_DROPBOX_SESSION_THRESHOLD  = 150 * 1024 * 1024   # 150 MB — must use sessions above this
+_DROPBOX_CHUNK_SIZE         = 100 * 1024 * 1024   # 100 MB chunks
+
+
+def _google_resumable(token, fpath, fname, parent_id, file_size, overwrite_id=None):
+    """Upload a file to Google Drive using the resumable upload API."""
+    import urllib.error as _urlerr
+    ctx    = _ssl_ctx()
+    opener = (_urlreq.build_opener(_urlreq.HTTPSHandler(context=ctx))
+              if ctx else _urlreq.build_opener())
+
+    if overwrite_id:
+        init_url  = (f'https://www.googleapis.com/upload/drive/v3/files/{overwrite_id}'
+                     f'?uploadType=resumable')
+        init_meta = json.dumps({'name': fname}).encode('utf-8')
+        init_meth = 'PATCH'
+    else:
+        init_url  = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable'
+        init_meta = json.dumps({'name': fname, 'parents': [parent_id]}).encode('utf-8')
+        init_meth = 'POST'
+
+    init_req = _urlreq.Request(
+        init_url, data=init_meta, method=init_meth,
+        headers={
+            'Authorization':          f'Bearer {token}',
+            'Content-Type':           'application/json',
+            'X-Upload-Content-Type':  'application/octet-stream',
+            'X-Upload-Content-Length': str(file_size),
+        })
+    with opener.open(init_req) as r:
+        session_uri = r.headers.get('Location') or r.headers.get('location')
+    if not session_uri:
+        raise Exception('Resumable upload: no session URI returned')
+
+    with open(fpath, 'rb') as f:
+        offset = 0
+        while offset < file_size:
+            chunk = f.read(_GOOGLE_CHUNK_SIZE)
+            if not chunk:
+                break
+            end = offset + len(chunk) - 1
+            req = _urlreq.Request(
+                session_uri, data=chunk, method='PUT',
+                headers={
+                    'Content-Length': str(len(chunk)),
+                    'Content-Range':  f'bytes {offset}-{end}/{file_size}',
+                })
+            try:
+                with opener.open(req) as r:
+                    raw = r.read()
+                    return json.loads(raw.decode('utf-8')) if raw.strip() else {}
+            except _urlerr.HTTPError as e:
+                if e.code == 308:        # Resume Incomplete — chunk received, keep going
+                    offset += len(chunk)
+                    continue
+                raise
+    return {}
+
+
+def _google_upload(token, fpath, fname, parent_id, existing, conflict):
+    """Upload one file to Google Drive (multipart or resumable, with conflict handling)."""
+    if existing and conflict == 'skip':
+        return {'skipped': True}
+
+    file_size = os.path.getsize(fpath)
+
+    if existing and conflict == 'overwrite':
+        file_id = existing[0]['id']
+        if file_size > _GOOGLE_RESUMABLE_THRESHOLD:
+            resp = _google_resumable(token, fpath, fname, parent_id, file_size,
+                                     overwrite_id=file_id)
+        else:
+            with open(fpath, 'rb') as f:
+                content = f.read()
+            resp = _http(
+                f'https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media',
+                method='PATCH', data=content,
+                headers={'Authorization': f'Bearer {token}',
+                         'Content-Type':  'application/octet-stream'})
+        return {'id': resp.get('id'), 'name': fname}
+
+    # New file
+    if file_size > _GOOGLE_RESUMABLE_THRESHOLD:
+        resp = _google_resumable(token, fpath, fname, parent_id, file_size)
+        return {'id': resp.get('id'), 'name': resp.get('name')}
+
+    with open(fpath, 'rb') as f:
+        content = f.read()
+    boundary = 'gd_' + secrets.token_hex(8)
+    meta = json.dumps({'name': fname, 'parents': [parent_id]}).encode('utf-8')
+    body = (
+        f'--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'
+        .encode() + meta + b'\r\n'
+        + f'--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n'
+        .encode() + content
+        + f'\r\n--{boundary}--'.encode()
+    )
+    resp = _http(
+        'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+        method='POST', data=body,
+        headers={'Authorization': f'Bearer {token}',
+                 'Content-Type':  f'multipart/related; boundary={boundary}'})
+    return {'id': resp.get('id'), 'name': resp.get('name')}
+
+
+def _dropbox_upload(token, fpath, dbx_path, conflict):
+    """Upload one file to Dropbox (simple or session, with conflict handling)."""
+    if conflict == 'skip':
+        try:
+            _http('https://api.dropboxapi.com/2/files/get_metadata',
+                  method='POST',
+                  data=json.dumps({'path': dbx_path}).encode(),
+                  headers={'Authorization': f'Bearer {token}',
+                           'Content-Type': 'application/json'})
+            return {'skipped': True}
+        except Exception:
+            pass  # file not found — proceed
+
+    file_size = os.path.getsize(fpath)
+    if file_size > _DROPBOX_SESSION_THRESHOLD:
+        return _dropbox_session_upload(token, fpath, dbx_path)
+
+    with open(fpath, 'rb') as f:
+        content = f.read()
+    resp = _http(
+        'https://content.dropboxapi.com/2/files/upload',
+        method='POST', data=content,
+        headers={
+            'Authorization':   f'Bearer {token}',
+            'Content-Type':    'application/octet-stream',
+            'Dropbox-API-Arg': json.dumps({'path': dbx_path, 'mode': 'overwrite'}),
+        })
+    return {'path': resp.get('path_display')}
+
+
+def _dropbox_session_upload(token, fpath, dbx_path):
+    """Upload a large file (>150 MB) to Dropbox via upload sessions."""
+    file_size = os.path.getsize(fpath)
+    with open(fpath, 'rb') as f:
+        first = f.read(_DROPBOX_CHUNK_SIZE)
+        start = _http(
+            'https://content.dropboxapi.com/2/files/upload_session/start',
+            method='POST', data=first,
+            headers={
+                'Authorization':   f'Bearer {token}',
+                'Content-Type':    'application/octet-stream',
+                'Dropbox-API-Arg': json.dumps({'close': False}),
+            })
+        session_id = start['session_id']
+        offset     = len(first)
+
+        while offset < file_size:
+            chunk      = f.read(_DROPBOX_CHUNK_SIZE)
+            offset_end = offset + len(chunk)
+            cursor     = {'session_id': session_id, 'offset': offset}
+            if offset_end >= file_size:
+                resp = _http(
+                    'https://content.dropboxapi.com/2/files/upload_session/finish',
+                    method='POST', data=chunk,
+                    headers={
+                        'Authorization':   f'Bearer {token}',
+                        'Content-Type':    'application/octet-stream',
+                        'Dropbox-API-Arg': json.dumps({
+                            'cursor': cursor,
+                            'commit': {'path': dbx_path, 'mode': 'overwrite'},
+                        }),
+                    })
+                return {'path': resp.get('path_display')}
+            _http(
+                'https://content.dropboxapi.com/2/files/upload_session/append_v2',
+                method='POST', data=chunk,
+                headers={
+                    'Authorization':   f'Bearer {token}',
+                    'Content-Type':    'application/octet-stream',
+                    'Dropbox-API-Arg': json.dumps({'cursor': cursor, 'close': False}),
+                })
+            offset = offset_end
+    return {}
+
+
+def _load_cloud_creds():
+    try:
+        with open(_CLOUD_CREDS_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cloud_creds(data):
+    os.makedirs(_CLOUD_DIR, exist_ok=True)
+    with open(_CLOUD_CREDS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def _load_cloud_tokens():
+    try:
+        with open(_CLOUD_TOKENS_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cloud_tokens(data):
+    os.makedirs(_CLOUD_DIR, exist_ok=True)
+    with open(_CLOUD_TOKENS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def _pkce_pair():
+    verifier  = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b'=').decode()
+    return verifier, challenge
+
+
+def _google_access_token():
+    """Return a valid Google access token, refreshing if expired."""
+    tokens = _load_cloud_tokens().get('google')
+    if not tokens:
+        return None
+    if time.time() < tokens.get('expires_at', 0) - 60:
+        return tokens['access_token']
+    creds = _load_cloud_creds().get('google', {})
+    try:
+        resp = _http('https://oauth2.googleapis.com/token', method='POST',
+                     data=urllib.parse.urlencode({
+                         'client_id':     creds['client_id'],
+                         'client_secret': creds['client_secret'],
+                         'refresh_token': tokens['refresh_token'],
+                         'grant_type':    'refresh_token',
+                     }).encode())
+        all_t = _load_cloud_tokens()
+        all_t['google']['access_token'] = resp['access_token']
+        all_t['google']['expires_at']   = time.time() + resp.get('expires_in', 3600)
+        _save_cloud_tokens(all_t)
+        return resp['access_token']
+    except Exception as exc:
+        print(f'[cloud] Google token refresh failed: {exc}', flush=True)
+        return None
+
+
+def _dropbox_access_token():
+    """Return a valid Dropbox access token, refreshing if expired."""
+    tokens = _load_cloud_tokens().get('dropbox')
+    if not tokens:
+        return None
+    if time.time() < tokens.get('expires_at', 0) - 60:
+        return tokens.get('access_token')
+    creds = _load_cloud_creds().get('dropbox', {})
+    try:
+        resp = _http('https://api.dropboxapi.com/oauth2/token', method='POST',
+                     data=urllib.parse.urlencode({
+                         'grant_type':    'refresh_token',
+                         'refresh_token': tokens['refresh_token'],
+                         'client_id':     creds['app_key'],
+                     }).encode())
+        all_t = _load_cloud_tokens()
+        all_t['dropbox']['access_token'] = resp['access_token']
+        all_t['dropbox']['expires_at']   = time.time() + resp.get('expires_in', 14400)
+        _save_cloud_tokens(all_t)
+        return resp['access_token']
+    except Exception as exc:
+        print(f'[cloud] Dropbox token refresh failed: {exc}', flush=True)
+        return None
+
+
+def _oauth_close_page(message, ok=True):
+    icon  = '✓' if ok else '✗'
+    color = '#4ade80' if ok else '#f87171'
+    return (
+        '<!DOCTYPE html><html><head>'
+        '<style>body{font-family:sans-serif;background:#0f1720;color:#9ab4cc;'
+        'display:flex;align-items:center;justify-content:center;height:100vh;'
+        'margin:0;flex-direction:column;gap:14px;}</style></head><body>'
+        f'<div style="font-size:26px;color:{color}">{icon} {message}</div>'
+        '<div style="color:#4a6580;font-size:13px">You can close this window — '
+        'the app has been updated.</div>'
+        '<script>setTimeout(()=>window.close(),4000)</script>'
+        '</body></html>'
+    )
+
+
+# ── Account status ─────────────────────────────────────────────────────────────
+@app.route('/api/cloud/accounts')
+def cloud_accounts():
+    tokens = _load_cloud_tokens()
+    creds  = _load_cloud_creds()
+    def _svc(name, cred_key):
+        t = tokens.get(name, {})
+        c = creds.get(name, {})
+        return {
+            'connected': bool(t.get('access_token')),
+            'email':     t.get('email'),
+            'name':      t.get('name'),
+            'has_creds': bool(c.get(cred_key)),
+        }
+    return jsonify({
+        'google':  _svc('google',  'client_id'),
+        'dropbox': _svc('dropbox', 'app_key'),
+    })
+
+
+# ── Disconnect ─────────────────────────────────────────────────────────────────
+@app.route('/api/cloud/disconnect', methods=['POST'])
+def cloud_disconnect():
+    service = (request.json or {}).get('service')
+    tokens  = _load_cloud_tokens()
+    tokens.pop(service, None)
+    _save_cloud_tokens(tokens)
+    return jsonify({'ok': True})
+
+
+# ── Google OAuth ───────────────────────────────────────────────────────────────
+@app.route('/api/oauth/google/start')
+def google_oauth_start():
+    creds = _load_cloud_creds().get('google', {})
+    if not creds.get('client_id'):
+        return jsonify({'error': 'Google credentials not configured'}), 400
+    state             = secrets.token_urlsafe(16)
+    verifier, challenge = _pkce_pair()
+    _OAUTH_PENDING[state] = {'verifier': verifier}
+    url = 'https://accounts.google.com/o/oauth2/v2/auth?' + urllib.parse.urlencode({
+        'client_id':             creds['client_id'],
+        'redirect_uri':          f'http://localhost:{PORT}/oauth/google/callback',
+        'response_type':         'code',
+        'scope':                 ('openid email profile '
+                                  'https://www.googleapis.com/auth/drive'),
+        'state':                 state,
+        'code_challenge':        challenge,
+        'code_challenge_method': 'S256',
+        'access_type':           'offline',
+        'prompt':                'consent select_account',
+    })
+    return jsonify({'url': url})
+
+
+@app.route('/oauth/google/callback')
+def google_oauth_callback():
+    code  = request.args.get('code')
+    state = request.args.get('state')
+    error = request.args.get('error')
+    if error:
+        return _oauth_close_page(f'Authorization failed: {error}', ok=False)
+    pending = _OAUTH_PENDING.pop(state, None)
+    if not pending:
+        return _oauth_close_page('Invalid session. Please try again.', ok=False)
+    creds = _load_cloud_creds().get('google', {})
+    try:
+        token_resp = _http('https://oauth2.googleapis.com/token', method='POST',
+                           data=urllib.parse.urlencode({
+                               'code':          code,
+                               'client_id':     creds['client_id'],
+                               'client_secret': creds['client_secret'],
+                               'redirect_uri':  f'http://localhost:{PORT}/oauth/google/callback',
+                               'grant_type':    'authorization_code',
+                               'code_verifier': pending['verifier'],
+                           }).encode())
+        userinfo = _http('https://www.googleapis.com/oauth2/v3/userinfo',
+                         headers={'Authorization': f'Bearer {token_resp["access_token"]}'})
+        tokens = _load_cloud_tokens()
+        tokens['google'] = {
+            'access_token':  token_resp.get('access_token'),
+            'refresh_token': token_resp.get('refresh_token'),
+            'expires_at':    time.time() + token_resp.get('expires_in', 3600),
+            'email':         userinfo.get('email'),
+            'name':          userinfo.get('name'),
+        }
+        _save_cloud_tokens(tokens)
+        return _oauth_close_page(f'Connected as {userinfo.get("email")}', ok=True)
+    except Exception as exc:
+        print(f'[cloud] Google OAuth error: {exc}', flush=True)
+        return _oauth_close_page(f'Error: {exc}', ok=False)
+
+
+# ── Dropbox OAuth ──────────────────────────────────────────────────────────────
+@app.route('/api/oauth/dropbox/start')
+def dropbox_oauth_start():
+    creds = _load_cloud_creds().get('dropbox', {})
+    if not creds.get('app_key'):
+        return jsonify({'error': 'Dropbox credentials not configured'}), 400
+    state               = secrets.token_urlsafe(16)
+    verifier, challenge = _pkce_pair()
+    _OAUTH_PENDING[state] = {'verifier': verifier}
+    redirect_uri = f'http://localhost:{PORT}/oauth/dropbox/callback'
+    print(f'[cloud] Dropbox redirect_uri = {redirect_uri}', flush=True)
+    url = 'https://www.dropbox.com/oauth2/authorize?' + urllib.parse.urlencode({
+        'client_id':             creds['app_key'],
+        'redirect_uri':          redirect_uri,
+        'response_type':         'code',
+        'state':                 state,
+        'code_challenge':        challenge,
+        'code_challenge_method': 'S256',
+        'token_access_type':     'offline',
+        'scope': ('account_info.read '
+                  'files.metadata.read '
+                  'files.metadata.write '
+                  'files.content.read '
+                  'files.content.write'),
+    })
+    print(f'[cloud] Dropbox auth URL = {url}', flush=True)
+    return jsonify({'url': url, 'redirect_uri': redirect_uri})
+
+
+@app.route('/oauth/dropbox/callback')
+def dropbox_oauth_callback():
+    code  = request.args.get('code')
+    state = request.args.get('state')
+    error = request.args.get('error_description', request.args.get('error'))
+    if error:
+        return _oauth_close_page(f'Authorization failed: {error}', ok=False)
+    pending = _OAUTH_PENDING.pop(state, None)
+    if not pending:
+        return _oauth_close_page('Invalid session.', ok=False)
+    creds = _load_cloud_creds().get('dropbox', {})
+    try:
+        token_resp = _http('https://api.dropboxapi.com/oauth2/token', method='POST',
+                           data=urllib.parse.urlencode({
+                               'code':          code,
+                               'grant_type':    'authorization_code',
+                               'client_id':     creds['app_key'],
+                               'redirect_uri':  f'http://localhost:{PORT}/oauth/dropbox/callback',
+                               'code_verifier': pending['verifier'],
+                           }).encode())
+        account = _http('https://api.dropboxapi.com/2/users/get_current_account',
+                        method='POST', data=b'null',
+                        headers={
+                            'Authorization': f'Bearer {token_resp["access_token"]}',
+                            'Content-Type':  'application/json',
+                        })
+        tokens = _load_cloud_tokens()
+        tokens['dropbox'] = {
+            'access_token':  token_resp.get('access_token'),
+            'refresh_token': token_resp.get('refresh_token'),
+            'expires_at':    time.time() + token_resp.get('expires_in', 14400),
+            'email':         account.get('email'),
+            'name':          account.get('name', {}).get('display_name'),
+        }
+        _save_cloud_tokens(tokens)
+        return _oauth_close_page(f'Connected as {account.get("email")}', ok=True)
+    except Exception as exc:
+        print(f'[cloud] Dropbox OAuth error: {exc}', flush=True)
+        return _oauth_close_page(f'Error: {exc}', ok=False)
+
+
+# ── List uploadable files for a deployment (4 categories) ─────────────────────
+@app.route('/api/cloud/files/<dep>')
+def cloud_list_files(dep):
+    """Return files organised into 5 upload categories for a deployment."""
+
+    def scan(dirs, exts, label_base=None):
+        out = []
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for root, _, fnames in os.walk(d):
+                for fn in sorted(fnames):
+                    if os.path.splitext(fn)[1].lower() in exts:
+                        fp  = os.path.join(root, fn)
+                        rel = os.path.relpath(fp, BASE_DIR)
+                        lbl = os.path.relpath(fp, label_base or d)
+                        out.append({'label': lbl, 'path': rel,
+                                    'size': os.path.getsize(fp)})
+        out.sort(key=lambda x: x['label'].lower())
+        return out
+
+    dat_exts = {'.dat', '.dbd', '.ebd', '.mbd', '.nbd', '.sbd', '.tbd',
+                '.mlg', '.nlg', '.slg', '.tlg'}
+    nc_ext   = {'.nc'}
+    qc_exts  = {'.html', '.pdf', '.png', '.csv', '.json'}
+
+    dep_dir = _dep_dir(dep)
+
+    categories = {
+        'dat_flight': {
+            'label': 'Flight DAT Files',
+            'files': scan(
+                [os.path.join(BASE_DIR, 'dat_files', dep, 'flight_data')],
+                dat_exts,
+            ),
+        },
+        'dat_merged': {
+            'label': 'Merged DAT Files',
+            'files': scan(
+                [os.path.join(BASE_DIR, 'dat_files', dep, 'merged_data')],
+                dat_exts,
+            ),
+        },
+        'profile': {
+            'label': 'Profile NC',
+            'files': scan(
+                [os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'profile')],
+                nc_ext,
+            ),
+        },
+        'traj': {
+            'label': 'Trajectory NC',
+            'files': scan(
+                [os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep,
+                              'trajectory_science')],
+                nc_ext,
+            ),
+        },
+        'qc': {
+            'label': 'QC Reporting',
+            'files': scan(
+                [dep_dir],
+                qc_exts,
+                label_base=dep_dir,
+            ),
+        },
+        'qc_nc': {
+            'label': 'QC Output NC',
+            'files': scan(
+                [os.path.join(dep_dir, 'data', 'out', 'nc')],
+                nc_ext,
+                label_base=dep_dir,
+            ),
+        },
+        'plots': {
+            'label': 'QC Plots',
+            'files': scan(
+                [os.path.join(dep_dir, 'figs')],
+                {'.png', '.html', '.pdf'},
+                label_base=os.path.join(dep_dir, 'figs'),
+            ),
+        },
+        'adcp': {
+            'label': 'AD2CP Files & Plots',
+            'files': scan(
+                [_adcp_base_dir(dep, False)],
+                {'.nc', '.png', '.npz', '.csv'},
+                label_base=_adcp_base_dir(dep, False),
+            ),
+        },
+    }
+    return jsonify({'categories': categories})
+
+
+# ── Cloud folder browser (for upload destination picker) ───────────────────────
+@app.route('/api/cloud/folders/<service>')
+def cloud_list_folders(service):
+    parent = request.args.get('parent', '')
+    try:
+        if service == 'google':
+            token = _google_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            pid   = parent or 'root'
+            q_str = (f"'{pid}' in parents and "
+                     f"mimeType='application/vnd.google-apps.folder' and trashed=false")
+            url   = (f'https://www.googleapis.com/drive/v3/files'
+                     f'?q={urllib.parse.quote(q_str)}'
+                     f'&fields=files(id,name)&orderBy=name')
+            resp    = _http(url, headers={'Authorization': f'Bearer {token}'})
+            folders = [{'id': f['id'], 'name': f['name']}
+                       for f in resp.get('files', [])]
+            if parent:
+                meta    = _http(
+                    f'https://www.googleapis.com/drive/v3/files/{pid}?fields=id,name',
+                    headers={'Authorization': f'Bearer {token}'})
+                current = {'id': pid, 'name': meta.get('name', '')}
+            else:
+                current = {'id': 'root', 'name': 'My Drive'}
+            return jsonify({'folders': folders, 'current': current})
+
+        elif service == 'dropbox':
+            token = _dropbox_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            path  = parent or ''
+            resp  = _http('https://api.dropboxapi.com/2/files/list_folder',
+                          method='POST',
+                          data=json.dumps({'path': path}).encode(),
+                          headers={'Authorization': f'Bearer {token}',
+                                   'Content-Type': 'application/json'})
+            folders = sorted(
+                [{'id': e['path_lower'], 'name': e['name']}
+                 for e in resp.get('entries', []) if e.get('.tag') == 'folder'],
+                key=lambda x: x['name'].lower()
+            )
+            name = path.split('/')[-1] if path else 'Dropbox'
+            return jsonify({'folders': folders, 'current': {'id': path, 'name': name}})
+
+        return jsonify({'error': 'Unknown service'}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/cloud/folders/<service>/create', methods=['POST'])
+def cloud_create_folder(service):
+    data   = request.json or {}
+    name   = data.get('name', '').strip()
+    parent = data.get('parent', '')
+    if not name: return jsonify({'error': 'Name required'}), 400
+    try:
+        if service == 'google':
+            token = _google_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            resp = _http(
+                'https://www.googleapis.com/drive/v3/files?fields=id,name',
+                method='POST',
+                data=json.dumps({'name': name,
+                                 'mimeType': 'application/vnd.google-apps.folder',
+                                 'parents': [parent or 'root']}).encode(),
+                headers={'Authorization': f'Bearer {token}',
+                         'Content-Type': 'application/json'})
+            return jsonify({'id': resp.get('id'), 'name': resp.get('name')})
+
+        elif service == 'dropbox':
+            token = _dropbox_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            path = f'{parent}/{name}' if parent else f'/{name}'
+            resp = _http('https://api.dropboxapi.com/2/files/create_folder_v2',
+                         method='POST',
+                         data=json.dumps({'path': path, 'autorename': True}).encode(),
+                         headers={'Authorization': f'Bearer {token}',
+                                  'Content-Type': 'application/json'})
+            meta = resp.get('metadata', {})
+            return jsonify({'id': meta.get('path_lower'), 'name': meta.get('name')})
+
+        return jsonify({'error': 'Unknown service'}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/cloud/folders/<service>/rename', methods=['POST'])
+def cloud_rename_folder(service):
+    data     = request.json or {}
+    fid      = data.get('id', '')
+    new_name = data.get('name', '').strip()
+    if not fid or not new_name:
+        return jsonify({'error': 'id and name required'}), 400
+    try:
+        if service == 'google':
+            token = _google_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            resp = _http(
+                f'https://www.googleapis.com/drive/v3/files/{fid}?fields=id,name',
+                method='PATCH',
+                data=json.dumps({'name': new_name}).encode(),
+                headers={'Authorization': f'Bearer {token}',
+                         'Content-Type': 'application/json'})
+            return jsonify({'id': resp.get('id'), 'name': resp.get('name')})
+
+        elif service == 'dropbox':
+            token = _dropbox_access_token()
+            if not token: return jsonify({'error': 'Not connected'}), 401
+            parts   = fid.rstrip('/').split('/')
+            to_path = '/'.join(parts[:-1]) + '/' + new_name
+            resp = _http('https://api.dropboxapi.com/2/files/move_v2',
+                         method='POST',
+                         data=json.dumps({'from_path': fid, 'to_path': to_path,
+                                          'autorename': True}).encode(),
+                         headers={'Authorization': f'Bearer {token}',
+                                  'Content-Type': 'application/json'})
+            meta = resp.get('metadata', {})
+            return jsonify({'id': meta.get('path_lower'), 'name': meta.get('name')})
+
+        return jsonify({'error': 'Unknown service'}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+# ── Existing-file check (for resume mode) ──────────────────────────────────────
+@app.route('/api/cloud/existing')
+def cloud_existing():
+    """Return all filenames (not folders) that already exist in a destination folder."""
+    service = request.args.get('service')
+    dest    = request.args.get('dest', '')
+
+    try:
+        if service == 'google':
+            token = _google_access_token()
+            if not token:
+                return jsonify({'error': 'Not connected'}), 401
+            parent_id  = dest or 'root'
+            names      = []
+            page_token = None
+            while True:
+                q      = f"'{parent_id}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'"
+                params = (f'q={urllib.parse.quote(q)}'
+                          f'&fields=nextPageToken,files(name)&pageSize=1000')
+                if page_token:
+                    params += f'&pageToken={urllib.parse.quote(page_token)}'
+                r          = _http(f'https://www.googleapis.com/drive/v3/files?{params}',
+                                   headers={'Authorization': f'Bearer {token}'})
+                names.extend(f['name'] for f in r.get('files', []))
+                page_token = r.get('nextPageToken')
+                if not page_token:
+                    break
+            return jsonify({'filenames': names})
+
+        elif service == 'dropbox':
+            token = _dropbox_access_token()
+            if not token:
+                return jsonify({'error': 'Not connected'}), 401
+            dbx_path = dest or ''
+            names    = []
+            r = _http('https://api.dropboxapi.com/2/files/list_folder',
+                      method='POST',
+                      data=json.dumps({'path': dbx_path, 'limit': 2000}).encode(),
+                      headers={'Authorization': f'Bearer {token}',
+                               'Content-Type':  'application/json'})
+            names.extend(e['name'] for e in r.get('entries', []) if e['.tag'] == 'file')
+            while r.get('has_more'):
+                r = _http('https://api.dropboxapi.com/2/files/list_folder/continue',
+                          method='POST',
+                          data=json.dumps({'cursor': r['cursor']}).encode(),
+                          headers={'Authorization': f'Bearer {token}',
+                                   'Content-Type':  'application/json'})
+                names.extend(e['name'] for e in r.get('entries', []) if e['.tag'] == 'file')
+            return jsonify({'filenames': names})
+
+        return jsonify({'error': f'Unknown service: {service}'}), 400
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+# ── Upload ─────────────────────────────────────────────────────────────────────
+@app.route('/api/cloud/upload', methods=['POST'])
+def cloud_upload():
+    import traceback as _tb
+    data     = request.json or {}
+    service  = data.get('service')
+    paths    = data.get('files', [])    # paths relative to BASE_DIR
+    dest     = data.get('dest', '')     # Google: folder ID  |  Dropbox: folder path
+    conflict = data.get('conflict', 'overwrite')  # 'overwrite' | 'skip'
+
+    results = []
+    for rel in paths:
+        fpath = os.path.normpath(os.path.join(BASE_DIR, rel))
+        if not fpath.startswith(os.path.normpath(BASE_DIR)):
+            results.append({'file': rel, 'error': 'Path not allowed'}); continue
+        if not os.path.isfile(fpath):
+            results.append({'file': rel, 'error': 'File not found'}); continue
+        fname = os.path.basename(fpath)
+        try:
+            if service == 'google':
+                token = _google_access_token()
+                if not token:
+                    results.append({'file': rel, 'error': 'Not connected'}); continue
+                parent_id = dest or 'root'
+                q_str    = (f"name='{fname.replace(chr(39), chr(92)+chr(39))}' "
+                            f"and '{parent_id}' in parents and trashed=false")
+                existing = _http(
+                    f'https://www.googleapis.com/drive/v3/files'
+                    f'?q={urllib.parse.quote(q_str)}&fields=files(id)',
+                    headers={'Authorization': f'Bearer {token}'}
+                ).get('files', [])
+                resp = _google_upload(token, fpath, fname, parent_id, existing, conflict)
+                if resp.get('skipped'):
+                    results.append({'file': rel, 'skipped': True})
+                else:
+                    results.append({'file': rel, 'service': 'google', **resp})
+
+            elif service == 'dropbox':
+                token = _dropbox_access_token()
+                if not token:
+                    results.append({'file': rel, 'error': 'Not connected'}); continue
+                dbx_path = f'{dest}/{fname}' if dest else f'/{fname}'
+                resp = _dropbox_upload(token, fpath, dbx_path, conflict)
+                if resp.get('skipped'):
+                    results.append({'file': rel, 'skipped': True})
+                else:
+                    results.append({'file': rel, 'service': 'dropbox', **resp})
+
+            else:
+                results.append({'file': rel, 'error': f'Unknown service: {service}'})
+        except Exception as exc:
+            results.append({'file': rel, 'error': str(exc)})
+            print(f'[cloud] upload error {rel}: {exc}', flush=True)
+            print(_tb.format_exc(), flush=True)
+
+    ok      = sum(1 for r in results if 'error' not in r and not r.get('skipped'))
+    skipped = sum(1 for r in results if r.get('skipped'))
+    failed  = sum(1 for r in results if 'error' in r)
+    return jsonify({'ok': ok, 'skipped': skipped, 'failed': failed, 'results': results})
+
+
+# ── AD2CP Processing ──────────────────────────────────────────────────────────
+import threading  as _adcp_th
+import io         as _adcp_io
+import zipfile    as _adcp_zf
+
+_adcp_live_logs = {}   # (dep, stage, mode) -> [str]
+_adcp_live_done = {}   # (dep, stage, mode) -> bool
+_adcp_stg_lock  = _adcp_th.Lock()
+
+_ADCP_OUTPUTS = {
+    'load_nc':          ['adcp_glider_combined.csv'],
+    'gps_pairing':      ['gps_data.npz'],
+    'write_glider_nc':  ['glider_ad2cp_datetime_timecoord.nc'],
+    'process_shear':    ['shear_processed.nc'],
+    'compute_currents': ['currents.nc', 'dac.npz'],
+    'bias_correction':  ['currents_bias_corrected.nc', 'bias_diagnostic.png'],
+    'generate_plots':   ['velocity_sections.png', 'speed_section.png', 'shear_sections.png',
+                         'backscatter.png', 'dac_timeseries.png', 'dac_map_cartopy.png'],
+    'tidal_filter':     ['currents_subtidal.nc', 'tidal_filter.png'],
+    'diagnostics':      ['eke.png', 'transport.png', 'richardson_number.png'],
+}
+_ADCP_TEST_OUTPUTS = {
+    'process_shear':  ['shear_processed.nc'],
+    'generate_plots': ['velocity_sections.png', 'speed_section.png'],
+}
+# Stages whose outputs depend on processing options → written to a run subdir
+_ADCP_SHARED_STAGES = {'load_nc', 'gps_pairing', 'write_glider_nc'}
+_ADCP_OPTION_STAGES = {'process_shear', 'compute_currents', 'bias_correction',
+                       'generate_plots', 'tidal_filter', 'diagnostics'}
+
+
+def _adcp_run_label(opts):
+    """Build a filesystem-safe subdirectory name from processing options."""
+    xaxis = int(opts.get('xaxis', 3))
+    dmin  = int(float(opts.get('depth_min', 10)))
+    dmax  = int(float(opts.get('depth_max', 1000)))
+    label = f'xaxis{xaxis}_d{dmin}-{dmax}'
+    if opts.get('yaxis') is not None:
+        label += f'_y{int(float(opts["yaxis"]))}'
+    return label
+
+
+def _adcp_base_dir(dep, is_test):
+    if is_test:
+        return os.path.join(BASE_DIR, 'ad2cp', 'tests', dep, 'output')
+    return os.path.join(BASE_DIR, 'post_processing', dep, 'adcp')
+
+
+def _adcp_run_dir(base_dir, opts):
+    return os.path.join(base_dir, _adcp_run_label(opts))
+
+
+def _adcp_input_dir(dep, is_test):
+    if is_test:
+        return os.path.join(BASE_DIR, 'ad2cp', 'tests', dep)
+    return os.path.join(BASE_DIR, 'ad2cp', dep)
+
+
+def _adcp_sse_run(key, fn):
+    """Run fn(log_callback) in a thread; yield SSE events from its log output."""
+    import time as _t
+    log_lines    = []
+    error_holder = [None]
+
+    with _adcp_stg_lock:
+        _adcp_live_logs[key] = log_lines
+        _adcp_live_done[key] = False
+
+    def _thread():
+        try:
+            fn(lambda msg: log_lines.append(str(msg)))
+        except Exception as exc:
+            import traceback as _tb
+            log_lines.append(f'ERROR: {exc}')
+            for ln in _tb.format_exc().splitlines():
+                log_lines.append(ln)
+            error_holder[0] = exc
+        finally:
+            _adcp_live_done[key] = True
+
+    _adcp_th.Thread(target=_thread, daemon=True).start()
+
+    sent = 0
+    while True:
+        while sent < len(log_lines):
+            yield f"data: {json.dumps({'type': 'log', 'line': log_lines[sent]})}\n\n"
+            sent += 1
+        if _adcp_live_done.get(key):
+            success = error_holder[0] is None
+            yield f"data: {json.dumps({'type': 'done', 'success': success})}\n\n"
+            break
+        _t.sleep(0.15)
+
+
+# ── Stage functions ────────────────────────────────────────────────────────────
+
+def _adcp_load_nc(dep, out_dir, log):
+    import glob as _glob
+    import pandas as pd
+    import xarray as xr
+
+    nc_folder = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'profile')
+    nc_files  = sorted(_glob.glob(os.path.join(nc_folder, '*.nc')))
+    log(f'Found {len(nc_files)} NC files in {nc_folder}')
+    if not nc_files:
+        raise RuntimeError(f'No NC files found in {nc_folder}')
+
+    required = ['time', 'latitude', 'longitude', 'sci_water_pressure',
+                'temperature', 'salinity', 'profile_id']
+    rename   = {'sci_water_pressure': 'pressure', 'profile_id': 'profile_number'}
+
+    all_dfs, skipped = [], []
+    for f in nc_files:
+        try:
+            ds      = xr.open_dataset(f, decode_times=False)
+            missing = [v for v in required if v not in ds.variables]
+            if missing:
+                skipped.append((os.path.basename(f), f'missing {missing}'))
+                ds.close(); continue
+            df = ds[required].to_dataframe().reset_index()
+            df = df[[c for c in required if c in df.columns]].rename(columns=rename)
+            all_dfs.append(df)
+            ds.close()
+        except Exception as e:
+            skipped.append((os.path.basename(f), str(e)))
+
+    if not all_dfs:
+        raise RuntimeError('No valid NC files could be loaded')
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined['time']     = pd.to_numeric(combined['time'], errors='coerce')
+    combined['pressure'] = combined['pressure'] * 10  # dbar -> mbar
+
+    unique = sorted(combined['profile_number'].dropna().unique())
+    combined['profile_number'] = combined['profile_number'].map(
+        {v: i + 1 for i, v in enumerate(unique)})
+    combined = (combined.sort_values('time')
+                .drop_duplicates(subset='time').reset_index(drop=True))
+    combined['time']           = pd.to_datetime(combined['time'], unit='s', utc=True).dt.tz_localize(None)
+    combined['profile_number'] = combined['profile_number'].astype('int32')
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, 'adcp_glider_combined.csv')
+    combined.to_csv(out_path, index=False)
+
+    log(f'Saved: {out_path}  ({len(combined):,} rows)')
+    log(f'Profiles: {combined["profile_number"].nunique()}')
+    log(f'Time: {combined["time"].min()} to {combined["time"].max()}')
+    log(f'Pressure range: {combined["pressure"].min():.1f} - {combined["pressure"].max():.1f} mbar')
+    if skipped:
+        log(f'Skipped {len(skipped)} files')
+
+
+def _adcp_gps_pairing(out_dir, log):
+    import pandas as pd
+    import numpy as np
+
+    csv_path = os.path.join(out_dir, 'adcp_glider_combined.csv')
+    df = pd.read_csv(csv_path, parse_dates=['time'])
+    log(f'Loaded {len(df):,} rows from CSV')
+
+    surface_df = df[df['pressure'] <= 20].copy()
+    log(f'Near-surface rows (pressure ≤ 20 mbar): {len(surface_df)}')
+
+    surf_first = (surface_df.groupby('profile_number').first().reset_index()
+                  .dropna(subset=['latitude', 'longitude']))
+    surf_last  = (surface_df.groupby('profile_number').last().reset_index()
+                  .dropna(subset=['latitude', 'longitude']))
+
+    def classify(grp):
+        grp = grp.sort_values('time')
+        mid = len(grp) // 2
+        return 'dive' if grp['pressure'].iloc[mid:].mean() > grp['pressure'].iloc[:mid].mean() else 'climb'
+
+    types  = df.groupby('profile_number').apply(classify)
+    dives  = sorted(types[types == 'dive'].index)
+    climbs = sorted(types[types == 'climb'].index)
+    log(f'Dive profiles: {len(dives)}  Climb profiles: {len(climbs)}')
+
+    pre_rows, post_rows = [], []
+    for dp in dives:
+        following = [c for c in climbs if c > dp]
+        if not following:
+            continue
+        cp   = following[0]
+        pre  = surf_first[surf_first['profile_number'] == dp]
+        post = surf_last[surf_last['profile_number'] == cp]
+        if not pre.empty and not post.empty:
+            pre_rows.append(pre.iloc[0])
+            post_rows.append(post.iloc[0])
+
+    if not pre_rows:
+        raise RuntimeError('No matching dive/climb pairs found')
+
+    pre_df  = pd.DataFrame(pre_rows).reset_index(drop=True)
+    post_df = pd.DataFrame(post_rows).reset_index(drop=True)
+    log(f'Matched dive/climb pairs: {len(pre_df)}')
+
+    def build_gps(df_):
+        arr       = np.empty((len(df_), 3), dtype=object)
+        arr[:, 0] = df_['time'].values.astype('datetime64[s]')
+        arr[:, 1] = df_['longitude'].values.astype(float)
+        arr[:, 2] = df_['latitude'].values.astype(float)
+        return arr
+
+    gps_predive  = build_gps(pre_df)
+    gps_postdive = build_gps(post_df)
+
+    gaps = (post_df['time'].values.astype('datetime64[s]').astype(float) -
+            pre_df['time'].values.astype('datetime64[s]').astype(float))
+    log(f'Dive duration — min: {gaps.min()/3600:.2f}h  mean: {gaps.mean()/3600:.2f}h  max: {gaps.max()/3600:.2f}h')
+
+    out_path = os.path.join(out_dir, 'gps_data.npz')
+    np.savez(out_path, gps_predive=gps_predive, gps_postdive=gps_postdive)
+    log(f'Saved: {out_path}')
+
+
+def _adcp_write_glider_nc(out_dir, log):
+    import pandas as pd
+    import xarray as xr
+
+    csv_path = os.path.join(out_dir, 'adcp_glider_combined.csv')
+    df = pd.read_csv(csv_path, parse_dates=['time']).set_index('time')
+    ds = xr.Dataset.from_dataframe(df)
+
+    out_path = os.path.join(out_dir, 'glider_ad2cp_datetime_timecoord.nc')
+    ds.to_netcdf(out_path)
+    log(f'Saved: {out_path}')
+    log(f'Variables: {list(ds.data_vars)}')
+    log(f'Time range: {df.index.min()} to {df.index.max()}')
+
+
+def _adcp_gen_dummy_glider_nc(base_dir, adcp_path, log):
+    """Generate synthetic glider NC from AD2CP time range (test mode only)."""
+    import h5py
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    log('Generating synthetic glider file from AD2CP time range...')
+    with h5py.File(adcp_path, 'r') as hf:
+        t_unix = hf['Data/Average/time'][:]
+
+    t_min, t_max = float(t_unix.min()), float(t_unix.max())
+    log(f'AD2CP time range: {pd.Timestamp(t_min, unit="s")} to {pd.Timestamp(t_max, unit="s")}')
+    log(f'Total pings: {len(t_unix):,}')
+
+    N     = 2000
+    t_gd  = np.linspace(t_min, t_max, N)
+    plen  = N // 50
+    pnums = np.repeat(np.arange(1, 51), plen)[:N]
+    phase = (np.arange(N) % plen) / plen
+    press = np.abs(np.sin(phase * np.pi)) * 500.0
+
+    times = pd.to_datetime(t_gd, unit='s', utc=True).tz_localize(None)
+    df = pd.DataFrame({
+        'latitude':       np.full(N, 18.5),
+        'longitude':      np.full(N, -66.1),
+        'pressure':       press,
+        'temperature':    np.full(N, 20.0),
+        'salinity':       np.full(N, 35.0),
+        'profile_number': pnums.astype('int32'),
+    }, index=times)
+    df.index.name = 'time'
+
+    out_path = os.path.join(base_dir, 'glider_ad2cp_datetime_timecoord.nc')
+    xr.Dataset.from_dataframe(df).to_netcdf(out_path)
+    log(f'Saved dummy glider NC: {out_path}')
+
+
+def _adcp_process_shear(base_dir, run_dir, adcp_path, opts, log):
+    import matplotlib
+    matplotlib.use('Agg')
+    import time as _t
+    from gliderad2cp import process_shear, tools
+
+    glider_nc = os.path.join(base_dir, 'glider_ad2cp_datetime_timecoord.nc')
+    if not os.path.exists(glider_nc):
+        raise RuntimeError('Glider NC not found — run Write Glider NetCDF first')
+
+    options = tools.get_options(
+        xaxis=int(opts.get('xaxis', 3)),
+        yaxis=opts.get('yaxis') or None,
+        shear_bias_regression_depth_slice=(
+            float(opts.get('depth_min', 10)),
+            float(opts.get('depth_max', 1000)),
+        ),
+    )
+    log(f'AD2CP file:  {adcp_path}')
+    log(f'Glider NC:   {glider_nc}')
+    log(f'Options: xaxis={options["xaxis"]}, depth_slice=({opts.get("depth_min",10)},{opts.get("depth_max",1000)})')
+
+    t0      = _t.time()
+    ds_adcp = process_shear.process(adcp_path, glider_nc, options=options)
+    elapsed = _t.time() - t0
+
+    os.makedirs(run_dir, exist_ok=True)
+    out_path = os.path.join(run_dir, 'shear_processed.nc')
+    ds_adcp.to_netcdf(out_path)
+    log(f'Completed in {elapsed:.1f}s')
+    log(f'Saved: {out_path}')
+    log(f'Dimensions: {dict(ds_adcp.sizes)}')
+    for v in ['Sh_E', 'Sh_N', 'Sh_U', 'E', 'N', 'U']:
+        if v in ds_adcp:
+            valid = int(ds_adcp[v].notnull().sum())
+            total = ds_adcp[v].size
+            log(f'  {v}: {valid}/{total} valid ({valid/total*100:.1f}%)')
+
+
+def _adcp_compute_currents(base_dir, run_dir, opts, log):
+    import numpy as np
+    import xarray as xr
+    import time as _t
+    from gliderad2cp import process_currents, tools
+
+    shear_path = os.path.join(run_dir, 'shear_processed.nc')
+    gps_path   = os.path.join(base_dir, 'gps_data.npz')
+    for p in [shear_path, gps_path]:
+        if not os.path.exists(p):
+            raise RuntimeError(f'Required file not found: {os.path.basename(p)}')
+
+    log('Loading shear dataset...')
+    ds_adcp = xr.open_dataset(shear_path)
+    log(f'  Dimensions: {dict(ds_adcp.sizes)}')
+
+    log('Loading GPS arrays...')
+    gps          = np.load(gps_path, allow_pickle=True)
+    gps_predive  = gps['gps_predive']
+    gps_postdive = gps['gps_postdive']
+    log(f'  GPS pairs: {len(gps_predive)}')
+
+    options = tools.get_options(
+        xaxis=int(opts.get('xaxis', 3)),
+        yaxis=opts.get('yaxis') or None,
+        shear_bias_regression_depth_slice=(
+            float(opts.get('depth_min', 10)),
+            float(opts.get('depth_max', 1000)),
+        ),
+    )
+    log('Computing absolute currents...')
+    t0 = _t.time()
+    currents, DAC = process_currents.process(ds_adcp, gps_predive, gps_postdive, options=options)
+    elapsed = _t.time() - t0
+    log(f'Completed in {elapsed:.1f}s')
+
+    out_nc  = os.path.join(run_dir, 'currents.nc')
+    out_dac = os.path.join(run_dir, 'dac.npz')
+    currents.to_netcdf(out_nc)
+    np.savez(out_dac, dive_time=DAC['dive_time'], dac=DAC['dac'])
+    log(f'Saved: {out_nc}')
+    log(f'Saved: {out_dac}')
+    n_valid = int(np.isfinite(DAC['dac']).all(axis=1).sum())
+    log(f'DAC: {len(DAC["dive_time"])} dives, {n_valid} with valid vectors')
+    ds_adcp.close()
+
+
+def _adcp_bias_correction(run_dir, opts, log):
+    import xarray as xr
+    import time as _t
+    from gliderad2cp import process_bias, tools
+
+    currents_path = os.path.join(run_dir, 'currents.nc')
+    if not os.path.exists(currents_path):
+        raise RuntimeError('currents.nc not found — run Compute Absolute Currents first')
+
+    log('Loading currents dataset...')
+    currents = xr.open_dataset(currents_path)
+    log(f'  Dimensions: {dict(currents.sizes)}')
+
+    options = tools.get_options(
+        xaxis=int(opts.get('xaxis', 3)),
+        yaxis=opts.get('yaxis') or None,
+        shear_bias_regression_depth_slice=(
+            float(opts.get('depth_min', 10)),
+            float(opts.get('depth_max', 1000)),
+        ),
+    )
+    log('Applying bias correction...')
+    t0             = _t.time()
+    currents_bias  = process_bias.process(currents, options=options)
+    elapsed        = _t.time() - t0
+    log(f'Completed in {elapsed:.1f}s')
+
+    out_path = os.path.join(run_dir, 'currents_bias_corrected.nc')
+    currents_bias.to_netcdf(out_path)
+    log(f'Saved: {out_path}')
+    log(f'Variables: {list(currents_bias.data_vars)}')
+
+    # Save bias diagnostic plot produced by the library
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        process_bias.visualise(currents_bias, options)
+        diag_path = os.path.join(run_dir, 'bias_diagnostic.png')
+        plt.savefig(diag_path, dpi=150, bbox_inches='tight')
+        plt.close('all')
+        log(f'Saved: {diag_path}')
+    except Exception as exc:
+        log(f'Bias diagnostic plot skipped ({exc})')
+
+    currents.close()
+
+
+def _adcp_generate_plots(base_dir, run_dir, is_test, log):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    try:
+        import cmocean.cm as cmo
+        cmo_balance = cmo.balance
+        cmo_speed   = cmo.speed
+    except ImportError:
+        cmo_balance = 'RdBu_r'
+        cmo_speed   = 'viridis'
+        log('cmocean not found — using fallback colormaps')
+
+    if is_test:
+        shear_path = os.path.join(run_dir, 'shear_processed.nc')
+        if not os.path.exists(shear_path):
+            raise RuntimeError('shear_processed.nc not found — run Process Shear first')
+
+        ds      = xr.open_dataset(shear_path)
+        vel_E   = ds.get('E')
+        vel_N   = ds.get('N')
+        if vel_E is None or vel_N is None:
+            raise RuntimeError('E/N velocity variables not found in shear_processed.nc')
+
+        log(f'Loaded shear dataset: {dict(ds.sizes)}')
+
+        time_vals = ds.time.values
+        try:
+            time_clean = pd.Series(pd.to_datetime(time_vals)).interpolate('linear').values
+        except Exception:
+            time_clean = np.arange(len(time_vals))
+
+        depth_vals = np.arange(vel_E.shape[1])
+
+        # Plot 1: E/N velocity sections
+        fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
+        for ax, var, label in zip(axes,
+                                  [vel_E.values, vel_N.values],
+                                  ['Eastward velocity E (m/s)', 'Northward velocity N (m/s)']):
+            p = ax.pcolormesh(time_clean, depth_vals, var.T,
+                              cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
+            plt.colorbar(p, ax=ax, label=label, pad=0.01)
+            ax.set_ylabel('Bin index')
+            ax.invert_yaxis()
+        axes[1].set_xlabel('Time')
+        fig.suptitle('AD2CP Lab Test — Velocity (E/N)', fontsize=13)
+        plt.tight_layout()
+        p1 = os.path.join(run_dir, 'velocity_sections.png')
+        plt.savefig(p1, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p1}')
+
+        # Plot 2: Speed
+        speed = np.sqrt(vel_E.values ** 2 + vel_N.values ** 2)
+        fig, ax = plt.subplots(figsize=(16, 4))
+        p = ax.pcolormesh(time_clean, depth_vals, speed.T,
+                          cmap=cmo_speed, vmin=0, vmax=0.5, shading='auto')
+        plt.colorbar(p, ax=ax, label='Speed (m/s)', pad=0.01)
+        ax.set_ylabel('Bin index')
+        ax.set_xlabel('Time')
+        ax.invert_yaxis()
+        ax.set_title('AD2CP Lab Test — Speed')
+        plt.tight_layout()
+        p2 = os.path.join(run_dir, 'speed_section.png')
+        plt.savefig(p2, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p2}')
+        ds.close()
+
+    else:
+        bias_path = os.path.join(run_dir, 'currents_bias_corrected.nc')
+        gps_path  = os.path.join(base_dir, 'gps_data.npz')
+        dac_path  = os.path.join(run_dir, 'dac.npz')
+        for p in [bias_path, gps_path, dac_path]:
+            if not os.path.exists(p):
+                raise RuntimeError(f'Required file not found: {os.path.basename(p)}')
+
+        currents_bias = xr.open_dataset(bias_path)
+        log(f'Loaded bias-corrected currents: {dict(currents_bias.sizes)}')
+
+        vel_E = currents_bias['velocity_E_DAC_reference_sb_corrected']
+        vel_N = currents_bias['velocity_N_DAC_reference_sb_corrected']
+
+        time_clean = (pd.Series(currents_bias.time.values)
+                      .interpolate(method='linear').values)
+        log(f'NaT remaining after interpolation: {pd.isnull(time_clean).sum()}')
+
+        depth = currents_bias.depth.values
+
+        # Plot 1: E/N velocity sections
+        fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
+        for ax, var, label in zip(axes, [vel_E, vel_N],
+                                  ['Eastward velocity (m/s)', 'Northward velocity (m/s)']):
+            p = ax.pcolormesh(time_clean, depth, var.values,
+                              cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
+            plt.colorbar(p, ax=ax, label=label, pad=0.01)
+            ax.set_ylabel('Depth (m)')
+            ax.invert_yaxis()
+            ax.set_ylim([900, 0])
+        axes[1].set_xlabel('Date')
+        fig.suptitle('Bias-corrected absolute velocities', fontsize=13)
+        plt.tight_layout()
+        p1 = os.path.join(run_dir, 'velocity_sections.png')
+        plt.savefig(p1, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p1}')
+
+        # Plot 2: Speed
+        speed = np.sqrt(vel_E ** 2 + vel_N ** 2)
+        fig, ax = plt.subplots(figsize=(16, 4))
+        p = ax.pcolormesh(time_clean, depth, speed.values,
+                          cmap=cmo_speed, vmin=0, vmax=0.5, shading='auto')
+        plt.colorbar(p, ax=ax, label='Speed (m/s)', pad=0.01)
+        ax.set_ylabel('Depth (m)')
+        ax.set_xlabel('Date')
+        ax.invert_yaxis()
+        ax.set_ylim([900, 0])
+        ax.set_title('Current speed')
+        plt.tight_layout()
+        p2 = os.path.join(run_dir, 'speed_section.png')
+        plt.savefig(p2, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p2}')
+
+        # Plot 3: Shear sections (Sh_E, Sh_N)
+        # shear_processed.nc uses (time, gridded_bin); depth_offset coord = range from glider
+        try:
+            shear_path = os.path.join(run_dir, 'shear_processed.nc')
+            ds_sh = xr.open_dataset(shear_path)
+            if 'Sh_E' in ds_sh and 'Sh_N' in ds_sh:
+                sh_time = pd.Series(ds_sh.time.values).interpolate(method='linear').values
+                if 'depth_offset' in ds_sh.coords:
+                    sh_y      = ds_sh['depth_offset'].values
+                    sh_ylabel = 'Range from glider (m)'
+                else:
+                    sh_y      = np.arange(ds_sh['Sh_E'].shape[1])
+                    sh_ylabel = 'Bin index'
+                fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
+                for ax, var, label in zip(axes,
+                                          [ds_sh['Sh_E'].values, ds_sh['Sh_N'].values],
+                                          ['Eastward shear dU/dz (s⁻¹)', 'Northward shear dV/dz (s⁻¹)']):
+                    clim = 0.02
+                    p = ax.pcolormesh(sh_time, sh_y, var.T,
+                                      cmap=cmo_balance, vmin=-clim, vmax=clim, shading='auto')
+                    plt.colorbar(p, ax=ax, label=label, pad=0.01)
+                    ax.set_ylabel(sh_ylabel)
+                axes[1].set_xlabel('Date')
+                fig.suptitle('Vertical shear', fontsize=13)
+                plt.tight_layout()
+                p_sh = os.path.join(run_dir, 'shear_sections.png')
+                plt.savefig(p_sh, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_sh}')
+            else:
+                log('Shear variables Sh_E/Sh_N not found in shear_processed.nc — skipping')
+            ds_sh.close()
+        except Exception as exc:
+            log(f'Shear section plot skipped ({exc})')
+
+        # Plot 4: Backscatter / acoustic amplitude sections
+        # Amplitude is on (time, bin); use mean of D1-D4 depth arrays as approximate y-axis
+        try:
+            ds_amp   = xr.open_dataset(os.path.join(run_dir, 'shear_processed.nc'))
+            amp_vars = [f'AmplitudeBeam{b}' for b in range(1, 5)
+                        if f'AmplitudeBeam{b}' in ds_amp]
+            if amp_vars:
+                amp_time = pd.Series(ds_amp.time.values).interpolate(method='linear').values
+                # Build approximate depth axis from mean per-bin measurement depth
+                d_vars = [f'D{b}' for b in range(1, 5) if f'D{b}' in ds_amp]
+                if d_vars:
+                    amp_y      = np.nanmean(
+                        np.stack([np.nanmean(ds_amp[v].values, axis=0) for v in d_vars], axis=0),
+                        axis=0,
+                    )
+                    amp_ylabel = 'Approx. depth (m)'
+                else:
+                    amp_y      = np.arange(ds_amp[amp_vars[0]].shape[1])
+                    amp_ylabel = 'Bin index'
+                amp_mean = np.nanmean(
+                    np.stack([ds_amp[v].values for v in amp_vars], axis=0), axis=0
+                )
+                fig, ax = plt.subplots(figsize=(16, 5))
+                p = ax.pcolormesh(amp_time, amp_y, amp_mean.T,
+                                  cmap='inferno', shading='auto')
+                plt.colorbar(p, ax=ax, label='Mean acoustic amplitude (counts)', pad=0.01)
+                ax.set_ylabel(amp_ylabel)
+                ax.set_xlabel('Date')
+                ax.invert_yaxis()
+                ax.set_title(f'Acoustic backscatter (mean of {len(amp_vars)} beams)')
+                plt.tight_layout()
+                p_amp = os.path.join(run_dir, 'backscatter.png')
+                plt.savefig(p_amp, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_amp}')
+            else:
+                log('AmplitudeBeam variables not found in shear_processed.nc — skipping')
+            ds_amp.close()
+        except Exception as exc:
+            log(f'Backscatter plot skipped ({exc})')
+
+        # Plot 5: DAC time series
+        try:
+            dac_data   = np.load(dac_path, allow_pickle=True)
+            dac_E_ts   = dac_data['dac'][:, 0].astype(float)
+            dac_N_ts   = dac_data['dac'][:, 1].astype(float)
+            dac_spd_ts = np.sqrt(dac_E_ts ** 2 + dac_N_ts ** 2)
+            dac_times  = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
+            valid_ts   = np.isfinite(dac_E_ts) & np.isfinite(dac_N_ts)
+            if valid_ts.sum() >= 2:
+                fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+                axes[0].plot(dac_times[valid_ts], dac_E_ts[valid_ts], '-o',
+                             ms=3, lw=1.2, color='steelblue', label='U (east)')
+                axes[0].plot(dac_times[valid_ts], dac_N_ts[valid_ts], '-o',
+                             ms=3, lw=1.2, color='firebrick', label='V (north)')
+                axes[0].axhline(0, color='k', lw=0.5, ls='--')
+                axes[0].set_ylabel('DAC (m/s)')
+                axes[0].legend(fontsize=9)
+                axes[0].set_title('Depth-averaged current time series')
+                axes[1].plot(dac_times[valid_ts], dac_spd_ts[valid_ts], '-o',
+                             ms=3, lw=1.2, color='darkorchid', label='Speed')
+                axes[1].set_ylabel('Speed (m/s)')
+                axes[1].set_xlabel('Date')
+                axes[1].legend(fontsize=9)
+                plt.tight_layout()
+                p_dts = os.path.join(run_dir, 'dac_timeseries.png')
+                plt.savefig(p_dts, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_dts}')
+            else:
+                log('Insufficient valid DAC vectors for time series — skipping')
+        except Exception as exc:
+            log(f'DAC time series plot skipped ({exc})')
+
+        # Plot 6: DAC map
+        try:
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            from matplotlib.colors import Normalize
+            from matplotlib.cm import ScalarMappable
+
+            gps          = np.load(gps_path, allow_pickle=True)
+            gps_predive  = gps['gps_predive']
+            dac_data     = np.load(dac_path, allow_pickle=True)
+            dac_E        = dac_data['dac'][:, 0].astype(float)
+            dac_N        = dac_data['dac'][:, 1].astype(float)
+
+            dive_times_pd = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
+            pre_times_pd  = pd.to_datetime(gps_predive[:, 0].astype('datetime64[ns]'))
+
+            lons = np.full(len(dive_times_pd), np.nan)
+            lats = np.full(len(dive_times_pd), np.nan)
+            for i, dt in enumerate(dive_times_pd):
+                idx     = int(np.argmin(np.abs(pre_times_pd - dt)))
+                lons[i] = float(gps_predive[idx, 1])
+                lats[i] = float(gps_predive[idx, 2])
+
+            valid  = np.isfinite(dac_E) & np.isfinite(dac_N) & np.isfinite(lons) & np.isfinite(lats)
+            log(f'Valid DAC vectors: {valid.sum()} / {len(valid)}')
+
+            if valid.sum() >= 2:
+                N_sub    = max(1, len(np.where(valid)[0]) // 50)
+                idx_sub  = np.where(valid)[0][::N_sub]
+                lon_min  = lons[valid].min() - 0.5
+                lon_max  = lons[valid].max() + 0.5
+                lat_min  = lats[valid].min() - 0.5
+                lat_max  = lats[valid].max() + 0.5
+                dac_norm = Normalize(vmin=0, vmax=0.3)
+
+                fig, ax = plt.subplots(figsize=(10, 12),
+                                       subplot_kw={'projection': ccrs.PlateCarree()})
+                ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+                ax.add_feature(cfeature.OCEAN.with_scale('10m'),     color='lightsteelblue', alpha=0.4)
+                ax.add_feature(cfeature.LAND.with_scale('10m'),      color='wheat', zorder=2)
+                ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=0.6, zorder=3)
+                gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='grey', alpha=0.6, linestyle='--')
+                gl.top_labels   = False
+                gl.right_labels = False
+                ax.plot(lons[valid], lats[valid], 'k-', lw=0.8, alpha=0.4,
+                        transform=ccrs.PlateCarree(), zorder=4)
+
+                sub_v = (np.isfinite(dac_E[idx_sub]) & np.isfinite(dac_N[idx_sub]) &
+                         np.isfinite(lons[idx_sub]) & np.isfinite(lats[idx_sub]))
+                q = ax.quiver(
+                    lons[idx_sub][sub_v], lats[idx_sub][sub_v],
+                    dac_E[idx_sub][sub_v], dac_N[idx_sub][sub_v],
+                    dac_norm(np.sqrt(dac_E[idx_sub][sub_v] ** 2 + dac_N[idx_sub][sub_v] ** 2)),
+                    cmap=cmo_speed, scale=4, width=0.003,
+                    transform=ccrs.PlateCarree(), zorder=5,
+                )
+                sm = ScalarMappable(cmap=cmo_speed, norm=dac_norm)
+                sm.set_array([])
+                plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02,
+                             shrink=0.6, label='DAC speed (m/s)')
+                ax.quiverkey(q, 0.87, 0.97, 0.1, '0.1 m/s',
+                             labelpos='E', fontproperties={'size': 9})
+                ax.set_title('Depth-averaged currents (DAC)', fontsize=12)
+                plt.tight_layout()
+                p3 = os.path.join(run_dir, 'dac_map_cartopy.png')
+                plt.savefig(p3, dpi=200, bbox_inches='tight')
+                plt.close(fig)
+                log(f'Saved: {p3}')
+            else:
+                log('Insufficient valid DAC vectors for map plot — skipping')
+
+        except Exception as exc:
+            log(f'DAC map skipped ({exc})')
+
+        currents_bias.close()
+
+
+def _adcp_tidal_filter(run_dir, opts, log):
+    """40-hour low-pass Butterworth to separate sub-tidal from tidal signal."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import xarray as xr
+    import pandas as pd
+    from scipy import signal
+
+    bias_path = os.path.join(run_dir, 'currents_bias_corrected.nc')
+    if not os.path.exists(bias_path):
+        raise RuntimeError('currents_bias_corrected.nc not found — run Bias Correction first')
+
+    try:
+        import cmocean.cm as cmo
+        cmo_balance = cmo.balance
+        cmo_amp     = cmo.amp
+    except ImportError:
+        cmo_balance = 'RdBu_r'
+        cmo_amp     = 'hot_r'
+
+    log('Loading bias-corrected currents...')
+    currents = xr.open_dataset(bias_path)
+    vel_E = currents['velocity_E_DAC_reference_sb_corrected'].values.copy()
+    vel_N = currents['velocity_N_DAC_reference_sb_corrected'].values.copy()
+    depth = currents.depth.values
+    times = pd.to_datetime(currents.time.values)
+
+    # currents_bias_corrected.nc layout: (depth, profile_index)
+    # depth axis = axis 0 (vel_E.shape[0]), profile/time axis = axis 1 (vel_E.shape[1])
+    n_dep  = vel_E.shape[0]   # depth levels  (e.g. 501)
+    n_prof = vel_E.shape[1]   # profiles/time (e.g. 355) — same length as time coord
+    log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
+    log(f'  depth coord length: {len(depth)}, time coord length: {len(times)}')
+
+    # Estimate time spacing from actual profile times
+    t_float  = times.astype(np.int64) / 1e9 / 3600   # hours since epoch
+    dt_hours = float(np.nanmedian(np.diff(t_float)))
+    log(f'  Median profile spacing: {dt_hours:.2f} h')
+
+    CUTOFF_HOURS = 40.0
+    nyq  = 1.0 / (2.0 * dt_hours)
+    Wn   = (1.0 / CUTOFF_HOURS) / nyq
+
+    if Wn >= 1.0:
+        log(f'  Profile spacing too coarse for {CUTOFF_HOURS}-h filter — sub-tidal == full signal')
+        u_sub = vel_E.copy()
+        v_sub = vel_N.copy()
+    else:
+        order    = 4
+        log(f'  Butterworth order={order}, cutoff={CUTOFF_HOURS} h, Wn={Wn:.4f}')
+        b, a     = signal.butter(order, Wn, btype='low')
+        u_sub    = np.full_like(vel_E, np.nan)
+        v_sub    = np.full_like(vel_N, np.nan)
+        min_samp = max(15, int(CUTOFF_HOURS / dt_hours) * 3)
+        idx_all  = np.arange(n_prof)   # profile indices (length n_prof)
+
+        # Filter along the profile/time axis (axis 1) for each depth level
+        for di in range(n_dep):
+            uc = vel_E[di, :]   # time series at depth di, shape (n_prof,)
+            vc = vel_N[di, :]
+            ok = np.isfinite(uc) & np.isfinite(vc)
+            if ok.sum() < min_samp:
+                continue
+            idx_ok = idx_all[ok]
+            uf = np.interp(idx_all, idx_ok, uc[ok])
+            vf = np.interp(idx_all, idx_ok, vc[ok])
+            try:
+                uf = signal.filtfilt(b, a, uf)
+                vf = signal.filtfilt(b, a, vf)
+            except ValueError:
+                continue
+            u_sub[di, :] = np.where(ok, uf, np.nan)
+            v_sub[di, :] = np.where(ok, vf, np.nan)
+
+        valid_dep = int(np.any(np.isfinite(u_sub), axis=1).sum())
+        log(f'  Valid depth levels after filtering: {valid_dep}/{n_dep}')
+
+    u_tidal = vel_E - u_sub
+    v_tidal = vel_N - v_sub
+
+    # Save NetCDF — same layout as input: (depth, profile_index)
+    time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
+    ds_out = xr.Dataset({
+        'velocity_E_subtidal': (['depth', 'profile_index'], u_sub),
+        'velocity_N_subtidal': (['depth', 'profile_index'], v_sub),
+        'velocity_E_tidal':    (['depth', 'profile_index'], u_tidal),
+        'velocity_N_tidal':    (['depth', 'profile_index'], v_tidal),
+    }, coords={'time': (['profile_index'], time_clean), 'depth': depth})
+    ds_out.attrs['filter_cutoff_hours'] = CUTOFF_HOURS
+    ds_out.attrs['filter_order']        = 4
+    out_nc = os.path.join(run_dir, 'currents_subtidal.nc')
+    ds_out.to_netcdf(out_nc)
+    log(f'Saved: {out_nc}')
+
+    # Plot: sub-tidal sections + tidal residual speed
+    # pcolormesh(x=time, y=depth, C) expects C.shape=(n_dep, n_prof) — matches array layout
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True, sharey=True)
+    for ax, data, label in zip(
+        axes[:2],
+        [u_sub, v_sub],
+        ['Sub-tidal E velocity (m/s)', 'Sub-tidal N velocity (m/s)'],
+    ):
+        p = ax.pcolormesh(time_clean, depth, data,
+                          cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
+        plt.colorbar(p, ax=ax, label=label, pad=0.01)
+        ax.set_ylabel('Depth (m)')
+        ax.invert_yaxis()
+        ax.set_ylim([depth.max(), 0])
+
+    tidal_spd = np.sqrt(u_tidal**2 + v_tidal**2)
+    p = axes[2].pcolormesh(time_clean, depth, tidal_spd,
+                           cmap=cmo_amp, vmin=0, vmax=0.2, shading='auto')
+    plt.colorbar(p, ax=axes[2], label='Tidal signal speed (m/s)', pad=0.01)
+    axes[2].set_ylabel('Depth (m)')
+    axes[2].set_xlabel('Date')
+    axes[2].invert_yaxis()
+    axes[2].set_ylim([depth.max(), 0])
+    fig.suptitle(f'Tidal filtering ({CUTOFF_HOURS}-h low-pass Butterworth)', fontsize=13)
+    plt.tight_layout()
+    out_png = os.path.join(run_dir, 'tidal_filter.png')
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+    log(f'Saved: {out_png}')
+    currents.close()
+
+
+def _adcp_diagnostics(base_dir, run_dir, opts, log):
+    """Compute and plot EKE, depth-integrated transport, and Richardson number."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import xarray as xr
+    import pandas as pd
+
+    bias_path  = os.path.join(run_dir, 'currents_bias_corrected.nc')
+    shear_path = os.path.join(run_dir, 'shear_processed.nc')
+    for p in [bias_path, shear_path]:
+        if not os.path.exists(p):
+            raise RuntimeError(f'{os.path.basename(p)} not found — run Process Shear and Bias Correction first')
+
+    try:
+        import cmocean.cm as cmo
+        cmo_amp = cmo.amp
+    except ImportError:
+        cmo_amp = 'hot_r'
+
+    log('Loading bias-corrected currents...')
+    currents   = xr.open_dataset(bias_path)
+    vel_E      = currents['velocity_E_DAC_reference_sb_corrected'].values
+    vel_N      = currents['velocity_N_DAC_reference_sb_corrected'].values
+    depth      = currents.depth.values
+    time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
+
+    # Layout: (depth=axis0, profile_index=axis1) — same as currents_bias_corrected.nc
+    n_dep  = vel_E.shape[0]
+    n_prof = vel_E.shape[1]
+    log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
+
+    # depth axis weights for integration (axis 0)
+    dz = np.abs(np.gradient(depth))   # shape (n_dep,)
+
+    # ── EKE ──────────────────────────────────────────────────────────────────────
+    log('Computing EKE...')
+    try:
+        # Time-mean current at each depth (mean over profile axis=1)
+        u_bar   = np.nanmean(vel_E, axis=1, keepdims=True)   # (n_dep, 1)
+        v_bar   = np.nanmean(vel_N, axis=1, keepdims=True)
+        EKE     = 0.5 * ((vel_E - u_bar)**2 + (vel_N - v_bar)**2)  # (n_dep, n_prof)
+        # Depth-integrate: sum over axis 0, weighted by dz
+        eke_int = np.nansum(EKE * dz[:, np.newaxis], axis=0)  # (n_prof,)
+
+        fig, axes = plt.subplots(2, 1, figsize=(16, 8),
+                                 gridspec_kw={'height_ratios': [3, 1]})
+        # pcolormesh(x=time, y=depth, C) — C layout is (n_dep, n_prof) ✓
+        p = axes[0].pcolormesh(time_clean, depth, EKE,
+                               cmap=cmo_amp, vmin=0, vmax=0.05, shading='auto')
+        plt.colorbar(p, ax=axes[0], label='EKE (m²/s²)', pad=0.01)
+        axes[0].set_ylabel('Depth (m)')
+        axes[0].invert_yaxis()
+        axes[0].set_ylim([depth.max(), 0])
+        axes[0].set_title('Eddy Kinetic Energy')
+        axes[1].fill_between(time_clean, eke_int, color='firebrick', alpha=0.7)
+        axes[1].set_ylabel('Depth-int. EKE (m³/s²)')
+        axes[1].set_xlabel('Date')
+        plt.tight_layout()
+        p_eke = os.path.join(run_dir, 'eke.png')
+        plt.savefig(p_eke, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p_eke}')
+    except Exception as exc:
+        log(f'EKE skipped ({exc})')
+
+    # ── Transport ─────────────────────────────────────────────────────────────────
+    log('Computing depth-integrated transport...')
+    try:
+        # Integrate over depth axis (axis 0), weighted by dz
+        T_E   = np.nansum(vel_E * dz[:, np.newaxis], axis=0)  # (n_prof,)
+        T_N   = np.nansum(vel_N * dz[:, np.newaxis], axis=0)
+        T_mag = np.sqrt(T_E**2 + T_N**2)
+
+        fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+        axes[0].plot(time_clean, T_E, '-o', ms=2, lw=1.2,
+                     color='steelblue', label='E component')
+        axes[0].plot(time_clean, T_N, '-o', ms=2, lw=1.2,
+                     color='firebrick', label='N component')
+        axes[0].axhline(0, color='k', lw=0.5, ls='--')
+        axes[0].set_ylabel('Transport (m²/s)')
+        axes[0].legend(fontsize=9)
+        axes[0].set_title('Depth-integrated transport')
+        axes[1].fill_between(time_clean, T_mag, color='darkorchid', alpha=0.7)
+        axes[1].set_ylabel('Transport magnitude (m²/s)')
+        axes[1].set_xlabel('Date')
+        plt.tight_layout()
+        p_tr = os.path.join(run_dir, 'transport.png')
+        plt.savefig(p_tr, dpi=150)
+        plt.close(fig)
+        log(f'Saved: {p_tr}')
+    except Exception as exc:
+        log(f'Transport skipped ({exc})')
+
+    currents.close()
+
+    # ── Richardson number ─────────────────────────────────────────────────────────
+    log('Computing Richardson number (Ri = N² / shear²)...')
+    try:
+        import gsw
+        ds_sh = xr.open_dataset(shear_path)
+
+        need = ['glider_temperature', 'glider_salinity', 'Pressure',
+                'Depth', 'Latitude', 'Sh_E', 'Sh_N', 'bin_depth']
+        missing = [v for v in need if v not in ds_sh and v not in ds_sh.coords]
+        if missing:
+            log(f'  Missing variables {missing} in shear_processed.nc — skipping Ri')
+        else:
+            T_raw    = ds_sh['glider_temperature'].values
+            S_raw    = ds_sh['glider_salinity'].values
+            p_raw    = ds_sh['Pressure'].values
+            lat_raw  = ds_sh['Latitude'].values
+            lon_raw  = ds_sh['Longitude'].values
+            prof_raw = np.round(ds_sh['profile_number'].values).astype(float)
+            Sh_E     = ds_sh['Sh_E'].values        # (time, gridded_bin)
+            Sh_N     = ds_sh['Sh_N'].values
+            bin_d    = ds_sh['bin_depth'].values   # (time, gridded_bin) — actual depths
+
+            dmin = float(opts.get('depth_min', 10))
+            dmax = float(opts.get('depth_max', 1000))
+            dg   = np.arange(dmin, dmax + 1.0, 5.0)  # 5 m depth grid
+
+            unique_profs = np.unique(prof_raw[np.isfinite(prof_raw)])
+            log(f'  {len(unique_profs)} profiles, depth grid {dmin}–{dmax} m (5 m bins)')
+
+            ri_arr   = np.full((len(unique_profs), len(dg)), np.nan)
+            time_arr = np.empty(len(unique_profs), dtype='datetime64[ns]')
+            time_arr[:] = np.datetime64('NaT')
+
+            for pi, prof in enumerate(unique_profs):
+                t_mask = prof_raw == prof
+                if t_mask.sum() < 5:
+                    continue
+
+                # Representative time for this profile
+                try:
+                    time_arr[pi] = np.datetime64(
+                        int(np.nanmean(ds_sh.time.values[t_mask].astype('int64'))), 'ns')
+                except Exception:
+                    pass
+
+                # CTD profile: one (T, S, p) point per ADCP ping during this profile
+                ok_ctd = t_mask & np.isfinite(T_raw) & np.isfinite(S_raw) & np.isfinite(p_raw)
+                if ok_ctd.sum() < 10:
+                    continue
+
+                T_p   = T_raw[ok_ctd]
+                S_p   = S_raw[ok_ctd]
+                p_p   = p_raw[ok_ctd]
+                lat_m = float(np.nanmean(lat_raw[ok_ctd]))
+                lon_m = float(np.nanmean(lon_raw[ok_ctd]))
+
+                # Sort strictly by pressure and remove duplicates
+                sidx  = np.argsort(p_p)
+                T_p, S_p, p_p = T_p[sidx], S_p[sidx], p_p[sidx]
+                _, uniq = np.unique(p_p, return_index=True)
+                T_p, S_p, p_p = T_p[uniq], S_p[uniq], p_p[uniq]
+                if len(p_p) < 4:
+                    continue
+
+                # N² from gsw
+                try:
+                    SA        = gsw.SA_from_SP(S_p, p_p, lon_m, lat_m)
+                    CT        = gsw.CT_from_t(SA, T_p, p_p)
+                    N2, p_mid = gsw.Nsquared(SA, CT, p_p, lat_m)
+                    d_mid     = -gsw.z_from_p(p_mid, lat_m)   # positive-down
+                    ok_n2     = np.isfinite(N2) & np.isfinite(d_mid) & (d_mid > 0)
+                    if ok_n2.sum() < 3:
+                        continue
+                    N2_grid = np.interp(dg, d_mid[ok_n2], N2[ok_n2],
+                                        left=np.nan, right=np.nan)
+                except Exception:
+                    continue
+
+                # Shear² binned to depth grid (bin_depth gives true depths)
+                sh2  = (Sh_E[t_mask].ravel()**2 + Sh_N[t_mask].ravel()**2)
+                bd   = bin_d[t_mask].ravel()
+                ok_s = np.isfinite(sh2) & np.isfinite(bd) & (bd > 0)
+                if ok_s.sum() < 5:
+                    continue
+                sh2_grid = np.array([
+                    np.nanmean(sh2[ok_s & (bd >= d - 2.5) & (bd < d + 2.5)])
+                    for d in dg
+                ])
+
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ri = np.where(sh2_grid > 0, N2_grid / sh2_grid, np.nan)
+                ri[ri < 0]  = np.nan   # convective instability
+                ri[ri > 50] = 50.0     # cap display range
+                ri_arr[pi]  = ri
+
+            ok_p = np.any(np.isfinite(ri_arr), axis=1)
+            log(f'  Profiles with valid Ri: {ok_p.sum()}/{len(unique_profs)}')
+
+            if ok_p.sum() >= 2:
+                t_plot  = pd.Series(pd.to_datetime(time_arr[ok_p])).interpolate(method='linear').values
+                ri_plot = ri_arr[ok_p]
+
+                fig, ax = plt.subplots(figsize=(16, 6))
+                pcm = ax.pcolormesh(t_plot, dg, ri_plot.T,
+                                    cmap='RdYlBu_r', vmin=0, vmax=1, shading='auto')
+                plt.colorbar(pcm, ax=ax, label='Ri', pad=0.01)
+                # Ri = 0.25 contour marks onset of shear instability
+                try:
+                    ax.contour(t_plot, dg, ri_plot.T, levels=[0.25],
+                               colors='k', linewidths=1.2, linestyles='--')
+                except Exception:
+                    pass
+                ax.set_ylabel('Depth (m)')
+                ax.set_xlabel('Date')
+                ax.invert_yaxis()
+                ax.set_ylim([dg.max(), dg.min()])
+                ax.set_title('Richardson number  —  dashed line: Ri = 0.25 (shear instability threshold)')
+                plt.tight_layout()
+                p_ri = os.path.join(run_dir, 'richardson_number.png')
+                plt.savefig(p_ri, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_ri}')
+            else:
+                log('  Not enough valid profiles for Ri plot')
+
+        ds_sh.close()
+    except Exception as exc:
+        log(f'Richardson number skipped ({exc})')
+
+
+# ── AD2CP Routes ───────────────────────────────────────────────────────────────
+
+@app.route('/api/adcp/import', methods=['POST'])
+def adcp_import():
+    """Copy .nc files into the ad2cp input directory for a dep/test."""
+    body    = request.json or {}
+    dep     = body.get('dep', '')
+    is_test = bool(body.get('is_test', False))
+    paths   = body.get('paths', [])
+
+    if not dep:
+        return jsonify({'error': 'dep required'}), 400
+
+    dest_dir = _adcp_input_dir(dep, is_test)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    results = []
+    for src in paths:
+        src  = os.path.normpath(src)
+        name = os.path.basename(src)
+        if not name.lower().endswith('.nc'):
+            results.append({'path': src, 'ok': False, 'error': 'Only .nc files are accepted'})
+            continue
+        if not os.path.isfile(src):
+            results.append({'path': src, 'ok': False, 'error': 'File not found'})
+            continue
+        dst = os.path.join(dest_dir, name)
+        try:
+            shutil.copy2(src, dst)
+            results.append({'path': src, 'ok': True, 'name': name})
+        except Exception as exc:
+            results.append({'path': src, 'ok': False, 'error': str(exc)})
+
+    return jsonify({'results': results})
+
+
+@app.route('/api/adcp/files/<path:filename>', methods=['DELETE'])
+def adcp_delete_file(filename):
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    fpath   = os.path.join(_adcp_input_dir(dep, is_test), os.path.basename(filename))
+    if not os.path.isfile(fpath):
+        return abort(404)
+    try:
+        os.remove(fpath)
+        return jsonify({'ok': True})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/adcp/files')
+def adcp_files():
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    d       = _adcp_input_dir(dep, is_test)
+    if not os.path.isdir(d):
+        return jsonify({'files': []})
+    files = sorted(f for f in os.listdir(d) if f.lower().endswith('.nc'))
+    return jsonify({'files': files})
+
+
+@app.route('/api/adcp/tests', methods=['GET'])
+def adcp_list_tests():
+    d = os.path.join(BASE_DIR, 'ad2cp', 'tests')
+    if not os.path.isdir(d):
+        return jsonify({'tests': []})
+    tests = sorted(t for t in os.listdir(d) if os.path.isdir(os.path.join(d, t)))
+    return jsonify({'tests': tests})
+
+
+@app.route('/api/adcp/tests/<label>', methods=['DELETE'])
+def adcp_delete_test(label):
+    d = os.path.join(BASE_DIR, 'ad2cp', 'tests', label)
+    if not os.path.isdir(d):
+        return abort(404)
+    try:
+        shutil.rmtree(d)
+        return jsonify({'ok': True})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/adcp/tests', methods=['POST'])
+def adcp_create_test():
+    label = (request.json or {}).get('label', '').strip()
+    if not label:
+        return jsonify({'error': 'label required'}), 400
+    label = re.sub(r'[^A-Za-z0-9 _\-]', '_', label)
+    os.makedirs(_adcp_input_dir(label, True), exist_ok=True)
+    return jsonify({'label': label})
+
+
+@app.route('/api/adcp/status')
+def adcp_status():
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    base    = _adcp_base_dir(dep, is_test)
+    outputs = _ADCP_TEST_OUTPUTS if is_test else _ADCP_OUTPUTS
+
+    def _file_info(path):
+        exists = os.path.exists(path)
+        return {'exists': exists, 'size': os.path.getsize(path) if exists else 0}
+
+    # Shared stages (not option-dependent) — files live directly in base_dir
+    shared_status = {}
+    for stage in _ADCP_SHARED_STAGES:
+        if stage not in outputs:
+            continue
+        files = outputs[stage]
+        file_info = {f: _file_info(os.path.join(base, f)) for f in files}
+        shared_status[stage] = {
+            'done':  all(fi['exists'] for fi in file_info.values()),
+            'files': file_info,
+        }
+
+    # Option stages — files live in per-run subdirs of base_dir
+    opt_stages = [s for s in outputs if s in _ADCP_OPTION_STAGES]
+    runs = {}
+    if os.path.isdir(base):
+        for entry in sorted(os.listdir(base)):
+            sub = os.path.join(base, entry)
+            if not os.path.isdir(sub):
+                continue
+            run_status = {}
+            for stage in opt_stages:
+                files = outputs[stage]
+                file_info = {f: _file_info(os.path.join(sub, f)) for f in files}
+                run_status[stage] = {
+                    'done':  all(fi['exists'] for fi in file_info.values()),
+                    'files': file_info,
+                }
+            runs[entry] = run_status
+
+    return jsonify({'shared': shared_status, 'runs': runs, 'base_dir': base})
+
+
+@app.route('/api/adcp/run/<stage>', methods=['POST'])
+def adcp_run_stage(stage):
+    body    = request.json or {}
+    dep     = body.get('dep', '')
+    is_test = bool(body.get('is_test', False))
+    adcp_fn = body.get('adcp_file', '')
+    opts    = body.get('options', {})
+
+    if not dep:
+        return jsonify({'error': 'dep required'}), 400
+
+    base_dir  = _adcp_base_dir(dep, is_test)
+    run_dir   = _adcp_run_dir(base_dir, opts)
+    adcp_path = os.path.join(_adcp_input_dir(dep, is_test), adcp_fn) if adcp_fn else ''
+    key       = (dep, stage, 'test' if is_test else 'dep')
+
+    with _adcp_stg_lock:
+        if key in _adcp_live_logs and not _adcp_live_done.get(key):
+            return jsonify({'error': 'Stage already running'}), 409
+
+    valid_stages = list(_ADCP_TEST_OUTPUTS if is_test else _ADCP_OUTPUTS)
+    if stage not in valid_stages:
+        return jsonify({'error': f'Unknown stage: {stage}'}), 400
+
+    def fn(log):
+        os.makedirs(base_dir, exist_ok=True)
+        if stage == 'load_nc':
+            _adcp_load_nc(dep, base_dir, log)
+        elif stage == 'gps_pairing':
+            _adcp_gps_pairing(base_dir, log)
+        elif stage == 'write_glider_nc':
+            _adcp_write_glider_nc(base_dir, log)
+        elif stage == 'process_shear':
+            if is_test:
+                _adcp_gen_dummy_glider_nc(base_dir, adcp_path, log)
+            _adcp_process_shear(base_dir, run_dir, adcp_path, opts, log)
+        elif stage == 'compute_currents':
+            _adcp_compute_currents(base_dir, run_dir, opts, log)
+        elif stage == 'bias_correction':
+            _adcp_bias_correction(run_dir, opts, log)
+        elif stage == 'generate_plots':
+            _adcp_generate_plots(base_dir, run_dir, is_test, log)
+        elif stage == 'tidal_filter':
+            _adcp_tidal_filter(run_dir, opts, log)
+        elif stage == 'diagnostics':
+            _adcp_diagnostics(base_dir, run_dir, opts, log)
+
+    return Response(
+        _adcp_sse_run(key, fn),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@app.route('/api/adcp/download/<path:filename>')
+def adcp_download(filename):
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    run     = request.args.get('run', '')
+    base    = _adcp_base_dir(dep, is_test)
+    if run:
+        fpath = os.path.join(base, run, filename)
+        if not os.path.isfile(fpath):
+            fpath = os.path.join(base, filename)
+    else:
+        fpath = os.path.join(base, filename)
+    if not os.path.isfile(fpath):
+        return abort(404)
+    return send_file(fpath, as_attachment=True, download_name=os.path.basename(fpath))
+
+
+@app.route('/api/adcp/plot/<path:filename>')
+def adcp_plot(filename):
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    run     = request.args.get('run', '')
+    base    = _adcp_base_dir(dep, is_test)
+    if run:
+        fpath = os.path.join(base, run, filename)
+        if not os.path.isfile(fpath):
+            fpath = os.path.join(base, filename)
+    else:
+        fpath = os.path.join(base, filename)
+    if not os.path.isfile(fpath):
+        return abort(404)
+    return send_file(fpath, mimetype='image/png')
+
+
+@app.route('/api/adcp/export')
+def adcp_export():
+    dep     = request.args.get('dep', '')
+    is_test = request.args.get('is_test', 'false').lower() == 'true'
+    run     = request.args.get('run', '')
+    base    = _adcp_base_dir(dep, is_test)
+    if not os.path.isdir(base):
+        return abort(404)
+
+    buf = _adcp_io.BytesIO()
+    with _adcp_zf.ZipFile(buf, 'w', _adcp_zf.ZIP_DEFLATED) as zf:
+        if run:
+            # Shared files from base_dir + option-specific files from the run subdir
+            for fn in os.listdir(base):
+                fp = os.path.join(base, fn)
+                if os.path.isfile(fp):
+                    zf.write(fp, fn)
+            run_sub = os.path.join(base, run)
+            if os.path.isdir(run_sub):
+                for fn in os.listdir(run_sub):
+                    fp = os.path.join(run_sub, fn)
+                    if os.path.isfile(fp):
+                        zf.write(fp, os.path.join(run, fn))
+        else:
+            # Export everything recursively
+            for root, _dirs, files in os.walk(base):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    zf.write(fp, os.path.relpath(fp, base))
+    buf.seek(0)
+
+    safe   = re.sub(r'[^A-Za-z0-9_\-]', '_', dep)
+    suffix = f'_{re.sub(r"[^A-Za-z0-9_-]", "_", run)}' if run else ''
+    return send_file(buf, mimetype='application/zip',
+                     as_attachment=True, download_name=f'adcp_{safe}{suffix}.zip')
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

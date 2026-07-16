@@ -60,30 +60,26 @@ def dbd_to_dat_flight_command(base_dir, deployment):
     """
     Convert DBD-only Slocum binary files to flight ASCII DAT files.
     Output always goes to dat_files/<dep>/flight_data/.
-    Run this stage when only DBD (no science EBD) files are present.
-    Fails fast with a clear error if EBD files are found in the source dir.
+    Only DBD files are passed to the script — EBD files are ignored so
+    this stage can run alongside Stage 1a on the same deployment.
     """
     src    = f'/home/glider/incoming_data/{deployment}'
     dest   = f'/home/glider/dat_files/{deployment}/flight_data'
     exes   = '/home/glider/slocum/linux-bin'
     cac    = '/home/glider/master_cac'
     script = '/home/glider/slocum/bin2ascii/processDbds.sh'
+    tmp    = f'/tmp/dbd_flight_{deployment}'
 
-    # Guard: abort if EBD files are present — use Stage 1a instead
-    ebd_check = (
-        f'if find {src} -maxdepth 1 -iname "*.ebd" | grep -q .; then '
-        f'echo "ERROR: EBD science files found in {src}. Use Stage 1a (DBD+EBD) for deployments with science data." >&2; '
-        f'exit 1; '
-        f'fi'
-    )
-
+    # Copy only .dbd files into a temp dir so the script never sees EBD files
     inner = ' && '.join([
-        ebd_check,
+        f'mkdir -p {tmp}',
+        f'find {src} -maxdepth 1 -iname "*.dbd" -exec cp {{}} {tmp}/ \\;',
         f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab',
         f'mkdir -p {dest}',
         f'cp -r {cac} /tmp/slocum_cac',
-        f'bash {script} -c /tmp/slocum_cac -e {exes} {src} {dest}',
+        f'bash {script} -c /tmp/slocum_cac -e {exes} {tmp} {dest}',
         f'cp /tmp/slocum_cac/*.cac {cac}/ 2>/dev/null || true',
+        f'rm -rf {tmp}',
     ])
     return _docker_run(base_dir, inner), base_dir, None
 

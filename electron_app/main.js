@@ -77,3 +77,6 @@ app.on('window-all-closed', () => {
 
 // IPC: open a file/folder in the system shell
 ipcMain.handle('shell-open', (_, filePath) => shell.openPath(filePath))
+
+// IPC: open a URL in the default system browser (used for OAuth flows)
+ipcMain.handle('open-url', (_, url) => shell.openExternal(url))

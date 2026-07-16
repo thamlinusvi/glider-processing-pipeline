@@ -13,11 +13,16 @@ const state = {
 const activeRuns  = {}     // stageKey → AbortController
 const stageLogs   = {}     // stageKey → string[]  (persists across re-renders)
 const stageEls    = {}     // stageKey → { log, badge, btnRun, btnAbort }  (live DOM refs)
+let   nicknames   = {}     // dep → short name; loaded in init, shared across functions
 
 /* ── API helpers ─────────────────────────────────────────────────────────────*/
 async function apiFetch (url, opts = {}) {
   const r = await fetch(API + url, opts)
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText} — ${url}`)
+  if (!r.ok) {
+    let detail = ''
+    try { const j = await r.json(); detail = j.error || '' } catch (_) {}
+    throw new Error(`${r.status} ${r.statusText}${detail ? ': ' + detail : ''} — ${url}`)
+  }
   return r.json()
 }
 
@@ -133,6 +138,8 @@ function showNewDepModal () {
   const nameHints   = h('datalist', { id: 'nd-name-hints' },
     ...gliders.map(g => h('option', { value: g + '-' })))
   const nameHint    = h('div', { class: 'nd-name-hint' }, 'Format: glider-YYYYMMDDThhmm')
+  const nicknameInput = h('input', { class: 'form-input', type: 'text', id: 'nd-nickname',
+    placeholder: 'e.g. Spring 2026 Survey  (optional)' })
 
   // Template dropdown — grouped, auto-selects most recent same-glider dep
   const templateSel = _buildTemplateSelect(deps, gliders[0] || '')
@@ -158,6 +165,9 @@ function showNewDepModal () {
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Deployment name'),
           nameInput, nameHints, nameHint),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Short name'),
+          nicknameInput),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Copy config from'), templateSel),
         h('div', { class: 'form-group' },
@@ -238,6 +248,7 @@ function closeModal () {
 async function _ndDoCreate () {
   const name     = _ndDepName()
   const template = document.getElementById('nd-template').value
+  const nick     = (document.getElementById('nd-nickname')?.value || '').trim()
   const status   = document.getElementById('nd-status')
   const btn      = document.getElementById('btn-create-dep')
   if (!name) { status.textContent = 'Please fill in all fields.'; return }
@@ -248,7 +259,17 @@ async function _ndDoCreate () {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, template }),
     })
-    // Add to deployment selector
+
+    // Save nickname if provided
+    if (nick) {
+      await apiFetch(`/api/deployment/${encodeURIComponent(name)}/nickname`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nickname: nick }),
+      })
+      nicknames[name] = nick
+    }
+
+    // Add to deployment selector (use nickname as label if set)
     const sel = document.getElementById('dep-select')
     sel.appendChild(h('option', { value: name }, name))
     sel.value = name
@@ -389,13 +410,29 @@ async function renderDashboard () {
   const page = document.getElementById('page-dashboard')
   page.innerHTML = ''
 
+  let dashSort = localStorage.getItem('dashboardSort') || 'time'
+
+  const sortBtn = h('button', { class: 'btn-secondary dash-sort-btn',
+    onclick: () => {
+      dashSort = dashSort === 'time' ? 'alpha' : 'time'
+      localStorage.setItem('dashboardSort', dashSort)
+      renderDashboard()
+    }
+  })
+  const updateSortBtn = () => {
+    sortBtn.textContent = dashSort === 'time' ? '⏱ Newest first' : 'A–Z'
+    sortBtn.title       = dashSort === 'time' ? 'Currently: newest first — click for A–Z' : 'Currently: A–Z — click for newest first'
+  }
+  updateSortBtn()
+
   const header = h('div', { class: 'page-header' },
     h('div', { style: 'display:flex;align-items:flex-start;justify-content:space-between' },
       h('div', {},
         h('h1', {}, 'Deployments'),
         h('p',  {}, 'All glider deployments found in this pipeline directory.')),
-      h('button', { class: 'btn-primary', style: 'margin-top:4px', onclick: showNewDepModal },
-        '+ New Deployment')))
+      h('div', { style: 'display:flex;gap:8px;margin-top:4px' },
+        sortBtn,
+        h('button', { class: 'btn-primary', onclick: showNewDepModal }, '+ New Deployment'))))
   const body = h('div', { class: 'page-body' })
   page.appendChild(header)
   page.appendChild(body)
@@ -403,9 +440,12 @@ async function renderDashboard () {
   const deps = Array.from(document.getElementById('dep-select').options).map(o => o.value).filter(v => v)
   if (!deps.length) { body.appendChild(h('div', { class: 'empty-state' }, 'No deployments found.')); return }
 
-  const allStates = await Promise.all(deps.map(d => loadDepState(d)))
+  const [allStates, allHealth] = await Promise.all([
+    Promise.all(deps.map(d => loadDepState(d))),
+    apiFetch('/api/deployments/health').catch(() => ({})),
+  ])
 
-  // Group deployments by glider name (everything before the first '-')
+  // Group by glider name (everything before the first '-')
   const gliderMap = new Map()
   deps.forEach((dep, i) => {
     const glider = dep.split('-')[0]
@@ -413,12 +453,34 @@ async function renderDashboard () {
     gliderMap.get(glider).push({ dep, ds: allStates[i] })
   })
 
-  gliderMap.forEach((gliderDeps, glider) => {
-    // Parse last deployment date for display
-    const lastDep  = gliderDeps[gliderDeps.length - 1].dep
-    const datePart = lastDep.split('-')[1] || ''
-    const lastDate = datePart.length >= 8
-      ? `${datePart.slice(0,4)}-${datePart.slice(4,6)}-${datePart.slice(6,8)}`
+  // Helper: extract sortable timestamp string from dep name
+  const depTimestamp = dep => dep.split('-')[1] || ''
+
+  // Sort within each glider group
+  gliderMap.forEach(gliderDeps => {
+    if (dashSort === 'time') {
+      gliderDeps.sort((a, b) => depTimestamp(b.dep).localeCompare(depTimestamp(a.dep)))
+    } else {
+      gliderDeps.sort((a, b) => a.dep.localeCompare(b.dep))
+    }
+  })
+
+  // Sort glider groups themselves
+  const sortedGroups = [...gliderMap.entries()]
+  if (dashSort === 'time') {
+    // Sort groups by their most-recent deployment (first item after inner sort)
+    sortedGroups.sort(([, a], [, b]) =>
+      depTimestamp(b[0].dep).localeCompare(depTimestamp(a[0].dep))
+    )
+  } else {
+    sortedGroups.sort(([a], [b]) => a.localeCompare(b))
+  }
+
+  sortedGroups.forEach(([glider, gliderDeps]) => {
+    // Most-recent dep is always first after inner sort (time) or first alpha (alpha) — find actual newest for display
+    const newestTs  = gliderDeps.reduce((m, { dep }) => { const t = depTimestamp(dep); return t > m ? t : m }, '')
+    const lastDate  = newestTs.length >= 8
+      ? `${newestTs.slice(0,4)}-${newestTs.slice(4,6)}-${newestTs.slice(6,8)}`
       : ''
 
     const sectionHeader = h('div', { class: 'glider-section-header' },
@@ -431,22 +493,41 @@ async function renderDashboard () {
       const ps       = ds.state    || {}
       const nc_count = ds.nc_count || 0
       const nc_dir   = ds.nc_dir   || ''
+      const health   = allHealth[dep] || {}
+
+      const allNotRun = state.stages.every(sk => !ps[sk] || ps[sk].status === 'not_run')
 
       const badges = h('div', { class: 'badge-row' },
         ...state.stages.map(sk =>
           h('span', { class: `badge ${statusClass((ps[sk] || {}).status || 'not_run')}` }, shortLabel(sk))
         ))
 
-      const infoText = nc_count > 0
-        ? `${nc_count.toLocaleString()} QC'd profile files  ·  ${nc_dir}`
-        : 'QC output not yet generated'
+      // Health indicator row
+      const healthRow = _depHealthRow(dep, health)
 
+      // Checklist for brand-new deployments
+      const checklist = allNotRun ? _depChecklist(dep, health) : null
+
+      const infoText = !allNotRun
+        ? h('div', { class: 'dep-info' },
+            nc_count > 0
+              ? `${nc_count.toLocaleString()} QC'd profile files  ·  ${nc_dir}`
+              : 'QC output not yet generated')
+        : null
+
+      const nick = nicknames[dep]
       return h('div', { class: 'dep-card' },
         h('div', { class: 'dep-card-header' },
-          h('span', { class: 'dep-name' }, dep),
-          h('button', { class: 'btn-primary', onclick: () => openDeployment(dep) }, 'Open →')),
-        badges,
-        h('div', { class: 'dep-info' }, infoText))
+          h('div', { class: 'dep-name-block' },
+            h('span', { class: 'dep-name' }, dep),
+            nick ? h('span', { class: 'dep-card-nick' }, nick) : null),
+          h('div', { style: 'display:flex;gap:6px' },
+            h('button', { class: 'btn-primary',  onclick: () => openDeployment(dep) }, 'Open →'),
+            h('button', { class: 'btn-danger-outline', title: 'Delete deployment…',
+              onclick: () => showDeleteDepModal(dep) }, 'Delete'))),
+        allNotRun ? checklist : badges,
+        healthRow,
+        infoText)
     })
 
     body.appendChild(h('div', { class: 'glider-section' }, sectionHeader, ...cards))
@@ -468,6 +549,111 @@ function shortLabel (stageKey) {
   return map[stageKey] || stageKey
 }
 
+function _depHealthRow (dep, h_) {
+  const dot = (ok, label) => {
+    const cls = ok ? 'health-dot--ok' : 'health-dot--warn'
+    return h('span', { class: `health-dot ${cls}`, title: ok ? `${label}: OK` : `${label}: missing or incomplete` }, label)
+  }
+  return h('div', { class: 'dep-health-row' },
+    dot(h_.raw_files > 0,         `Raw (${h_.raw_files ?? '?'})`),
+    dot((h_.dat_merged > 0 || h_.dat_flight > 0), `DAT (${(h_.dat_merged || 0) + (h_.dat_flight || 0)})`),
+    dot(h_.metadata_complete,     'Metadata'),
+    dot(h_.sensor_defs_valid,     'Sensor defs'),
+    dot(h_.nc_profile > 0,        `NC (${h_.nc_profile ?? 0})`),
+  )
+}
+
+function _depChecklist (dep, h_) {
+  const step = (done, label, note) => h('div', { class: `checklist-step ${done ? 'checklist-step--done' : 'checklist-step--todo'}` },
+    h('span', { class: 'checklist-icon' }, done ? '✓' : '○'),
+    h('span', { class: 'checklist-label' }, label),
+    note ? h('span', { class: 'checklist-note' }, note) : null)
+
+  return h('div', { class: 'dep-checklist' },
+    h('div', { class: 'checklist-title' }, 'Getting started'),
+    step(h_.raw_files > 0,     'Import raw files',    h_.raw_files > 0 ? `${h_.raw_files} files present` : 'Use Files page to import .dbd / .ebd'),
+    step(h_.metadata_complete, 'Add metadata files',  !h_.metadata_complete ? 'Open Metadata page — add deployment.json, global_attributes.json, instruments.json' : null),
+    step(h_.sensor_defs_valid, 'Build sensor defs',   !h_.sensor_defs_valid ? 'Metadata page → Build Sensor Defs → Copy to this deployment' : null),
+    step(false,                'Run Stage 1 → DAT',   'Pipeline page — convert raw binary files to DAT'),
+    step(false,                'Run Stages 2a/2b/2c → NetCDF', 'Pipeline page — convert DAT to NetCDF'),
+  )
+}
+
+function showDeleteDepModal (dep) {
+  const overlay = h('div', { class: 'modal-overlay',
+    onclick: e => { if (e.target === overlay) overlay.remove() }
+  })
+
+  const input = h('input', {
+    class: 'form-input', type: 'text',
+    placeholder: `Type "${dep}" to confirm`,
+    oninput: () => {
+      confirmBtn.disabled = input.value.trim() !== dep
+    }
+  })
+
+  const statusEl  = h('div', { class: 'modal-status', style: 'color:#e74c3c' })
+
+  const confirmBtn = h('button', {
+    class: 'btn-danger', disabled: true,
+    onclick: async () => {
+      confirmBtn.disabled = true
+      confirmBtn.textContent = 'Deleting…'
+      try {
+        await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/delete`, { method: 'POST' })
+        overlay.remove()
+        delete nicknames[dep]
+
+        // Rebuild sidebar select from fresh state
+        const fresh = await loadAppState()
+        const updatedDeps = fresh.deployments || []
+        const sel = document.getElementById('dep-select')
+        sel.innerHTML = ''
+        sel.appendChild(h('option', { value: '' }, '— select deployment —'))
+        updatedDeps.forEach(d => sel.appendChild(h('option', { value: d }, d)))
+
+        if (state.deployment === dep) {
+          state.deployment = null
+          sel.value = ''
+          localStorage.removeItem('lastDeployment')
+          document.getElementById('dep-nickname-lbl').classList.add('hidden')
+          document.getElementById('dep-nickname-btn').disabled = true
+          document.getElementById('dep-rename-btn').disabled   = true
+        }
+
+        renderDashboard()
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message
+        confirmBtn.disabled  = false
+        confirmBtn.textContent = 'Delete deployment'
+      }
+    }
+  }, 'Delete deployment')
+
+  const cancelBtn = h('button', { class: 'btn-secondary',
+    onclick: () => overlay.remove()
+  }, 'Cancel')
+
+  overlay.appendChild(h('div', { class: 'modal' },
+    h('div', { class: 'modal-header' },
+      h('h2', { style: 'color:#c0392b' }, 'Delete Deployment'),
+      h('button', { class: 'modal-close', onclick: () => overlay.remove() }, '×')),
+    h('div', { class: 'modal-body' },
+      h('p', { style: 'margin-bottom:10px' },
+        'This will permanently delete all files and folders for:'),
+      h('p', { class: 'delete-dep-name' }, dep),
+      h('p', { style: 'margin:10px 0;color:#7f8c8d;font-size:12px' },
+        'Deleted folders: incoming_data, dat_files, deployments, gncutils output, config files, logs, AD2CP data.'),
+      h('label', { class: 'form-label', style: 'margin-top:12px;display:block' },
+        'Type the deployment name to confirm:'),
+      input,
+      statusEl),
+    h('div', { class: 'modal-footer' }, cancelBtn, confirmBtn)))
+
+  document.body.appendChild(overlay)
+  input.focus()
+}
+
 function openDeployment (dep) {
   document.getElementById('dep-select').value = dep
   state.deployment = dep
@@ -487,7 +673,13 @@ async function renderPipeline () {
   )
   const body = h('div', { class: 'page-body' })
   page.appendChild(header)
+
+  // Docker status banner
+  const dockerBanner = h('div', { class: 'docker-banner docker-banner--checking' }, 'Checking Docker…')
+  page.appendChild(dockerBanner)
   page.appendChild(body)
+
+  _checkDockerBanner(dockerBanner)
 
   if (!dep) return
 
@@ -495,19 +687,86 @@ async function renderPipeline () {
   const ps = ds.state || {}
 
   for (const sk of state.stages) {
-    const info   = state.stageInfo[sk] || {}
-    const status = (ps[sk] || {}).status || 'not_run'
-    body.appendChild(buildStageCard(sk, info, status, dep))
+    const info       = state.stageInfo[sk] || {}
+    const stateEntry = ps[sk] || {}
+    const status     = stateEntry.status || 'not_run'
+    body.appendChild(buildStageCard(sk, info, status, dep, stateEntry))
   }
 }
 
-function buildStageCard (sk, info, initialStatus, dep) {
+async function _checkDockerBanner (banner) {
+  let running = false
+  try {
+    const r = await apiFetch('/api/docker/status')
+    running = r.running
+  } catch {}
+
+  if (running) {
+    banner.className   = 'docker-banner docker-banner--ok'
+    banner.textContent = 'Docker is running'
+    return
+  }
+
+  // Not running — show start button
+  banner.className = 'docker-banner docker-banner--down'
+  banner.innerHTML = ''
+  banner.appendChild(document.createTextNode('Docker is not running. '))
+  const btn = h('button', { class: 'docker-start-btn' }, 'Start Docker Desktop')
+  banner.appendChild(btn)
+  const status = h('span', { class: 'docker-start-status' })
+  banner.appendChild(status)
+
+  btn.onclick = async () => {
+    btn.disabled       = true
+    status.textContent = ' Starting…'
+    try {
+      const r = await apiFetch('/api/docker/start', { method: 'POST' })
+      if (!r.ok) { status.textContent = ` Error: ${r.error}`; btn.disabled = false; return }
+    } catch (e) {
+      status.textContent = ` Error: ${e.message}`
+      btn.disabled = false
+      return
+    }
+
+    // Stream /api/docker/wait for readiness
+    const t0  = Date.now()
+    const src = new EventSource(`${API}/api/docker/wait`)
+    src.onmessage = (e) => {
+      const d = JSON.parse(e.data)
+      if (d.ready) {
+        src.close()
+        banner.className   = 'docker-banner docker-banner--ok'
+        banner.textContent = 'Docker is running'
+      } else if (d.timeout) {
+        src.close()
+        status.textContent = ' Timed out — start Docker Desktop manually.'
+        btn.disabled = false
+      } else {
+        const secs = Math.round((Date.now() - t0) / 1000)
+        status.textContent = ` Starting… ${secs}s`
+      }
+    }
+    src.onerror = () => {
+      src.close()
+      status.textContent = ' Connection lost — try again.'
+      btn.disabled = false
+    }
+  }
+}
+
+function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
   const src = getStagePaths(sk, dep)
 
   // Header
-  const badge = h('span', { class: `status-badge ${statusClass(initialStatus)}` }, statusLabel(initialStatus))
+  const badge     = h('span', { class: `status-badge ${statusClass(initialStatus)}` }, statusLabel(initialStatus))
+  const timingEl  = h('span', { class: 'stage-timing' })
+  if (stateEntry.started_at && stateEntry.finished_at) {
+    const dur = Math.round((new Date(stateEntry.finished_at) - new Date(stateEntry.started_at)) / 1000)
+    timingEl.textContent = `${Math.floor(dur / 60)}m ${String(dur % 60).padStart(2, '0')}s`
+  }
   const cardHeader = h('div', { class: 'stage-card-header' },
     h('span', { class: 'stage-title' }, info.label || sk),
+    timingEl,
     badge
   )
 
@@ -558,10 +817,40 @@ function buildStageCard (sk, info, initialStatus, dep) {
       })
     }
 
-    const btnRun   = h('button', { class: 'btn-success', onclick: () => doRun(dep, sk, badge, btnRun, btnAbort, log, stageOpts ? stageOpts() : {}) }, '▶  Run Stage')
+    const btnRun   = h('button', { class: 'btn-success', onclick: async () => {
+      if (sk === 'dbd_to_dat' || sk === 'dbd_to_dat_flight') {
+        try {
+          const counts = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/dat-count`)
+          const count  = sk === 'dbd_to_dat' ? counts.merged : counts.flight
+          const folder = sk === 'dbd_to_dat' ? 'merged_data' : 'flight_data'
+          if (count > 0 && !confirm(
+            `${count} existing DAT file${count !== 1 ? 's' : ''} found in ${folder}.\n\nProceeding will overwrite them. Continue?`
+          )) return
+        } catch {}
+      }
+      if (sk === 'dat_to_profile_nc' || sk === 'dat_to_trajectory_nc' || sk === 'dat_to_trajectory_flight_nc') {
+        try {
+          const v = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/validate-netcdf-config?stage=${sk}`)
+          if (!v.ok) {
+            _showValidationModal(sk, v.issues)
+            return
+          }
+        } catch {}
+      }
+      doRun(dep, sk, badge, btnRun, btnAbort, log, stageOpts ? stageOpts() : {}, timingEl)
+    }}, '▶  Run Stage')
     const btnAbort = h('button', { class: 'btn-danger hidden', onclick: () => doAbort(dep, sk, badge, btnRun, btnAbort) }, '■  Abort')
     const btnClear = h('button', { class: 'btn-secondary', onclick: () => { log.innerHTML = ''; log.classList.add('hidden'); stageLogs[sk] = [] } }, 'Clear log')
-    const btnRow   = h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear)
+    const btnSetStatus = h('button', { class: 'btn-secondary',
+      title: 'Manually override this stage\'s status',
+      onclick: e => _stageStatusPopover(e.currentTarget, async st => {
+        await setStageStatus(dep, sk, st)
+        badge.className   = `status-badge ${statusClass(st)}`
+        badge.textContent = statusLabel(st)
+        btnRun.textContent = st === 'done' ? '↺  Re-run Stage' : '▶  Run Stage'
+      })
+    }, 'Set status ▾')
+    const btnRow   = h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear, btnSetStatus)
 
     // Restore state if this stage is currently running or has prior log output
     if (activeRuns[sk]) {
@@ -677,6 +966,26 @@ function buildStageCard (sk, info, initialStatus, dep) {
       btnRun.textContent = '↺  Re-run Stage'
     }
 
+    // Async validation banner for stages 2a/2b/2c
+    const NC_STAGES = ['dat_to_profile_nc', 'dat_to_trajectory_nc', 'dat_to_trajectory_flight_nc']
+    if (NC_STAGES.includes(sk)) {
+      const banner = h('div', { class: 'stage-validation-banner hidden' })
+      bodyEl.appendChild(banner)
+      ;(async () => {
+        try {
+          const v = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/validate-netcdf-config?stage=${sk}`)
+          if (!v.ok && v.issues?.length) {
+            banner.className = 'stage-validation-banner stage-validation-banner--warn'
+            banner.appendChild(h('span', { class: 'stage-validation-icon' }, '⚠'))
+            banner.appendChild(h('span', { class: 'stage-validation-text' },
+              `${v.issues.length} config issue${v.issues.length !== 1 ? 's' : ''} — stage may fail`))
+            banner.appendChild(h('button', { class: 'stage-validation-detail-btn',
+              onclick: () => _showValidationModal(sk, v.issues) }, 'Details'))
+          }
+        } catch {}
+      })()
+    }
+
     if (configRow) bodyEl.appendChild(configRow)
     bodyEl.appendChild(btnRow)
     bodyEl.appendChild(log)
@@ -709,9 +1018,9 @@ async function markManual (dep, sk, status, badge) {
   badge.textContent = statusLabel(status)
 }
 
-function doRun (dep, sk, badge, btnRun, btnAbort, log, opts = {}) {
+function doRun (dep, sk, badge, btnRun, btnAbort, log, opts = {}, timingEl = null) {
   // Register live DOM refs — updated by buildStageCard on re-render
-  stageEls[sk]  = { log, badge, btnRun, btnAbort }
+  stageEls[sk]  = { log, badge, btnRun, btnAbort, timingEl }
   stageLogs[sk] = []
 
   log.classList.remove('hidden')
@@ -720,6 +1029,16 @@ function doRun (dep, sk, badge, btnRun, btnAbort, log, opts = {}) {
   btnAbort.classList.remove('hidden')
   badge.className   = 'status-badge running'
   badge.textContent = 'RUNNING…'
+
+  const _t0 = Date.now()
+  if (timingEl) timingEl.textContent = '0m 00s'
+  const _timingIv = setInterval(() => {
+    const el = stageEls[sk]
+    if (el?.timingEl) {
+      const s = Math.round((Date.now() - _t0) / 1000)
+      el.timingEl.textContent = `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+    }
+  }, 1000)
 
   // For preflight stage: capture the PREFLIGHT_JSON line as the analysis runs
   let preflightResult = null
@@ -737,8 +1056,13 @@ function doRun (dep, sk, badge, btnRun, btnAbort, log, opts = {}) {
       if (el) appendLog(el.log, line)
     },
     (success) => {
+      clearInterval(_timingIv)
       const el = stageEls[sk]
       delete stageEls[sk]
+      if (el?.timingEl) {
+        const s = Math.round((Date.now() - _t0) / 1000)
+        el.timingEl.textContent = `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+      }
       const finalLine = success ? '✔ Analysis complete.' : '✖ Finished with errors.'
       stageLogs[sk].push(finalLine)
       if (el) {
@@ -809,8 +1133,9 @@ function showPreflightPanel (dep, data, bodyEl, badge) {
   // ── Config file cards ──────────────────────────────────────────────────────
   const configCards = []
   for (const [fname, info] of Object.entries(configs)) {
+    const actionLabel = { create: 'New file', update: 'Will update', unchanged: 'Up to date' }
     const actionBadge = h('span', { class: `preflight-badge ${actionBadgeClass(info.action)}` },
-      info.action.toUpperCase())
+      actionLabel[info.action] || info.action)
 
     const headerRow = h('div', { class: 'preflight-file-header' },
       h('span', { class: 'preflight-file-name' }, fname),
@@ -848,6 +1173,7 @@ function showPreflightPanel (dep, data, bodyEl, badge) {
   let   includeBoundary    = boundaryInadequate  // checkbox default
 
   let boundaryCard = null
+  let inpLatMin = null, inpLatMax = null, inpLonMin = null, inpLonMax = null
   if (boundaryInadequate) {
     const cbBoundary = h('input', { type: 'checkbox' })
     cbBoundary.checked = true
@@ -868,10 +1194,10 @@ function showPreflightPanel (dep, data, bodyEl, badge) {
       })
       return inp
     }
-    const inpLatMin = makeNumInput(rc.proposed_lat[0])
-    const inpLatMax = makeNumInput(rc.proposed_lat[1])
-    const inpLonMin = makeNumInput(rc.proposed_lon[0])
-    const inpLonMax = makeNumInput(rc.proposed_lon[1])
+    inpLatMin = makeNumInput(rc.proposed_lat[0])
+    inpLatMax = makeNumInput(rc.proposed_lat[1])
+    inpLonMin = makeNumInput(rc.proposed_lon[0])
+    inpLonMax = makeNumInput(rc.proposed_lon[1])
 
     const boundsTable = h('table', { class: 'preflight-bounds-table' },
       h('thead', {},
@@ -994,13 +1320,80 @@ function showPreflightPanel (dep, data, bodyEl, badge) {
   bodyEl.appendChild(panel)
 }
 
+function _showValidationModal (stage, issues) {
+  const STAGE_LABELS = {
+    dat_to_profile_nc:           'Stage 2a — Profile NetCDF',
+    dat_to_trajectory_nc:        'Stage 2b — Trajectory NC (Science)',
+    dat_to_trajectory_flight_nc: 'Stage 2c — Trajectory NC (Flight)',
+  }
+  const SUBDIR_LABELS = {
+    dat_to_profile_nc:           'science_profile/',
+    dat_to_trajectory_nc:        'science_trajectory/',
+    dat_to_trajectory_flight_nc: 'trajectory_flight/',
+  }
+
+  const overlay = h('div', { class: 'modal-overlay' })
+  const modal   = h('div', { class: 'modal-box' },
+    h('h2', {}, `Cannot run ${STAGE_LABELS[stage] || stage}`),
+    h('p',  { style: 'color:#a0b0c0;font-size:13px;margin-bottom:12px' },
+      `Fix the following issues in the ${SUBDIR_LABELS[stage] || ''} metadata config before running:`),
+    h('ul', { class: 'validation-issue-list' },
+      ...issues.map(({ file, message }) =>
+        h('li', { class: 'validation-issue-item' },
+          h('span', { class: 'validation-issue-file' }, file),
+          h('span', { class: 'validation-issue-msg'  }, message)
+        )
+      )
+    ),
+    h('p', { style: 'color:#a0b0c0;font-size:12px;margin-top:12px' },
+      'Use the Metadata page to add missing files, or run Build Sensor Defs to regenerate sensor_defs.json.'),
+    h('div', { class: 'btn-row', style: 'margin-top:16px' },
+      h('button', { class: 'btn-primary', onclick: () => overlay.remove() }, 'OK')
+    )
+  )
+  overlay.appendChild(modal)
+  document.body.appendChild(overlay)
+}
+
+function _stageStatusPopover (anchor, onPick) {
+  document.querySelectorAll('.stage-status-popover').forEach(el => el.remove())
+
+  const options = [
+    { value: 'done',     label: statusLabel('done'),     cls: 'done' },
+    { value: 'failed',   label: statusLabel('failed'),   cls: 'failed' },
+    { value: 'not_run',  label: statusLabel('not_run'),  cls: 'not_run' },
+  ]
+
+  const rect    = anchor.getBoundingClientRect()
+  const popover = h('div', { class: 'stage-status-popover' })
+  popover.style.top  = `${rect.bottom + window.scrollY + 4}px`
+  popover.style.left = `${rect.left + window.scrollX}px`
+
+  options.forEach(({ value, label, cls }) => {
+    const item = h('div', { class: `stage-status-popover-item status-pop-${cls}`,
+      onclick: async e => {
+        e.stopPropagation()
+        popover.remove()
+        await onPick(value)
+      }
+    }, label)
+    popover.appendChild(item)
+  })
+
+  document.body.appendChild(popover)
+  const close = e => { if (!popover.contains(e.target)) { popover.remove(); document.removeEventListener('click', close) } }
+  setTimeout(() => document.addEventListener('click', close), 0)
+}
+
 async function doAbort (dep, sk, badge, btnRun, btnAbort) {
-  await abortRun(dep, sk)
+  const r  = await abortRun(dep, sk)
+  const st = r?.restored_status || 'not_run'
   const el = stageEls[sk] || { badge, btnRun, btnAbort }
   el.btnRun.classList.remove('hidden')
   el.btnAbort.classList.add('hidden')
-  el.badge.className   = 'status-badge failed'
-  el.badge.textContent = '✖ FAILED'
+  el.badge.className   = `status-badge ${statusClass(st)}`
+  el.badge.textContent = statusLabel(st)
+  el.btnRun.textContent = st === 'done' ? '↺  Re-run Stage' : '▶  Run Stage'
   delete stageEls[sk]
 }
 
@@ -1054,18 +1447,33 @@ async function renderReports () {
     await renderFlightStats(dep, flightTab)
   }
 
+  function switchToAdcp () {
+    tabBar.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'adcp'))
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-adcp'))
+  }
+
   const tabBar = h('div', { class: 'tab-bar' },
     h('button', { class: 'tab-btn active', 'data-tab': 'report',    onclick: switchTab     }, 'QC Report'),
     h('button', { class: 'tab-btn',        'data-tab': 'plots',     onclick: switchTab     }, 'Plots'),
     h('button', { class: 'tab-btn',        'data-tab': 'variables', onclick: switchToVars  }, 'Variables'),
     h('button', { class: 'tab-btn',        'data-tab': 'map',       onclick: switchToMap   }, 'Map'),
     h('button', { class: 'tab-btn',        'data-tab': 'flight',    onclick: switchToFlight}, 'Flight Stats'),
+    h('button', { class: 'tab-btn',        'data-tab': 'adcp',      onclick: switchToAdcp  }, 'AD2CP'),
   )
   page.appendChild(tabBar)
 
   // Report tab
-  const frame = h('iframe', { id: 'report-frame', src: dep ? `${API}/api/deployment/${encodeURIComponent(dep)}/report` : 'about:blank' })
-  const reportTab = h('div', { class: 'tab-panel active', id: 'tab-report' }, frame)
+  const reportSrc = dep ? `${API}/api/deployment/${encodeURIComponent(dep)}/report` : 'about:blank'
+  const frame = h('iframe', { id: 'report-frame', src: reportSrc })
+  const qcDlBtn = dep ? h('a', {
+    class: 'btn-secondary btn-sm',
+    href: reportSrc,
+    download: `qc_report_${dep}.html`,
+  }, '⬇ Download Report') : null
+  const reportTab = h('div', { class: 'tab-panel active', id: 'tab-report' },
+    h('div', { class: 'report-toolbar' }, qcDlBtn),
+    frame,
+  )
 
   // Plots tab
   const plotGrid = h('div', { class: 'plot-grid' })
@@ -1080,11 +1488,26 @@ async function renderReports () {
   // Flight Stats tab
   const flightTab = h('div', { class: 'tab-panel', id: 'tab-flight' })
 
+  // AD2CP tab — iframe like QC Report
+  const adcpReportSrc = dep
+    ? `${API}/api/adcp/report-html?dep=${encodeURIComponent(dep)}`
+    : 'about:blank'
+  const adcpReportFrame = h('iframe', { id: 'adcp-report-frame', src: adcpReportSrc })
+  const adcpDlBtn = dep ? h('a', {
+    class: 'btn-secondary btn-sm',
+    href: `${adcpReportSrc}&dl=1`,
+  }, '⬇ Download Report') : null
+  const adcpReportTab = h('div', { class: 'tab-panel', id: 'tab-adcp' },
+    h('div', { class: 'report-toolbar' }, adcpDlBtn),
+    adcpReportFrame,
+  )
+
   page.appendChild(reportTab)
   page.appendChild(plotsTab)
   page.appendChild(varsTab)
   page.appendChild(mapTab)
   page.appendChild(flightTab)
+  page.appendChild(adcpReportTab)
 
   if (dep) {
     try {
@@ -1397,11 +1820,26 @@ async function renderTrajectoryMap (dep, container) {
     }
   }, '⬇ Download KMZ')
 
+  const mapImgBtn = h('button', { class: 'btn-secondary',
+    onclick: async () => {
+      mapImgBtn.disabled = true
+      mapImgBtn.textContent = 'Generating…'
+      try {
+        await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/generate-map-image`, { method: 'POST' })
+        mapImgBtn.textContent = '✓ Map Image Saved'
+      } catch (e) {
+        mapImgBtn.textContent = 'Failed'
+        alert('Could not generate map image: ' + e.message)
+      }
+    }
+  }, '📷 Save Map Image')
+
   const headerBar = h('div', { class: 'traj-header-bar' },
     h('span', { class: 'traj-stat-chip' }, `${surf.count} GPS surfacings`),
     h('span', { class: 'traj-stat-chip' }, `${(surf.n_records || 0).toLocaleString()} records`),
     h('span', { class: 'traj-stat-chip' }, `${surf.n_files} traj files`),
     kmzBtn,
+    mapImgBtn,
   )
   container.appendChild(headerBar)
 
@@ -1506,78 +1944,322 @@ async function renderFlightStats (dep, container) {
   const fmtV = (v, d = 2) => v == null ? 'N/A' : Number(v).toFixed(d)
 
   container.appendChild(h('div', { class: 'flight-stats-grid' },
-    _statCard('GPS Surfacings',   stats.n_surfacings),
-    _statCard('Records',          stats.n_records.toLocaleString()),
-    _statCard('Battery Min',      fmtV(stats.battery_v.min, 2) + ' V'),
-    _statCard('Battery Max',      fmtV(stats.battery_v.max, 2) + ' V'),
-    _statCard('Amp-Hours Used',   stats.total_ah_used != null ? fmtV(stats.total_ah_used, 1) + ' Ah' : 'N/A'),
-    _statCard('Mean Pitch',       fmtV(stats.pitch_deg.mean, 1) + '°'),
-    _statCard('Mean Roll',        fmtV(stats.roll_deg.mean,  1) + '°'),
-    _statCard('Mean Vacuum',      fmtV(stats.vacuum_inhg.mean, 2) + ' inHg'),
+    _statCard('Records',        stats.n_records.toLocaleString()),
+    _statCard('Battery Min',    fmtV(stats.battery_v.min, 2) + ' V'),
+    _statCard('Battery Max',    fmtV(stats.battery_v.max, 2) + ' V'),
+    _statCard('Amp-Hours Used', stats.total_ah_used != null ? fmtV(stats.total_ah_used, 1) + ' Ah' : 'N/A'),
+    _statCard('Mean Pitch',     fmtV(stats.pitch_deg.mean, 1) + '°'),
+    _statCard('Mean Roll',      fmtV(stats.roll_deg.mean,  1) + '°'),
+    _statCard('Mean Vacuum',    fmtV(stats.vacuum_inhg.mean, 2) + ' inHg'),
   ))
+
+  const flightRptBtn = h('button', { class: 'btn-secondary',
+    onclick: () => {
+      const a = document.createElement('a')
+      a.href = `${API}/api/deployment/${encodeURIComponent(dep)}/flight-stats-report`
+      a.download = `flight_stats_${dep}.html`
+      document.body.appendChild(a); a.click(); a.remove()
+    }
+  }, '⬇ Download Report')
+
+  const flightHeaderBar = h('div', { class: 'traj-header-bar' }, flightRptBtn)
+  container.appendChild(flightHeaderBar)
 
   const chartsWrap = h('div', { class: 'flight-charts' })
   container.appendChild(chartsWrap)
 
-  // ── Plotly charts ──────────────────────────────────────────────────────────
-  const DARK = {
-    paper_bgcolor: '#131c27',
-    plot_bgcolor:  '#0f1720',
-    font:          { color: '#9ab4cc', size: 11 },
-    margin:        { l: 56, r: 16, t: 10, b: 48 },
-    xaxis:         { type: 'date', gridcolor: '#1e2d40', zerolinecolor: '#1e2d40' },
-    showlegend:    true,
-    legend:        { orientation: 'h', y: 1.08, font: { size: 11 } },
+  // ── Shared Plotly theme pieces ─────────────────────────────────────────────
+  // NOTE: never spread xaxis into yaxis — xaxis has type:'date' which breaks
+  // numeric y-axes by making Plotly interpret every value as a timestamp.
+  const PAPER  = '#131c27'
+  const PLOT   = '#0f1720'
+  const GRID   = '#1e2d40'
+  const FONT   = { color: '#9ab4cc', size: 11 }
+
+  const XDATE  = { type: 'date',   gridcolor: GRID, zerolinecolor: GRID, color: '#9ab4cc' }
+  const YLIN   = { type: 'linear', gridcolor: GRID, zerolinecolor: GRID, color: '#9ab4cc' }
+
+  // Range-selector button styling (used in pitch/roll chart)
+  const RS_STYLE = {
+    bgcolor: '#1a2840', activecolor: '#2d4a6a',
+    bordercolor: '#2d4a6a', borderwidth: 1,
+    font: { color: '#9ab4cc', size: 10 },
   }
 
-  function addChart (title, traces) {
-    const div = h('div', { class: 'flight-chart' })
-    chartsWrap.appendChild(h('div', { class: 'flight-chart-wrap' },
-      h('div', { class: 'flight-chart-title' }, title),
-      div))
+  const BASE = {
+    paper_bgcolor: PAPER,
+    plot_bgcolor:  PLOT,
+    font:          FONT,
+    margin:        { l: 60, r: 16, t: 8, b: 52 },
+    showlegend:    true,
+    // Keep legend inside the plot area so the chart wrapper's overflow:hidden
+    // doesn't clip it (y:1.12 would place it above the canvas and hide it).
+    legend: {
+      orientation: 'h',
+      x: 0.01, xanchor: 'left',
+      y: 0.99, yanchor: 'top',
+      bgcolor: 'rgba(13,20,32,0.75)',
+      bordercolor: '#1e2d40',
+      borderwidth: 1,
+      font: { size: 10 },
+    },
+  }
+
+  function addChart (title, subtitle) {
+    const div     = h('div', { class: 'flight-chart' })
+    const titleEl = h('div', { class: 'flight-chart-title' }, title)
+    if (subtitle) titleEl.appendChild(h('span', { class: 'flight-chart-subtitle' }, subtitle))
+    chartsWrap.appendChild(h('div', { class: 'flight-chart-wrap' }, titleEl, div))
     return div
+  }
+
+  // ── Per-day average helper (runs client-side from subsampled data) ─────────
+  function dailyAvg (xs, ys) {
+    const map = {}
+    for (let i = 0; i < xs.length; i++) {
+      if (!xs[i] || ys[i] == null) continue
+      const day = xs[i].slice(0, 10)           // 'YYYY-MM-DD'
+      if (!map[day]) map[day] = { sum: 0, n: 0 }
+      map[day].sum += ys[i]; map[day].n++
+    }
+    const days = Object.keys(map).sort()
+    return {
+      x: days.map(d => d + 'T12:00:00Z'),      // plot at noon each day
+      y: days.map(d => +(map[d].sum / map[d].n).toFixed(3)),
+    }
   }
 
   try {
     const Plotly = await loadPlotlyLib()
+    const cfg    = { responsive: true, displayModeBar: false }
 
-    const cfg = { responsive: true, displayModeBar: false }
-
-    // Pitch & Roll
-    const prDiv = addChart('Pitch & Roll (degrees)')
+    // ── 1. Pitch & Roll — with 1-day / 3-day / 7-day / All range buttons ────
+    const prDiv = addChart('PITCH & ROLL (DEGREES)')
     Plotly.newPlot(prDiv, [
       { x: times, y: timeseries.pitch, name: 'Pitch', type: 'scattergl', mode: 'lines',
         line: { color: '#60a5fa', width: 1 } },
       { x: times, y: timeseries.roll,  name: 'Roll',  type: 'scattergl', mode: 'lines',
         line: { color: '#f97316', width: 1 } },
-    ], { ...DARK, yaxis: { ...DARK.xaxis, title: { text: 'deg', standoff: 4 } } }, cfg)
+    ], {
+      ...BASE,
+      xaxis: {
+        ...XDATE,
+        rangeselector: {
+          ...RS_STYLE,
+          buttons: [
+            { count: 1, label: '1d', step: 'day',  stepmode: 'backward' },
+            { count: 3, label: '3d', step: 'day',  stepmode: 'backward' },
+            { count: 7, label: '7d', step: 'day',  stepmode: 'backward' },
+            { step: 'all', label: 'All' },
+          ],
+        },
+      },
+      yaxis: { ...YLIN, title: { text: 'degrees', standoff: 4 } },
+    }, cfg)
 
-    // Battery Voltage
-    const battDiv = addChart('Battery Voltage (V)')
+    // ── 2. Battery Voltage — full mission thin line + bold per-day average ───
+    // Use scatter (not scattergl) for both traces so Plotly's autorange sees all
+    // data; also pin the y-axis to the true min/max from stats so the raw dips
+    // (e.g. 14.1 V during dives) are never clipped.
+    const dayBatt = dailyAvg(times, timeseries.battery)
+    const battDiv = addChart('BATTERY VOLTAGE — FULL MISSION WITH DAILY AVERAGE')
+    const bPad = 0.15
+    const bMin = stats.battery_v.min != null ? stats.battery_v.min - bPad : null
+    const bMax = stats.battery_v.max != null ? stats.battery_v.max + bPad : null
     Plotly.newPlot(battDiv, [
-      { x: times, y: timeseries.battery, name: 'Battery', type: 'scattergl', mode: 'lines',
-        line: { color: '#4ade80', width: 1 } },
-    ], { ...DARK, showlegend: false,
-         yaxis: { ...DARK.xaxis, title: { text: 'V', standoff: 4 } } }, cfg)
+      { x: times,     y: timeseries.battery, name: 'Raw readings',
+        type: 'scatter', mode: 'lines',
+        line: { color: '#4ade80', width: 0.7 }, opacity: 0.55 },
+      { x: dayBatt.x, y: dayBatt.y,          name: 'Daily average',
+        type: 'scatter', mode: 'lines+markers',
+        line: { color: '#86efac', width: 2.5 },
+        marker: { color: '#86efac', size: 6, symbol: 'circle' } },
+    ], {
+      ...BASE,
+      xaxis: XDATE,
+      yaxis: {
+        ...YLIN,
+        title: { text: 'V', standoff: 4 },
+        ...(bMin != null ? { range: [bMin, bMax], autorange: false } : {}),
+      },
+    }, cfg)
 
-    // Cumulative Amp-Hours
-    const ahDiv = addChart('Cumulative Amp-Hours')
+    // ── 3. Cumulative Amp-Hours — start/end labels + daily draw bars ─────────
+    // Find first & last non-null readings from the subsampled timeseries
+    let startAh = null, endAh = null
+    for (let i = 0; i < timeseries.coulomb.length; i++)
+      if (timeseries.coulomb[i] != null && startAh === null) startAh = timeseries.coulomb[i]
+    for (let i = timeseries.coulomb.length - 1; i >= 0; i--)
+      if (timeseries.coulomb[i] != null) { endAh = timeseries.coulomb[i]; break }
+
+    // Daily draw: difference between last reading of each consecutive pair of days
+    const ahDailyDraw = (() => {
+      const last = {}   // day -> last Ah value seen that day
+      for (let i = 0; i < times.length; i++) {
+        if (!times[i] || timeseries.coulomb[i] == null) continue
+        last[times[i].slice(0, 10)] = timeseries.coulomb[i]
+      }
+      const days = Object.keys(last).sort()
+      const x = [], y = []
+      for (let i = 1; i < days.length; i++) {
+        const delta = +(last[days[i]] - last[days[i - 1]]).toFixed(2)
+        if (delta > 0) { x.push(days[i] + 'T12:00:00Z'); y.push(delta) }
+      }
+      return { x, y }
+    })()
+
+    const avgDraw = ahDailyDraw.y.length
+      ? (ahDailyDraw.y.reduce((a, b) => a + b, 0) / ahDailyDraw.y.length).toFixed(2)
+      : null
+    const ahTotal = (startAh != null && endAh != null)
+      ? (endAh - startAh).toFixed(1) : null
+
+    const ahSubtitle = [
+      startAh != null ? `Start ${startAh.toFixed(1)} Ah` : null,
+      endAh   != null ? `End ${endAh.toFixed(1)} Ah`     : null,
+      ahTotal != null ? `Total used ${ahTotal} Ah`        : null,
+      avgDraw != null ? `Avg ${avgDraw} Ah/day`           : null,
+    ].filter(Boolean).join('  ·  ')
+
+    const ahDiv = addChart('CUMULATIVE AMP-HOURS', ahSubtitle)
     Plotly.newPlot(ahDiv, [
-      { x: times, y: timeseries.coulomb, name: 'Amp-hrs', type: 'scattergl', mode: 'lines',
-        line: { color: '#facc15', width: 1 } },
-    ], { ...DARK, showlegend: false,
-         yaxis: { ...DARK.xaxis, title: { text: 'Ah', standoff: 4 } } }, cfg)
+      { x: times,           y: timeseries.coulomb, name: 'Cumulative Ah',
+        type: 'scatter', mode: 'lines',
+        line: { color: '#facc15', width: 1.5 }, yaxis: 'y' },
+      { x: ahDailyDraw.x,  y: ahDailyDraw.y,      name: 'Daily draw',
+        type: 'bar',
+        marker: { color: 'rgba(251,191,36,0.3)', line: { color: 'rgba(251,191,36,0.6)', width: 1 } },
+        yaxis: 'y2' },
+    ], {
+      ...BASE,
+      xaxis:  XDATE,
+      yaxis:  { ...YLIN, title: { text: 'Ah (cumul.)', standoff: 4 } },
+      yaxis2: { ...YLIN, title: { text: 'Ah/day', standoff: 4 },
+                overlaying: 'y', side: 'right', showgrid: false,
+                rangemode: 'tozero' },
+      barmode: 'overlay',
+      margin:  { ...BASE.margin, r: 70 },   // extra right margin for y2 label
+    }, cfg)
 
-    // Vacuum (hull integrity)
-    const vacDiv = addChart('Vacuum (inHg) — Hull Integrity')
+    // ── 4. Vacuum (hull integrity) — full mission + daily average ────────────
+    const dayVac = dailyAvg(times, timeseries.vacuum)
+    const vacDiv = addChart('VACUUM (inHg) — HULL INTEGRITY WITH DAILY AVERAGE')
+    const vPad = 0.05
+    const vMin = stats.vacuum_inhg.min != null ? stats.vacuum_inhg.min - vPad : null
+    const vMax = stats.vacuum_inhg.max != null ? stats.vacuum_inhg.max + vPad : null
     Plotly.newPlot(vacDiv, [
-      { x: times, y: timeseries.vacuum, name: 'Vacuum', type: 'scattergl', mode: 'lines',
-        line: { color: '#c084fc', width: 1 } },
-    ], { ...DARK, showlegend: false,
-         yaxis: { ...DARK.xaxis, title: { text: 'inHg', standoff: 4 } } }, cfg)
+      { x: times,     y: timeseries.vacuum, name: 'Raw readings',
+        type: 'scatter', mode: 'lines',
+        line: { color: '#c084fc', width: 0.7 }, opacity: 0.55 },
+      { x: dayVac.x,  y: dayVac.y,          name: 'Daily average',
+        type: 'scatter', mode: 'lines+markers',
+        line: { color: '#d8b4fe', width: 2.5 },
+        marker: { color: '#d8b4fe', size: 6, symbol: 'circle' } },
+    ], {
+      ...BASE,
+      xaxis: XDATE,
+      yaxis: {
+        ...YLIN,
+        title: { text: 'inHg', standoff: 4 },
+        ...(vMin != null ? { range: [vMin, vMax], autorange: false } : {}),
+      },
+    }, cfg)
 
   } catch (e) {
     chartsWrap.appendChild(h('div', { class: 'empty-state' }, 'Could not render charts: ' + e.message))
+  }
+}
+
+
+async function renderAdcpReportTab (dep, container) {
+  container.innerHTML = ''
+  container.style.padding = '16px 20px'
+
+  if (!dep) {
+    container.appendChild(h('div', { class: 'empty-state' }, 'Select a deployment.'))
+    return
+  }
+
+  let statusR
+  try {
+    statusR = await apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=false`)
+  } catch (e) {
+    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load AD2CP status: ' + e.message))
+    return
+  }
+
+  const shared = statusR.shared || {}
+  const runs   = statusR.runs   || {}
+  const baseQs = `dep=${encodeURIComponent(dep)}&is_test=false`
+
+  // Status summary row
+  const sharedDone = Object.values(shared).filter(s => s.done).length
+  const sharedTotal = Object.keys(shared).length
+  const summaryEl = h('div', { class: 'adcp-report-summary' },
+    h('span', { class: 'adcp-report-chip' }, `Shared stages: ${sharedDone}/${sharedTotal}`),
+    h('span', { class: 'adcp-report-chip' }, `Runs: ${Object.keys(runs).length}`),
+  )
+  container.appendChild(summaryEl)
+
+  const rptBtn = h('a', {
+    class: 'btn-secondary btn-sm',
+    href: `${API}/api/adcp/report-html?dep=${encodeURIComponent(dep)}`,
+  }, '⬇ Download AD2CP Report')
+  container.appendChild(h('div', { style: 'margin-bottom: 16px' }, rptBtn))
+
+  if (Object.keys(runs).length === 0) {
+    container.appendChild(h('div', { class: 'empty-state', style: 'margin-top:32px' },
+      h('div', { class: 'reports-empty-icon' }, '📡'),
+      h('div', { class: 'reports-empty-title' }, 'No AD2CP runs yet'),
+      h('div', { class: 'reports-empty-sub'   }, 'Run the AD2CP processing stages to generate plots.'),
+    ))
+    return
+  }
+
+  // Render each run
+  for (const [runLabel, runStatus] of Object.entries(runs)) {
+    const plotsGenerated = runStatus.generate_plots?.done
+    const runQs = `${baseQs}&run=${encodeURIComponent(runLabel)}`
+
+    const runEl = h('div', { class: 'adcp-report-run' })
+    const titleRow = h('div', { class: 'adcp-report-run-title' },
+      h('span', {}, runLabel),
+      h('a', { class: 'btn-secondary btn-sm',
+        href: `${API}/api/adcp/export?${runQs}` }, '⬇ Export ZIP'),
+    )
+    runEl.appendChild(titleRow)
+
+    const reportStagePlots = [
+      { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
+      { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
+                                           'shear_sections.png', 'backscatter.png',
+                                           'dac_timeseries.png', 'dac_map_cartopy.png'] },
+      { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
+      { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },
+    ]
+    const reportPlots = reportStagePlots.flatMap(({ stage, plots }) =>
+      runStatus[stage]?.done ? plots : [])
+
+    if (reportPlots.length > 0) {
+      const plotsArea = h('div', { class: 'adcp-plots-area', style: 'margin-top:12px' })
+      reportPlots.forEach(fn => {
+        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${runQs}`
+        const dlUrl = `${API}/api/adcp/download/${encodeURIComponent(fn)}?${runQs}`
+        const img   = h('img', { class: 'adcp-plot-img', src: url, alt: fn })
+        img.onerror = () => img.parentElement.remove()
+        const foot  = h('div', { class: 'adcp-plot-footer' },
+          h('span', {}, fn),
+          h('a', { class: 'btn-secondary btn-sm', href: dlUrl }, '⬇ Download'),
+        )
+        plotsArea.appendChild(h('div', { class: 'adcp-plot-wrap' }, img, foot))
+      })
+      runEl.appendChild(plotsArea)
+    } else {
+      runEl.appendChild(h('div', { class: 'adcp-files-missing', style: 'margin-top:8px' },
+        'Plots not yet generated for this run.'))
+    }
+
+    container.appendChild(runEl)
   }
 }
 
@@ -1621,13 +2303,40 @@ async function renderMetadata () {
     return
   }
 
-  const fileList = h('div', { class: 'meta-file-list' })
-  const content  = h('div', { class: 'meta-content' })
-  const grid     = h('div', { class: 'meta-grid' }, fileList, content)
+  const fileList    = h('div', { class: 'meta-file-list' })
+  const resizer     = h('div', { class: 'meta-resize-handle' })
+  const content     = h('div', { class: 'meta-content' })
+  const grid        = h('div', { class: 'meta-grid' }, fileList, resizer, content)
   page.appendChild(grid)
+
+  // Restore saved width
+  const savedWidth = parseInt(localStorage.getItem('metaListWidth'), 10)
+  fileList.style.width = (savedWidth && savedWidth >= 160 && savedWidth <= 520 ? savedWidth : 240) + 'px'
+
+  // Drag-to-resize
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault()
+    resizer.classList.add('dragging')
+    const startX     = e.clientX
+    const startWidth = fileList.getBoundingClientRect().width
+    const onMove = ev => {
+      const w = Math.min(520, Math.max(160, startWidth + ev.clientX - startX))
+      fileList.style.width = w + 'px'
+    }
+    const onUp = ev => {
+      resizer.classList.remove('dragging')
+      const w = Math.min(520, Math.max(160, startWidth + ev.clientX - startX))
+      localStorage.setItem('metaListWidth', w)
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup',   onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup',   onUp)
+  })
 
   // Group entries by top-level subdirectory
   const groupLabels = { science_profile: 'Profile', science_trajectory: 'Trajectory (Science)', trajectory_flight: 'Trajectory (Flight)' }
+  const GROUP_ORDER = ['science_profile', 'science_trajectory', 'trajectory_flight']
   const groups = {}
   entries.forEach(([rel, json]) => {
     const group = rel.split(/[\\/]/)[0]
@@ -1641,40 +2350,56 @@ async function renderMetadata () {
   const otherDeps = allDeps.filter(d => d !== dep)
 
   let firstEntry = null
-  Object.entries(groups).forEach(([group, items]) => {
+  GROUP_ORDER.forEach(group => {
+    const items = groups[group] || []
     fileList.appendChild(h('div', { class: 'meta-section-header' }, groupLabels[group] || group))
-    items.forEach(([rel, json]) => {
+
+    if (!items.length) {
+      fileList.appendChild(h('div', { class: 'meta-file-empty' }, 'No files yet'))
+    }
+
+    items.forEach(([rel, fileJson]) => {
       const filename = rel.split(/[\\/]/).pop()
       const isFirst  = firstEntry === null
-      if (isFirst) firstEntry = [rel, json]
+      if (isFirst) firstEntry = [rel, fileJson]
 
-      // Copy-from-deployment button (shown on hover)
-      const copyBtn = otherDeps.length
-        ? h('button', {
-            class: 'meta-file-copy',
-            title: `Copy ${filename} from another deployment…`,
-            onclick: async e => {
-              e.stopPropagation()
-              await _metaCopyFromPrev(dep, glider, rel, fileList, content)
-            }
-          }, '↩')
-        : null
-
-      // Import-from-disk button (shown on hover)
-      const importBtn = h('button', {
-        class: 'meta-file-import',
-        title: `Replace ${filename} with a file from disk…`,
+      // Single ⋯ menu button (shown on hover)
+      const menuBtn = h('button', {
+        class: 'meta-file-menu-btn',
+        title: 'File actions…',
         onclick: e => {
           e.stopPropagation()
-          _metaImportFileReplace(dep, rel, fileList, content)
+          const anchor = e.currentTarget
+          const actions = []
+          if (fileJson !== null) {
+            actions.push({ label: 'Copy to section…', action: () => _metaCopySectionPopover(anchor, dep, group, filename, fileJson, renderMetadata) })
+          }
+          actions.push({ label: 'Import from disk…', action: () => _metaImportFileReplace(dep, rel, fileList, content) })
+          if (otherDeps.length) {
+            actions.push({ label: 'Copy from deployment…', action: async () => _metaCopyFromPrev(dep, glider, rel, fileList, content) })
+          }
+          actions.push({ label: 'Delete', danger: true, action: async () => {
+            if (!confirm(`Delete ${filename} from ${groupLabels[group] || group}?\n\nThis cannot be undone.`)) return
+            try {
+              await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/delete`, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ path: rel }),
+              })
+              await renderMetadata()
+            } catch (ex) {
+              alert('Delete failed: ' + ex.message)
+            }
+          }})
+          _metaFileMenuPopover(e.currentTarget, actions)
         }
-      }, '↑')
+      }, '⋯')
 
       const item = h('div', {
         class: 'meta-file-item' + (isFirst ? ' active' : ''),
         'data-rel': rel,
-        onclick: () => selectMetaFile(rel, json, fileList, content, dep),
-      }, h('span', { class: 'meta-file-name' }, filename), importBtn, copyBtn)
+        onclick: () => selectMetaFile(rel, fileJson, fileList, content, dep),
+      }, h('span', { class: 'meta-file-name' }, filename), menuBtn)
       fileList.appendChild(item)
     })
   })
@@ -1774,6 +2499,77 @@ function _metaAddBar (dep) {
       onclick: () => _metaImportJsonFiles(dep) }, '↑ Import files'),
     h('button', { class: 'meta-add-action', title: 'Create a new blank config file',
       onclick: () => _metaNewFileModal(dep) }, '+ New file'))
+}
+
+/* Per-file ⋯ actions menu ───────────────────────────────────────────────────*/
+function _metaFileMenuPopover (anchor, actions) {
+  document.querySelectorAll('.meta-file-menu-popover').forEach(el => el.remove())
+
+  const pop = document.createElement('div')
+  pop.className = 'meta-file-menu-popover'
+
+  actions.forEach(({ label, danger, action }) => {
+    const item = document.createElement('button')
+    item.className = 'meta-file-menu-item' + (danger ? ' meta-file-menu-item--danger' : '')
+    item.textContent = label
+    item.addEventListener('click', e => {
+      e.stopPropagation()
+      pop.remove()
+      document.removeEventListener('mousedown', dismiss)
+      action()
+    })
+    pop.appendChild(item)
+  })
+
+  document.body.appendChild(pop)
+  const rect = anchor.getBoundingClientRect()
+  pop.style.top  = (rect.bottom + 4) + 'px'
+  pop.style.left = Math.min(rect.left, window.innerWidth - pop.offsetWidth - 8) + 'px'
+
+  function dismiss (e) { if (!pop.contains(e.target)) { pop.remove(); document.removeEventListener('mousedown', dismiss) } }
+  setTimeout(() => document.addEventListener('mousedown', dismiss), 0)
+}
+
+/* Copy a file to another section within the same deployment ─────────────────*/
+function _metaCopySectionPopover (anchor, dep, srcGroup, filename, fileJson, onDone) {
+  document.querySelectorAll('.meta-section-popover').forEach(el => el.remove())
+
+  const SECTION_LABELS = {
+    science_profile:   'Profile',
+    science_trajectory:'Trajectory (Science)',
+    trajectory_flight: 'Trajectory (Flight)',
+  }
+  const targets = Object.keys(SECTION_LABELS).filter(g => g !== srcGroup)
+
+  const rect    = anchor.getBoundingClientRect()
+  const popover = h('div', { class: 'meta-section-popover' })
+  popover.style.top  = `${rect.bottom + window.scrollY + 4}px`
+  popover.style.left = `${rect.left + window.scrollX}px`
+
+  targets.forEach(targetGroup => {
+    const opt = h('button', { class: 'meta-section-popover-item',
+      onclick: async e => {
+        e.stopPropagation()
+        popover.remove()
+        const targetPath = `${targetGroup}/${filename}`
+        try {
+          await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/save`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ path: targetPath, content: JSON.stringify(fileJson, null, 2) }),
+          })
+          await onDone()
+        } catch (ex) {
+          alert('Copy failed: ' + ex.message)
+        }
+      }
+    }, `→ ${SECTION_LABELS[targetGroup]}`)
+    popover.appendChild(opt)
+  })
+
+  document.body.appendChild(popover)
+  const close = e => { if (!popover.contains(e.target)) { popover.remove(); document.removeEventListener('click', close) } }
+  setTimeout(() => document.addEventListener('click', close), 0)
 }
 
 /* Copy ALL config files from another deployment into this one ────────────────*/
@@ -2075,9 +2871,9 @@ function renderMetaView (rel, jsonData, content, dep) {
     return
   }
 
-  const editBtn = h('button', { class: 'btn-primary', style: 'margin-bottom:10px',
+  const editBtn = h('button', { class: 'btn-primary',
     onclick: () => renderMetaEdit(rel, text, content, dep) }, 'Edit')
-  content.appendChild(editBtn)
+  content.appendChild(h('div', { class: 'meta-edit-bar' }, editBtn))
   content.appendChild(h('pre', {}, text))
 }
 
@@ -2142,8 +2938,17 @@ async function showManageSensorSets (dep) {
 
   const allSensors = data.all_sensors       // {name: {source, long_name, units}}
   const allNames   = Object.keys(allSensors).sort()
-  const datSet     = datData ? new Set(datData.sensors) : null  // sensors in actual DAT files
-  const datCount   = datSet ? datData.files_scanned : 0
+
+  // Per-source DAT sensor sets: merged → profile + traj science; flight → traj flight
+  const _merged = datData?.merged
+  const _flight = datData?.flight
+  const datSets = {
+    profile:           _merged ? { set: new Set(_merged.sensors), count: _merged.files_scanned } : null,
+    trajectory:        _merged ? { set: new Set(_merged.sensors), count: _merged.files_scanned } : null,
+    trajectory_flight: _flight ? { set: new Set(_flight.sensors), count: _flight.files_scanned } : null,
+  }
+
+  function getDat (tabKey) { return datSets[tabKey] || null }
 
   // Mutable working copies
   const selected = {
@@ -2157,6 +2962,9 @@ async function showManageSensorSets (dep) {
 
   function buildPane (tabKey) {
     const sel  = selected[tabKey]
+    const dat  = getDat(tabKey)
+    const datSet   = dat ? dat.set   : null
+    const datCount = dat ? dat.count : 0
     let search = ''
 
     // "My data only" toggle button
@@ -2282,16 +3090,25 @@ async function showManageSensorSets (dep) {
         btn.classList.add('active')
         paneContainer.innerHTML = ''
         paneContainer.appendChild(buildPane(key))
+        updateDatStatus()
       }
     }, TAB_LABELS[key])
     return btn
   })
 
-  // DAT status line
-  const datStatus = datSet
-    ? h('span', { class: 'ss-dat-status' },
-        `${datCount} DAT file${datCount !== 1 ? 's' : ''} scanned — ${datSet.size} sensors in your data`)
-    : h('span', { class: 'ss-dat-status ss-dat-status-none' }, 'No DAT files found for this deployment')
+  // DAT status line — updates when tab changes
+  const datStatus = h('span', {})
+  function updateDatStatus () {
+    const dat = getDat(activeTab)
+    if (dat && dat.count > 0) {
+      datStatus.className   = 'ss-dat-status'
+      datStatus.textContent = `${dat.count} DAT file${dat.count !== 1 ? 's' : ''} scanned — ${dat.set.size} sensors in your data`
+    } else {
+      datStatus.className   = 'ss-dat-status ss-dat-status-none'
+      datStatus.textContent = 'No DAT files found for this tab'
+    }
+  }
+  updateDatStatus()
 
   paneContainer.appendChild(buildPane(activeTab))
 
@@ -2311,7 +3128,7 @@ async function showManageSensorSets (dep) {
         })
         saveBtn.disabled = false; saveBtn.textContent = 'Save'
         statusEl.textContent = `Saved — ${r.profile_count} profile, ${r.traj_count} traj (sci), ${r.traj_flight_count} traj (flt) sensors. Run "Build Sensor Defs" to apply.`
-        statusEl.style.color = '#7ec8a0'
+        statusEl.style.color = '#1da462'
       } catch (e) {
         saveBtn.disabled = false; saveBtn.textContent = 'Save'
         statusEl.textContent = 'Error: ' + e.message
@@ -2375,6 +3192,7 @@ async function showBuildSensorDefs (dep) {
 
 function renderMetaEdit (rel, originalText, content, dep) {
   content.innerHTML = ''
+  content.scrollTop = 0
 
   const textarea = h('textarea', { class: 'meta-editor', spellcheck: 'false' })
   textarea.value = originalText
@@ -2453,6 +3271,7 @@ async function renderDatBrowser () {
     else if (key === 'traj-nc')    renderTrajNcTab(dep, tabBody)
     else if (key === 'qc-output')  renderQcOutputTab(dep, tabBody)
     else if (key === 'cac')        renderCacTab(tabBody)
+    else if (key === 'adcp')       renderAdcpFilesTab(dep, tabBody)
   }
 
   const tabBar = h('div', { class: 'files-tab-bar' },
@@ -2462,6 +3281,7 @@ async function renderDatBrowser () {
     h('button', { class: 'files-tab',        'data-tab': 'traj-nc',    onclick: () => setTab('traj-nc')    }, 'Trajectory NC'),
     h('button', { class: 'files-tab',        'data-tab': 'qc-output',  onclick: () => setTab('qc-output')  }, 'QC Output'),
     h('button', { class: 'files-tab',        'data-tab': 'cac',        onclick: () => setTab('cac')        }, 'CAC Files'),
+    h('button', { class: 'files-tab',        'data-tab': 'adcp',       onclick: () => setTab('adcp')       }, 'AD2CP'),
   )
 
   page.appendChild(tabBar)
@@ -2832,6 +3652,138 @@ async function renderCacTab (container) {
 }
 
 
+async function renderAdcpFilesTab (dep, container) {
+  container.innerHTML = ''
+
+  // Scrollable wrapper (tab body has overflow:hidden)
+  const scroll = h('div', { class: 'adcp-files-scroll' })
+  container.appendChild(scroll)
+
+  let statusR, inputR
+  try {
+    [statusR, inputR] = await Promise.all([
+      apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=false`),
+      apiFetch(`/api/adcp/files?dep=${encodeURIComponent(dep)}&is_test=false`),
+    ])
+  } catch (e) {
+    scroll.appendChild(h('div', { class: 'empty-state' }, 'Could not load AD2CP data: ' + e.message))
+    return
+  }
+
+  const shared = statusR.shared || {}
+  const runs   = statusR.runs   || {}
+  const baseQs = `dep=${encodeURIComponent(dep)}&is_test=false`
+
+  function fmtSize (n) {
+    if (!n) return ''
+    return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB`
+         : n >= 1e3 ? `${(n / 1e3).toFixed(0)} KB`
+         : `${n} B`
+  }
+
+  function extBadge (filename) {
+    const ext = filename.split('.').pop().toLowerCase()
+    return h('span', { class: `adcp-file-ext adcp-file-ext--${ext}` }, ext.toUpperCase())
+  }
+
+  function dlBtn (filename, run) {
+    const qs = run ? `${baseQs}&run=${encodeURIComponent(run)}` : baseQs
+    const a  = h('a', { class: 'btn-secondary btn-xs',
+      href: `${API}/api/adcp/download/${encodeURIComponent(filename)}?${qs}` }, '⬇')
+    a.setAttribute('download', filename)
+    return a
+  }
+
+  // fileInfo is {exists, size} (new API) or bool (legacy fallback)
+  function fileRow (filename, fileInfo, run) {
+    const exists = (typeof fileInfo === 'object') ? fileInfo.exists : !!fileInfo
+    const size   = (typeof fileInfo === 'object') ? fileInfo.size   : 0
+    return h('div', { class: `adcp-file-row${exists ? '' : ' adcp-file-row--missing'}` },
+      extBadge(filename),
+      h('span', { class: 'adcp-file-name' }, filename),
+      exists
+        ? h('span', { class: 'adcp-file-size' }, fmtSize(size))
+        : h('span', { class: 'adcp-file-pending' }, 'not yet generated'),
+      exists ? dlBtn(filename, run) : h('span', {}),
+    )
+  }
+
+  function buildSection (title, subtitle, bodyEl, actionEl) {
+    const sec = h('div', { class: 'adcp-files-section' },
+      h('div', { class: 'adcp-section-header' },
+        h('div', { class: 'adcp-section-header-left' },
+          h('span', { class: 'adcp-section-title' }, title),
+          subtitle ? h('span', { class: 'adcp-section-count' }, subtitle) : null,
+        ),
+        actionEl || null,
+      ),
+      bodyEl,
+    )
+    return sec
+  }
+
+  function fileList (rows) {
+    if (!rows.length) return h('div', { class: 'adcp-file-empty' }, 'No files yet.')
+    const list = h('div', { class: 'adcp-file-list' })
+    rows.forEach(r => list.appendChild(r))
+    return list
+  }
+
+  // ── Input files ─────────────────────────────────────────────────────────────
+  const inputFiles = inputR.files || []
+  const inputRows = inputFiles.map(fn => h('div', { class: 'adcp-file-row' },
+    h('span', { class: 'adcp-file-ext adcp-file-ext--nc' }, 'NC'),
+    h('span', { class: 'adcp-file-name' }, fn),
+    h('span', {}), h('span', {}),
+  ))
+  if (!inputFiles.length) inputRows.push(
+    h('div', { class: 'adcp-file-empty' }, 'No AD2CP .nc files imported yet.'))
+  scroll.appendChild(buildSection(
+    'Input Files', `${inputFiles.length} file${inputFiles.length !== 1 ? 's' : ''}`,
+    fileList(inputRows)))
+
+  // ── Shared processing files ──────────────────────────────────────────────────
+  const sharedDefs = [
+    { stage: 'load_nc',         file: 'adcp_glider_combined.csv'           },
+    { stage: 'gps_pairing',     file: 'gps_data.npz'                       },
+    { stage: 'write_glider_nc', file: 'glider_ad2cp_datetime_timecoord.nc' },
+  ]
+  scroll.appendChild(buildSection('Shared Processing Files', null,
+    fileList(sharedDefs.map(({ stage, file }) =>
+      fileRow(file, shared[stage]?.files?.[file] ?? false, null)))))
+
+  // ── Per-run sections (grouped by stage) ─────────────────────────────────────
+  const stageGroups = [
+    { stage: 'process_shear',    label: 'Process Shear',    files: ['shear_processed.nc'] },
+    { stage: 'compute_currents', label: 'Compute Currents', files: ['currents.nc', 'dac.npz'] },
+    { stage: 'bias_correction',  label: 'Bias Correction',  files: ['currents_bias_corrected.nc', 'bias_diagnostic.png'] },
+    { stage: 'generate_plots',   label: 'Generate Plots',   files: ['velocity_sections.png', 'speed_section.png', 'shear_sections.png', 'backscatter.png', 'dac_timeseries.png', 'dac_map_cartopy.png'] },
+    { stage: 'tidal_filter',     label: 'Tidal Filter',     files: ['currents_subtidal.nc', 'tidal_filter.png'] },
+    { stage: 'diagnostics',      label: 'Diagnostics',      files: ['eke.png', 'transport.png', 'richardson_number.png'] },
+  ]
+
+  if (Object.keys(runs).length === 0) {
+    scroll.appendChild(buildSection('Processing Runs', 'no runs yet',
+      h('div', { class: 'adcp-file-empty' }, 'No processing runs completed yet.')))
+  } else {
+    Object.entries(runs).forEach(([runLabel, runStatus]) => {
+      const zipBtn = h('a', { class: 'btn-primary btn-xs',
+        href: `${API}/api/adcp/export?${baseQs}&run=${encodeURIComponent(runLabel)}` },
+        '⬇ Export ZIP')
+
+      const list = h('div', { class: 'adcp-file-list' })
+      stageGroups.forEach(({ stage, label, files }) => {
+        list.appendChild(h('div', { class: 'adcp-stage-divider' }, label))
+        files.forEach(file =>
+          list.appendChild(fileRow(file, runStatus[stage]?.files?.[file] ?? false, runLabel)))
+      })
+
+      scroll.appendChild(buildSection(`Run: ${runLabel}`, null, list, zipBtn))
+    })
+  }
+}
+
+
 /* ── Logs page ───────────────────────────────────────────────────────────────*/
 function formatBytes (bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -2991,6 +3943,1443 @@ async function renderLogs () {
   renderTable()
 }
 
+/* ── Folder Picker Modal ─────────────────────────────────────────────────────*/
+/**
+ * Opens a modal that lets the user browse, create, and rename folders on the
+ * connected cloud service, then pick a destination.
+ *
+ * @param {string}   service   'google' | 'dropbox'
+ * @param {function} onConfirm Called with { id, path } when user clicks Upload Here
+ * @param {object}   options   Optional: { catId } for per-category localStorage memory
+ */
+function showFolderPicker (service, onConfirm, options = {}) {
+  const lsKey    = options.catId ? `cloud_dest_${service}_${options.catId}` : null
+  const savedRaw = lsKey ? localStorage.getItem(lsKey) : null
+  let   savedDest = null
+  try { if (savedRaw) savedDest = JSON.parse(savedRaw) } catch (_) {}
+
+  const serviceLabel = service === 'google' ? 'Google Drive' : 'Dropbox'
+
+  // State
+  let breadcrumb = [service === 'google'
+    ? { id: 'root', name: 'My Drive' }
+    : { id: '',     name: 'Dropbox'  }]
+  let folders    = []
+  let renamingId = null
+  let loading    = false
+
+  // DOM refs updated by multiple render sub-functions
+  let folderListEl = null
+  let breadcrumbEl = null
+  let footerDestEl = null
+
+  const overlay = h('div', { class: 'modal-overlay' })
+  const modal   = h('div', { class: 'folder-picker-modal' })
+  overlay.appendChild(modal)
+  document.body.appendChild(overlay)
+
+  function currentId   () { return breadcrumb[breadcrumb.length - 1].id }
+  function currentPath () { return breadcrumb.map(b => b.name).join(' / ') }
+
+  // ── Render folder rows ──────────────────────────────────────────────────────
+  function renderFolderRows () {
+    if (!folderListEl) return
+    folderListEl.innerHTML = ''
+
+    if (loading) {
+      folderListEl.appendChild(h('div', { class: 'fp-empty' }, '⏳ Loading…'))
+      return
+    }
+    if (!folders.length) {
+      folderListEl.appendChild(h('div', { class: 'fp-empty' }, '(No subfolders here)'))
+      return
+    }
+
+    folders.forEach(f => {
+      const row = h('div', { class: 'fp-folder-row' })
+
+      if (renamingId === f.id) {
+        // ── Inline rename ─────────────────────────────────────────────────────
+        const inp = h('input', { type: 'text', class: 'fp-rename-input' })
+        inp.value = f.name
+        inp.addEventListener('click', e => e.stopPropagation())
+
+        const doSave = async e => {
+          e.stopPropagation()
+          const nm = inp.value.trim()
+          if (!nm || nm === f.name) { renamingId = null; renderFolderRows(); return }
+          try {
+            const r = await apiFetch(`/api/cloud/folders/${service}/rename`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: f.id, name: nm }),
+            })
+            f.id   = r.id
+            f.name = r.name
+          } catch (err) { alert('Rename failed: ' + err.message) }
+          renamingId = null
+          renderFolderRows()
+          renderBreadcrumb()
+          renderFooterDest()
+        }
+        inp.addEventListener('keydown', e => { if (e.key === 'Enter') doSave(e) })
+
+        row.appendChild(h('span', { class: 'fp-folder-icon' }, '📁'))
+        row.appendChild(inp)
+        row.appendChild(h('button', {
+          class: 'btn-secondary fp-rename-btn', onclick: doSave,
+        }, 'Save'))
+        row.appendChild(h('button', {
+          class: 'btn-secondary fp-rename-btn',
+          onclick: e => { e.stopPropagation(); renamingId = null; renderFolderRows() },
+        }, '✕'))
+
+      } else {
+        // ── Normal row ────────────────────────────────────────────────────────
+        row.appendChild(h('span', { class: 'fp-folder-icon' }, '📁'))
+        row.appendChild(h('span', { class: 'fp-folder-name' }, f.name))
+        row.appendChild(h('button', {
+          class: 'fp-rename-trigger',
+          onclick: e => { e.stopPropagation(); renamingId = f.id; renderFolderRows() },
+        }, 'Rename'))
+        row.addEventListener('click', () => {
+          breadcrumb.push({ id: f.id, name: f.name })
+          renamingId = null
+          loadFolders(f.id)
+          renderBreadcrumb()
+          renderFooterDest()
+        })
+      }
+      folderListEl.appendChild(row)
+    })
+  }
+
+  // ── Render breadcrumb ───────────────────────────────────────────────────────
+  function renderBreadcrumb () {
+    if (!breadcrumbEl) return
+    breadcrumbEl.innerHTML = ''
+    breadcrumb.forEach((b, i) => {
+      if (i > 0) breadcrumbEl.appendChild(h('span', { class: 'fp-bc-sep' }, ' / '))
+      breadcrumbEl.appendChild(h('span', {
+        class: `fp-bc-seg${i === breadcrumb.length - 1 ? ' active' : ''}`,
+        onclick: () => {
+          if (i === breadcrumb.length - 1) return
+          breadcrumb = breadcrumb.slice(0, i + 1)
+          renamingId = null
+          loadFolders(currentId())
+          renderBreadcrumb()
+          renderFooterDest()
+        },
+      }, b.name))
+    })
+  }
+
+  function renderFooterDest () {
+    if (footerDestEl) footerDestEl.textContent = `Upload to: ${currentPath()}`
+  }
+
+  // ── Load folders from API ───────────────────────────────────────────────────
+  async function loadFolders (parentId) {
+    loading = true
+    renderFolderRows()
+    try {
+      const r = await apiFetch(
+        `/api/cloud/folders/${service}?parent=${encodeURIComponent(parentId)}`)
+      folders = r.folders || []
+    } catch (err) {
+      folders = []
+      if (folderListEl) {
+        folderListEl.innerHTML = ''
+        folderListEl.appendChild(h('div', { class: 'fp-empty' }, '⚠ ' + err.message))
+      }
+      loading = false
+      return
+    }
+    loading = false
+    renderFolderRows()
+  }
+
+  // ── Build modal DOM ─────────────────────────────────────────────────────────
+  // Header
+  modal.appendChild(h('div', { class: 'fp-header' },
+    h('span', {}, `Choose Folder — ${serviceLabel}`),
+    h('button', { class: 'fp-close', onclick: () => overlay.remove() }, '×')
+  ))
+
+  // Breadcrumb bar
+  breadcrumbEl = h('div', { class: 'fp-breadcrumb' })
+  modal.appendChild(breadcrumbEl)
+  renderBreadcrumb()
+
+  // "Last used" banner (shown only when a saved destination exists)
+  if (savedDest) {
+    const banner = h('div', { class: 'fp-saved-dest' },
+      `📌 Last used: ${savedDest.path}`,
+      h('button', { class: 'btn-secondary btn-sm',
+        style: 'margin-left:10px',
+        onclick: () => {
+          breadcrumb = savedDest.breadcrumb || [
+            service === 'google'
+              ? { id: 'root', name: 'My Drive' }
+              : { id: '',     name: 'Dropbox'  }
+          ]
+          renderBreadcrumb()
+          renderFooterDest()
+          loadFolders(currentId())
+        },
+      }, 'Jump here')
+    )
+    modal.appendChild(banner)
+  }
+
+  // Folder list (scrollable)
+  folderListEl = h('div', { class: 'folder-list' })
+  modal.appendChild(folderListEl)
+
+  // New folder input row
+  const newFolderInput = h('input', {
+    type: 'text', class: 'fp-new-folder-input',
+    placeholder: 'New folder name…',
+  })
+  const addBtn = h('button', { class: 'btn-secondary',
+    onclick: async () => {
+      const name = newFolderInput.value.trim()
+      if (!name) return
+      addBtn.disabled = true
+      try {
+        const r = await apiFetch(`/api/cloud/folders/${service}/create`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, parent: currentId() }),
+        })
+        newFolderInput.value = ''
+        folders.push({ id: r.id, name: r.name })
+        folders.sort((a, b) => a.name.localeCompare(b.name))
+        renderFolderRows()
+      } catch (err) { alert('Could not create folder: ' + err.message) }
+      finally { addBtn.disabled = false }
+    },
+  }, '+ New Folder')
+  modal.appendChild(h('div', { class: 'fp-new-folder-row' }, newFolderInput, addBtn))
+
+  // Footer (path display + action buttons)
+  footerDestEl = h('div', { class: 'fp-dest' })
+  renderFooterDest()
+  modal.appendChild(h('div', { class: 'fp-footer' },
+    footerDestEl,
+    h('div', { class: 'fp-footer-btns' },
+      h('button', { class: 'btn-secondary', onclick: () => overlay.remove() }, 'Cancel'),
+      h('button', { class: 'btn-primary',
+        onclick: () => {
+          overlay.remove()
+          const dest = { id: currentId(), path: currentPath(), breadcrumb: [...breadcrumb] }
+          if (lsKey) localStorage.setItem(lsKey, JSON.stringify(dest))
+          onConfirm(dest)
+        },
+      }, 'Upload Here')
+    )
+  ))
+
+  // Kick off initial load
+  loadFolders(breadcrumb[0].id)
+}
+
+
+/* ── Cloud Storage page ──────────────────────────────────────────────────────*/
+async function renderCloud () {
+  const page = document.getElementById('page-cloud')
+  page.innerHTML = ''
+  page.style.overflowY = 'auto'
+
+  page.appendChild(h('div', { class: 'page-header' },
+    h('h1', {}, 'Cloud Storage'),
+    h('p',  {}, 'Connect Google Drive or Dropbox to upload reports and data files.')
+  ))
+
+  const body = h('div', { class: 'page-body' })
+  page.appendChild(body)
+
+  // ── Helper: open OAuth URL in the system browser ──────────────────────────
+  function openUrl (url) {
+    if (window.APP?.openUrl) window.APP.openUrl(url)
+    else window.open(url, '_blank')
+  }
+
+  // ── Helper: poll until the account becomes connected (max 90 s) ───────────
+  // Returns a cancel function that stops polling and resets the card.
+  function pollUntilConnected (service, onConnect, onCancel) {
+    let tries = 0
+    const iv = setInterval(async () => {
+      tries++
+      if (tries > 45) { clearInterval(iv); onCancel?.(); return }
+      try {
+        const ac = await apiFetch('/api/cloud/accounts')
+        if (ac[service]?.connected) { clearInterval(iv); onConnect(ac) }
+      } catch (_) {}
+    }, 2000)
+    return () => clearInterval(iv)
+  }
+
+  // ── Helper: show "Waiting…" spinner + Cancel button inside a card body ────
+  function showWaiting (cardBody, service, onCancel) {
+    cardBody.innerHTML = ''
+    cardBody.appendChild(h('div', { class: 'cloud-polling' }, '⏳ Waiting for sign-in…'))
+    cardBody.appendChild(h('button', {
+      class: 'btn-secondary', style: 'margin-top:4px',
+      onclick: () => { onCancel(); }
+    }, 'Cancel / Try Again'))
+  }
+
+  // ── Build a service card ──────────────────────────────────────────────────
+  function buildServiceCard (service, label, logoText, acctInfo) {
+    const card = h('div', { class: 'cloud-card' })
+
+    // Header row
+    card.appendChild(h('div', { class: 'cloud-card-header' },
+      h('span', { class: 'cloud-logo' }, logoText),
+      h('span', { class: 'cloud-label' }, label)
+    ))
+
+    const cardBody = h('div', { class: 'cloud-card-body' })
+    card.appendChild(cardBody)
+
+    function renderCardBody (info) {
+      cardBody.innerHTML = ''
+
+      if (info.connected) {
+        // ── Connected ────────────────────────────────────────────────────────
+        cardBody.appendChild(h('div', { class: 'cloud-account-row' },
+          h('span', { class: 'cloud-dot connected' }),
+          h('div', {},
+            h('div', { class: 'cloud-account-email' }, info.email || 'Connected'),
+            info.name ? h('div', { class: 'cloud-account-name' }, info.name) : null
+          )
+        ))
+        cardBody.appendChild(h('div', { class: 'cloud-btn-row' },
+          h('button', { class: 'btn-danger',
+            onclick: async () => {
+              await apiFetch('/api/cloud/disconnect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service }),
+              })
+              renderCardBody({ connected: false, has_creds: info.has_creds })
+            }
+          }, 'Disconnect'),
+          h('button', { class: 'btn-secondary',
+            onclick: async () => {
+              // Switch = disconnect then re-auth
+              await apiFetch('/api/cloud/disconnect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service }),
+              })
+              const r = await apiFetch(`/api/oauth/${service}/start`)
+              openUrl(r.url)
+              const cancelPoll = pollUntilConnected(service,
+                ac  => renderCardBody(ac[service]),
+                ()  => renderCardBody({ connected: false, has_creds: true })
+              )
+              showWaiting(cardBody, service, () => {
+                cancelPoll()
+                renderCardBody({ connected: false, has_creds: true })
+              })
+            }
+          }, 'Switch Account')
+        ))
+
+      } else if (info.has_creds) {
+        // ── Has credentials but not connected ────────────────────────────────
+        cardBody.appendChild(h('div', { class: 'cloud-account-row' },
+          h('span', { class: 'cloud-dot disconnected' }),
+          h('span', { class: 'cloud-account-email', style: 'color:#6b7a8d' }, 'Not connected')
+        ))
+        const connectLabel = service === 'google' ? 'Connect to Google Drive' : 'Connect to Dropbox'
+        cardBody.appendChild(h('button', { class: 'btn-primary cloud-connect-btn',
+          onclick: async () => {
+            const r = await apiFetch(`/api/oauth/${service}/start`)
+            // If the server returned the redirect URI, show it so the user can
+            // verify it exactly matches what's registered in the provider console.
+            if (r.redirect_uri) {
+              cardBody.innerHTML = ''
+              cardBody.appendChild(h('p', { class: 'cloud-setup-note' },
+                'Make sure this URI is registered exactly in your app console:'))
+              const uriEl = h('code', { class: 'cloud-config-path',
+                style: 'cursor:pointer; user-select:all',
+                title: 'Click to copy' })
+              uriEl.textContent = r.redirect_uri
+              uriEl.onclick = () => navigator.clipboard.writeText(r.redirect_uri)
+              cardBody.appendChild(uriEl)
+              cardBody.appendChild(h('br'))
+              await new Promise(res => setTimeout(res, 1500))
+            }
+            openUrl(r.url)
+            const cancelPoll = pollUntilConnected(service,
+              ac => renderCardBody(ac[service]),
+              ()  => renderCardBody({ connected: false, has_creds: true })
+            )
+            showWaiting(cardBody, service, () => {
+              cancelPoll()
+              renderCardBody({ connected: false, has_creds: true })
+            })
+          }
+        }, connectLabel))
+
+      } else {
+        // ── Credentials not found in config file ─────────────────────────────
+        const configPath = 'config/cloud/credentials.json'
+        const snippet = service === 'google'
+          ? `{\n  "google": {\n    "client_id": "…",\n    "client_secret": "…"\n  }\n}`
+          : `{\n  "dropbox": {\n    "app_key": "…"\n  }\n}`
+
+        cardBody.appendChild(h('div', { class: 'cloud-setup-note' },
+          `${label} credentials not found. Add them to:`))
+        cardBody.appendChild(h('code', { class: 'cloud-config-path' }, configPath))
+        cardBody.appendChild(h('pre',  { class: 'cloud-config-snippet' }, snippet))
+        cardBody.appendChild(h('p', { class: 'cloud-setup-note' },
+          'Restart the app after saving the file.'))
+      }
+    }
+
+    renderCardBody(acctInfo)
+    return card
+  }
+
+  // ── Load account state and render cards ───────────────────────────────────
+  let accounts
+  try {
+    accounts = await apiFetch('/api/cloud/accounts')
+  } catch (e) {
+    body.appendChild(h('div', { class: 'empty-state' },
+      'Could not load cloud status: ' + e.message))
+    return
+  }
+
+  const cardsRow = h('div', { class: 'cloud-cards-row' })
+  body.appendChild(cardsRow)
+  cardsRow.appendChild(buildServiceCard('google',  'Google Drive',
+    '🔵', accounts.google))
+  cardsRow.appendChild(buildServiceCard('dropbox', 'Dropbox',
+    '🔷', accounts.dropbox))
+
+  // ── Upload section (only shown if at least one service is connected) ───────
+  const anyConnected = accounts.google.connected || accounts.dropbox.connected
+  if (!anyConnected || !state.deployment) return
+
+  body.appendChild(h('div', { class: 'cloud-section-title' }, 'Upload Files'))
+
+  // Load file categories from server
+  let catData = {}
+  try {
+    const r = await apiFetch(`/api/cloud/files/${encodeURIComponent(state.deployment)}`)
+    catData = r.categories || {}
+  } catch (e) {
+    body.appendChild(h('div', { class: 'empty-state' }, 'Could not list files: ' + e.message))
+    return
+  }
+
+  const UPLOAD_CATEGORIES = [
+    { id: 'dat_flight', label: 'Flight DAT Files'     },
+    { id: 'dat_merged', label: 'Merged DAT Files'     },
+    { id: 'profile',    label: 'Profile NC'           },
+    { id: 'traj',       label: 'Trajectory NC'        },
+    { id: 'qc',         label: 'QC Reporting'         },
+    { id: 'qc_nc',      label: 'QC Output NC'         },
+    { id: 'plots',      label: 'QC Plots'             },
+    { id: 'adcp',       label: 'AD2CP Files & Plots'  },
+  ]
+
+  function fmtSize (n) {
+    return n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB`
+         : n >= 1e3 ? `${(n / 1e3).toFixed(0)} KB`
+         : `${n} B`
+  }
+
+  function askConflictMode (statusEl, total, totalBytes) {
+    return new Promise(resolve => {
+      statusEl.innerHTML = ''
+      statusEl.appendChild(h('div', { class: 'upload-conflict-prompt' },
+        h('div', { class: 'upload-conflict-summary' },
+          `${total} file${total === 1 ? '' : 's'} · ${fmtSize(totalBytes)}`),
+        h('div', { class: 'upload-conflict-text' },
+          'What should happen if a file already exists at the destination?'),
+        h('div', { class: 'cloud-btn-row', style: 'margin-top:8px; flex-wrap:wrap' },
+          h('button', { class: 'btn-primary btn-sm',
+            onclick: () => resolve('overwrite') }, 'Overwrite All'),
+          h('button', { class: 'btn-secondary btn-sm',
+            onclick: () => resolve('skip') }, 'Skip Duplicates'),
+          h('button', { class: 'btn-secondary btn-sm',
+            onclick: () => resolve(null) }, 'Cancel')
+        )
+      ))
+    })
+  }
+
+  // fileObjs: [{path, size, label}]  destPath: human-readable folder path
+  // options.conflict: pre-set conflict mode ('overwrite'|'skip') — skips the prompt
+  async function doUploadWithStatus (svc, fileObjs, destId, destPath, statusEl, options = {}) {
+    const total      = fileObjs.length
+    const totalBytes = fileObjs.reduce((s, f) => s + (f.size || 0), 0)
+    const paths      = fileObjs.map(f => f.path)
+    if (!total) return
+
+    const conflict = options.conflict != null
+      ? options.conflict
+      : await askConflictMode(statusEl, total, totalBytes)
+    if (conflict === null) { statusEl.innerHTML = ''; return }
+
+    // Build progress UI
+    statusEl.innerHTML = ''
+    const wrap     = h('div', { class: 'upload-progress-wrap' })
+    const barOuter = h('div', { class: 'upload-progress-bar' })
+    const barFill  = h('div', { class: 'upload-progress-fill' })
+    barOuter.appendChild(barFill)
+    const counter = h('div', { class: 'upload-progress-counter' }, `0 / ${total}`)
+    const curFile = h('div', { class: 'upload-progress-file' }, '…')
+    wrap.appendChild(barOuter)
+    wrap.appendChild(counter)
+    wrap.appendChild(curFile)
+    statusEl.appendChild(wrap)
+
+    let cancelled = false
+    const cancelBtn = h('button', { class: 'btn-secondary btn-sm',
+      style: 'margin-top:6px',
+      onclick: () => { cancelled = true; cancelBtn.disabled = true; cancelBtn.textContent = 'Cancelling…' },
+    }, 'Cancel')
+    statusEl.appendChild(cancelBtn)
+
+    const CONCURRENCY  = 4
+    const MAX_RETRIES  = 2
+    const RETRY_DELAY  = 1500  // ms; multiplied by attempt number
+    let queueIndex = 0, completed = 0, ok = 0, failed = 0, skipped = 0
+
+    async function tryUpload (path) {
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          return await apiFetch('/api/cloud/upload', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: svc, files: [path], dest: destId, conflict }),
+          })
+        } catch (err) {
+          if (attempt === MAX_RETRIES) throw err
+          await new Promise(r => setTimeout(r, RETRY_DELAY * (attempt + 1)))
+        }
+      }
+    }
+
+    curFile.textContent = `Uploading up to ${Math.min(CONCURRENCY, total)} files in parallel…`
+
+    const workers = Array.from({ length: Math.min(CONCURRENCY, total) }, async () => {
+      while (!cancelled) {
+        const i = queueIndex++
+        if (i >= total) break
+        try {
+          const r = await tryUpload(paths[i])
+          if (r.skipped) skipped++; else ok++
+        } catch (_) { failed++ }
+        completed++
+        barFill.style.width = `${Math.round((completed / total) * 100)}%`
+        counter.textContent = `${completed} / ${total}`
+        curFile.textContent = paths[i].split(/[\\/]/).pop()
+      }
+    })
+    await Promise.all(workers)
+
+    // Final state
+    barFill.style.width = '100%'
+    const parts = []
+    if (ok)      parts.push(`${ok} uploaded`)
+    if (skipped) parts.push(`${skipped} skipped`)
+    if (failed)  parts.push(`${failed} failed`)
+    counter.textContent = parts.join(', ') || 'Done'
+    curFile.textContent = cancelled ? 'Cancelled.' : ''
+    cancelBtn.remove()
+    if (!cancelled && !failed) barFill.style.background = '#4ade80'
+    else if (failed)           barFill.style.background = '#f87171'
+
+    if (!cancelled) addHistory({ ts: Date.now(), service: svc, dest: destPath || destId,
+      total, ok, skipped, failed })
+  }
+
+  function buildCategorySection (catId, catLabel, files) {
+    let expanded          = false
+    let rendered          = false
+    let currentVisible    = []
+    let currentFilterTerm = ''
+    const checkedPaths    = new Set()
+
+    let sectionStatusEl
+    let catBody
+
+    const section = h('div', { class: 'cloud-cat-section' })
+
+    // ── Header ──────────────────────────────────────────────────────────────
+    const toggleIcon   = h('span', { class: 'cloud-cat-toggle' }, '▶')
+    const countEl      = h('span', { class: 'cloud-cat-count' }, `${files.length} files`)
+    const uploadAllRow = h('div',  { class: 'cloud-cat-upload-all' })
+
+    // Select-all checkbox in header
+    const headerCb = h('input', { type: 'checkbox', class: 'cloud-header-cb',
+      title: 'Select / deselect all visible files' })
+    headerCb.addEventListener('click', e => {
+      e.stopPropagation()
+      if (!expanded) expandSection()
+      const allSel = currentVisible.length > 0
+        && currentVisible.every(f => checkedPaths.has(f.path))
+      currentVisible.forEach(f => {
+        if (allSel) checkedPaths.delete(f.path)
+        else        checkedPaths.add(f.path)
+      })
+      if (rendered) renderFiles(currentFilterTerm)
+      updateSelBtns()
+    })
+
+    function updateHeaderCb () {
+      if (!currentVisible.length) {
+        headerCb.checked = false; headerCb.indeterminate = false; return
+      }
+      const n = currentVisible.filter(f => checkedPaths.has(f.path)).length
+      headerCb.indeterminate = n > 0 && n < currentVisible.length
+      headerCb.checked       = n === currentVisible.length
+    }
+
+    function expandSection () {
+      if (!expanded) {
+        expanded = true
+        toggleIcon.textContent = '▼'
+        catBody.style.display  = ''
+        if (!rendered) { renderFiles(); rendered = true }
+      }
+    }
+
+    function makeUploadAllBtn (svc, btnLabel) {
+      return h('button', { class: 'btn-secondary btn-sm',
+        onclick: e => {
+          e.stopPropagation()
+          if (!files.length) return
+          expandSection()
+          showFolderPicker(svc, dest => {
+            doUploadWithStatus(svc, files, dest.id, dest.path, sectionStatusEl)
+          }, { catId })
+        },
+      }, btnLabel)
+    }
+
+    function makeResumeBtn (svc, btnLabel) {
+      return h('button', { class: 'btn-secondary btn-sm',
+        onclick: async e => {
+          e.stopPropagation()
+          if (!files.length) return
+          expandSection()
+          showFolderPicker(svc, async dest => {
+            sectionStatusEl.innerHTML = ''
+            sectionStatusEl.appendChild(
+              h('div', { class: 'cloud-resume-checking' }, '⏳ Checking destination…'))
+            try {
+              const r = await apiFetch(
+                `/api/cloud/existing?service=${svc}&dest=${encodeURIComponent(dest.id)}`)
+              const existingSet = new Set(r.filenames.map(n => n.toLowerCase()))
+              const missing = files.filter(
+                f => !existingSet.has(f.path.split(/[\\/]/).pop().toLowerCase()))
+
+              sectionStatusEl.innerHTML = ''
+              if (!missing.length) {
+                sectionStatusEl.appendChild(
+                  h('div', { class: 'cloud-resume-info' },
+                    `✓ All ${files.length} files are already at the destination.`))
+                return
+              }
+
+              const alreadyDone = files.length - missing.length
+              sectionStatusEl.appendChild(
+                h('div', { class: 'cloud-resume-info' },
+                  `${alreadyDone} already at destination · uploading ${missing.length} missing files…`))
+
+              // Auto-select the missing files so checkboxes reflect resume state
+              checkedPaths.clear()
+              missing.forEach(f => checkedPaths.add(f.path))
+              if (rendered) renderFiles(currentFilterTerm)
+              updateSelBtns()
+
+              doUploadWithStatus(svc, missing, dest.id, dest.path, sectionStatusEl,
+                { conflict: 'overwrite' })
+            } catch (err) {
+              sectionStatusEl.innerHTML = ''
+              sectionStatusEl.appendChild(
+                h('div', { class: 'cloud-resume-info error' },
+                  '⚠ Could not check destination: ' + err.message))
+            }
+          }, { catId })
+        },
+      }, btnLabel)
+    }
+
+    if (accounts.google.connected) {
+      uploadAllRow.appendChild(makeUploadAllBtn('google', '⬆ Drive'))
+      uploadAllRow.appendChild(makeResumeBtn('google', '↺ Drive'))
+    }
+    if (accounts.dropbox.connected) {
+      uploadAllRow.appendChild(makeUploadAllBtn('dropbox', '⬆ Dropbox'))
+      uploadAllRow.appendChild(makeResumeBtn('dropbox', '↺ Dropbox'))
+    }
+
+    const header = h('div', { class: 'cloud-cat-header' },
+      headerCb, toggleIcon, h('span', { class: 'cloud-cat-label' }, catLabel), countEl,
+      uploadAllRow)
+    section.appendChild(header)
+
+    // ── Body (lazy render, shown on first expand) ────────────────────────────
+    catBody = h('div', { class: 'cloud-cat-body', style: 'display:none' })
+    section.appendChild(catBody)
+
+    const searchInput = h('input', { type: 'text', class: 'cloud-search',
+      placeholder: `Search ${catLabel}…` })
+    catBody.appendChild(searchInput)
+
+    const fileListEl = h('div', { class: 'cloud-cat-file-list' })
+    catBody.appendChild(fileListEl)
+
+    const selBtnsRow = h('div', { class: 'cloud-btn-row', style: 'margin-top:8px' })
+    catBody.appendChild(selBtnsRow)
+
+    sectionStatusEl = h('div', { class: 'cloud-upload-status' })
+    catBody.appendChild(sectionStatusEl)
+
+    function updateSelBtns () {
+      selBtnsRow.innerHTML = ''
+      const n = checkedPaths.size
+      if (!n) return
+      if (accounts.google.connected)
+        selBtnsRow.appendChild(h('button', { class: 'btn-primary btn-sm',
+          onclick: () => showFolderPicker('google', dest => {
+            const sel = files.filter(f => checkedPaths.has(f.path))
+            doUploadWithStatus('google', sel, dest.id, dest.path, sectionStatusEl)
+          }, { catId }),
+        }, `⬆ Upload ${n} to Drive`))
+      if (accounts.dropbox.connected)
+        selBtnsRow.appendChild(h('button', { class: 'btn-primary btn-sm',
+          onclick: () => showFolderPicker('dropbox', dest => {
+            const sel = files.filter(f => checkedPaths.has(f.path))
+            doUploadWithStatus('dropbox', sel, dest.id, dest.path, sectionStatusEl)
+          }, { catId }),
+        }, `⬆ Upload ${n} to Dropbox`))
+    }
+
+    function renderFiles (filterTerm) {
+      currentFilterTerm = filterTerm || ''
+      fileListEl.innerHTML = ''
+      const term = currentFilterTerm.toLowerCase()
+      currentVisible = files.filter(f => !term || f.label.toLowerCase().includes(term))
+      updateHeaderCb()
+
+      if (!currentVisible.length) {
+        fileListEl.appendChild(h('div', { class: 'fp-empty' },
+          term ? 'No files match search.' : 'No files in this category.'))
+        return
+      }
+
+      currentVisible.forEach(f => {
+        const cb = h('input', { type: 'checkbox' })
+        cb.checked = checkedPaths.has(f.path)
+        cb.addEventListener('change', () => {
+          if (cb.checked) checkedPaths.add(f.path)
+          else            checkedPaths.delete(f.path)
+          updateSelBtns()
+          updateHeaderCb()
+        })
+        fileListEl.appendChild(h('label', { class: 'cloud-file-row' },
+          cb,
+          h('span', { class: 'cloud-file-name' }, f.label),
+          h('span', { class: 'cloud-file-size' }, fmtSize(f.size))
+        ))
+      })
+    }
+
+    searchInput.addEventListener('input', e => renderFiles(e.target.value))
+
+    header.addEventListener('click', () => {
+      expanded = !expanded
+      toggleIcon.textContent = expanded ? '▼' : '▶'
+      catBody.style.display  = expanded ? '' : 'none'
+      if (expanded && !rendered) { renderFiles(); rendered = true }
+    })
+
+    return section
+  }
+
+  const uploadSection = h('div', { class: 'cloud-upload-section' })
+  body.appendChild(uploadSection)
+
+  UPLOAD_CATEGORIES.forEach(({ id, label }) => {
+    const cat = catData[id] || { files: [] }
+    uploadSection.appendChild(buildCategorySection(id, label, cat.files || []))
+  })
+
+  // ── Upload history ─────────────────────────────────────────────────────────
+  const HIST_KEY = 'cloud_upload_history'
+  function getHistory () {
+    try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]') } catch (_) { return [] }
+  }
+
+  let historyBodyEl
+
+  function addHistory (entry) {
+    const hist = getHistory()
+    hist.unshift(entry)
+    if (hist.length > 50) hist.length = 50
+    localStorage.setItem(HIST_KEY, JSON.stringify(hist))
+    renderHistoryEntries()
+  }
+
+  function renderHistoryEntries () {
+    if (!historyBodyEl) return
+    historyBodyEl.innerHTML = ''
+    const hist = getHistory()
+    if (!hist.length) {
+      historyBodyEl.appendChild(h('div', { class: 'cloud-hist-empty' }, 'No uploads yet.'))
+      return
+    }
+    hist.forEach(e => {
+      const svcLabel = e.service === 'google' ? '📤 Google Drive' : '📦 Dropbox'
+      const parts    = []
+      if (e.ok)      parts.push(`${e.ok} uploaded`)
+      if (e.skipped) parts.push(`${e.skipped} skipped`)
+      if (e.failed)  parts.push(`${e.failed} failed`)
+      historyBodyEl.appendChild(h('div', { class: 'cloud-hist-entry' },
+        h('div', { class: 'cloud-hist-row' },
+          h('span', { class: 'cloud-hist-svc' }, svcLabel),
+          h('span', { class: 'cloud-hist-dest' }, `→ ${e.dest}`),
+          h('span', { class: 'cloud-hist-ts' }, new Date(e.ts).toLocaleString()),
+        ),
+        h('div', { class: 'cloud-hist-detail' },
+          `${e.total} file${e.total === 1 ? '' : 's'} · ${parts.join(', ') || 'done'}`),
+      ))
+    })
+  }
+
+  const histPanel = h('div', { class: 'cloud-hist-panel' })
+  body.appendChild(histPanel)
+  histPanel.appendChild(h('div', { class: 'cloud-hist-title' },
+    h('span', {}, 'Recent Uploads'),
+    h('button', { class: 'btn-secondary btn-sm',
+      onclick: () => { localStorage.removeItem(HIST_KEY); renderHistoryEntries() },
+    }, 'Clear'),
+  ))
+  historyBodyEl = h('div', { class: 'cloud-hist-body' })
+  histPanel.appendChild(historyBodyEl)
+  renderHistoryEntries()
+}
+
+/* ── AD2CP page ──────────────────────────────────────────────────────────────*/
+async function renderAdcp () {
+  const page = document.getElementById('page-adcp')
+  page.innerHTML = ''
+  page.style.overflowY = 'auto'
+
+  page.appendChild(h('div', { class: 'page-header' },
+    h('h1', {}, 'AD2CP Processing'),
+    h('p',  {}, 'Process Nortek AD2CP data for glider deployments or standalone lab tests.'),
+  ))
+
+  const body = h('div', { class: 'page-body' })
+  page.appendChild(body)
+
+  // ── Shared state ────────────────────────────────────────────────────────────
+  let isTest       = false
+  let testDep      = null
+  let selectedFile = null
+  const adcpOpts   = { xaxis: 3, yaxis: null, depth_min: 10, depth_max: 1000 }
+  const adcpLogs   = {}    // stage -> [lines]
+  const adcpCtrl   = {}    // stage -> AbortController
+
+  function adcpRunLabel (opts) {
+    const xaxis = parseInt(opts.xaxis ?? 3)
+    const dmin  = parseInt(parseFloat(opts.depth_min ?? 10))
+    const dmax  = parseInt(parseFloat(opts.depth_max ?? 1000))
+    let label = `xaxis${xaxis}_d${dmin}-${dmax}`
+    if (opts.yaxis != null) label += `_y${parseInt(parseFloat(opts.yaxis))}`
+    return label
+  }
+
+  // ── Mode toggle ─────────────────────────────────────────────────────────────
+  const btnDeploy = h('button', { class: 'btn-primary btn-sm' }, 'Deployment')
+  const btnTest   = h('button', { class: 'btn-secondary btn-sm' }, 'Lab Test')
+  btnDeploy.addEventListener('click', () => setMode(false))
+  btnTest.addEventListener('click',   () => setMode(true))
+  body.appendChild(h('div', { class: 'adcp-mode-row' }, btnDeploy, btnTest))
+
+  const mainArea = h('div', {})
+  body.appendChild(mainArea)
+
+  function setMode (test) {
+    isTest = test
+    btnDeploy.className = test ? 'btn-secondary btn-sm' : 'btn-primary btn-sm'
+    btnTest.className   = test ? 'btn-primary btn-sm'   : 'btn-secondary btn-sm'
+    selectedFile = null
+    renderMain()
+  }
+
+  // ── Main area renderer ───────────────────────────────────────────────────────
+  async function renderMain () {
+    mainArea.innerHTML = ''
+
+    if (isTest) {
+      const testSec = h('div', { class: 'adcp-section' })
+      mainArea.appendChild(testSec)
+      await renderTestSelector(testSec)
+    } else {
+      if (!state.deployment) {
+        mainArea.appendChild(h('div', { class: 'adcp-empty' },
+          'Select a deployment from the sidebar to continue.'))
+        return
+      }
+    }
+
+    const dep = isTest ? testDep : state.deployment
+    if (!dep) return
+
+    const fileSec = h('div', { class: 'adcp-section' })
+    mainArea.appendChild(fileSec)
+    await renderFilePicker(fileSec, dep)
+  }
+
+  // ── Test selector ────────────────────────────────────────────────────────────
+  async function renderTestSelector (container) {
+    container.innerHTML = ''
+    container.appendChild(h('div', { class: 'adcp-section-title' }, 'Lab Test'))
+
+    const newInput = h('input', { type: 'text', class: 'adcp-input',
+      placeholder: 'Test label  (e.g. Lab_Test_2026-07-15)' })
+    const newBtn = h('button', { class: 'btn-secondary btn-sm' }, '+ New Test')
+    newBtn.addEventListener('click', async () => {
+      const label = newInput.value.trim()
+      if (!label) return
+      await apiFetch('/api/adcp/tests', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label }),
+      })
+      newInput.value = ''
+      await renderTestSelector(container)
+    })
+    container.appendChild(h('div', { class: 'adcp-new-test-row' }, newInput, newBtn))
+
+    let r
+    try { r = await apiFetch('/api/adcp/tests') } catch { r = { tests: [] } }
+    const tests = r.tests || []
+
+    if (!tests.length) {
+      container.appendChild(h('div', { class: 'adcp-empty' }, 'No test runs yet. Create one above.'))
+      return
+    }
+    const list = h('div', { class: 'adcp-test-list' })
+    tests.forEach(t => {
+      const delBtn = h('button', { class: 'adcp-file-del', title: 'Delete test' }, '×')
+      delBtn.addEventListener('click', async e => {
+        e.stopPropagation()
+        if (!confirm(`Delete test "${t}" and all its files?`)) return
+        try {
+          await apiFetch(`/api/adcp/tests/${encodeURIComponent(t)}`, { method: 'DELETE' })
+          if (testDep === t) { testDep = null }
+          await renderTestSelector(container)
+          if (!testDep) mainArea.querySelectorAll('.adcp-section:not(:first-child)').forEach(el => el.remove())
+        } catch (err) { alert('Delete failed: ' + err.message) }
+      })
+      const row = h('div', { class: `adcp-test-item${t === testDep ? ' active' : ''}` },
+        h('span', { class: 'adcp-file-name' }, t), delBtn)
+      row.addEventListener('click', () => { testDep = t; renderMain() })
+      list.appendChild(row)
+    })
+    container.appendChild(list)
+  }
+
+  // ── File picker ──────────────────────────────────────────────────────────────
+  async function renderFilePicker (container, dep) {
+    container.innerHTML = ''
+    container.appendChild(h('div', { class: 'adcp-section-title' }, 'AD2CP Input File'))
+
+    let r
+    try {
+      r = await apiFetch(`/api/adcp/files?dep=${encodeURIComponent(dep)}&is_test=${isTest}`)
+    } catch { r = { files: [] } }
+    const files = r.files || []
+
+    // Drop zone — always shown; shows file list when files exist
+    const dropStatus = h('div', { class: 'adcp-drop-status hidden' })
+
+    async function importAndRefresh (droppedFiles) {
+      const ncFiles = droppedFiles.filter(f => f.name.toLowerCase().endsWith('.nc'))
+      if (!ncFiles.length) { dropStatus.textContent = 'Only .nc files are accepted.'; dropStatus.classList.remove('hidden'); return }
+      dropStatus.textContent = `Copying ${ncFiles.length} file(s)…`
+      dropStatus.classList.remove('hidden')
+      try {
+        await apiFetch('/api/adcp/import', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ dep, is_test: isTest, paths: ncFiles.map(f => f.path) }),
+        })
+        dropStatus.classList.add('hidden')
+        // Re-render the file picker so the new file appears
+        await renderFilePicker(container, dep)
+      } catch (e) {
+        dropStatus.textContent = 'Copy failed: ' + e.message
+      }
+    }
+
+    const dropZone = h('div', { class: 'adcp-dropzone' },
+      h('div', { class: 'adcp-drop-icon' }, '↑'),
+      h('div', { class: 'adcp-drop-text' }, files.length ? 'Drop .nc file to add' : 'Drop Nortek .nc file here'),
+      files.length ? null : h('div', { class: 'adcp-drop-hint' }, 'or browse to file location'),
+    )
+    dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over') })
+    dropZone.addEventListener('dragleave', e => { if (!dropZone.contains(e.relatedTarget)) dropZone.classList.remove('drag-over') })
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault(); dropZone.classList.remove('drag-over')
+      importAndRefresh(Array.from(e.dataTransfer.files))
+    })
+
+    let fileList = null
+    if (files.length) {
+      fileList = h('div', { class: 'adcp-file-list' })
+      files.forEach(f => {
+        const isActive = f === selectedFile
+        const nameSpan = h('span', { class: 'adcp-file-name' }, f)
+        const delBtn   = h('button', { class: 'adcp-file-del', title: 'Remove file' }, '×')
+
+        delBtn.addEventListener('click', async e => {
+          e.stopPropagation()
+          if (!confirm(`Remove "${f}" from the input folder?`)) return
+          try {
+            const qs = `dep=${encodeURIComponent(dep)}&is_test=${isTest}`
+            await apiFetch(`/api/adcp/files/${encodeURIComponent(f)}?${qs}`, { method: 'DELETE' })
+            if (selectedFile === f) selectedFile = null
+            await renderFilePicker(container, dep)
+          } catch (err) {
+            alert('Delete failed: ' + err.message)
+          }
+        })
+
+        const row = h('div', { class: `adcp-file-item${isActive ? ' active' : ''}` }, nameSpan, delBtn)
+        row.addEventListener('click', () => {
+          selectedFile = f
+          fileList.querySelectorAll('.adcp-file-item').forEach(el => el.classList.remove('active'))
+          row.classList.add('active')
+          renderBelow(dep)
+        })
+        fileList.appendChild(row)
+      })
+      container.appendChild(fileList)
+      container.appendChild(h('div', { class: 'adcp-file-hint' },
+        files.length === 1 && !selectedFile
+          ? 'Click the file above, then scroll down to run stages.'
+          : ''))
+    }
+
+    container.appendChild(dropZone)
+    container.appendChild(dropStatus)
+
+    // Options + stages go below; auto-select if only one file
+    const belowArea = h('div', {})
+    container.appendChild(belowArea)
+
+    async function renderBelow (dep) {
+      belowArea.innerHTML = ''
+
+      // Options
+      const optsSec = h('div', { class: 'adcp-section' })
+      belowArea.appendChild(optsSec)
+      renderOptions(optsSec)
+
+      // Stages
+      belowArea.appendChild(h('div', { class: 'adcp-section-title', style: 'margin-top:20px' }, 'Processing Stages'))
+
+      let statusR
+      try {
+        statusR = await apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=${isTest}`)
+      } catch { statusR = { shared: {}, runs: {} } }
+
+      // Merge shared-stage statuses with the current run's option-stage statuses
+      const currentRun = adcpRunLabel(adcpOpts)
+      const statusMap  = {
+        ...(statusR.shared || {}),
+        ...((statusR.runs || {})[currentRun] || {}),
+      }
+
+      const stagesDefs = isTest
+        ? [
+            { id: 'process_shear',  label: 'Process Shear',  needs: [] },
+            { id: 'generate_plots', label: 'Generate Plots', needs: ['process_shear'] },
+          ]
+        : [
+            { id: 'load_nc',          label: 'Load & Combine Profile NCs', needs: [] },
+            { id: 'gps_pairing',      label: 'GPS Pairing',                needs: ['load_nc'] },
+            { id: 'write_glider_nc',  label: 'Write Glider NetCDF',        needs: ['load_nc'] },
+            { id: 'process_shear',    label: 'Process Shear',                          needs: ['write_glider_nc'] },
+            { id: 'compute_currents', label: 'Compute Absolute Currents',               needs: ['process_shear', 'gps_pairing'] },
+            { id: 'bias_correction',  label: 'Bias Correction',                         needs: ['compute_currents'] },
+            { id: 'generate_plots',   label: 'Generate Plots',                          needs: ['bias_correction'] },
+            { id: 'tidal_filter',     label: 'Tidal Filtering (40-h low-pass)',         needs: ['bias_correction'] },
+            { id: 'diagnostics',      label: 'Diagnostics (EKE · Transport · Ri)',      needs: ['bias_correction', 'process_shear'] },
+          ]
+
+      const stagesContainer = h('div', {})
+      belowArea.appendChild(stagesContainer)
+
+      stagesDefs.forEach(({ id, label, needs }) => {
+        const inputsMet   = needs.every(n => statusMap[n]?.done)
+        const initStatus  = statusMap[id]?.done ? 'done' : 'not_run'
+        stagesContainer.appendChild(
+          buildAdcpStageCard(id, label, initStatus, dep, inputsMet, stagesContainer, stagesDefs, statusMap,
+            () => renderBelow(dep)))
+      })
+
+      // Export panel
+      const allRuns = statusR.runs || {}
+      if (Object.values(statusMap).some(s => s.done) || Object.keys(allRuns).length > 0) {
+        belowArea.appendChild(buildAdcpExportPanel(dep, statusMap, allRuns, currentRun))
+      }
+    }
+
+    if (files.length === 1) {
+      selectedFile = files[0]
+      fileList && fileList.querySelector('.adcp-file-item').classList.add('active')
+      renderBelow(dep)
+    } else if (selectedFile && files.includes(selectedFile)) {
+      renderBelow(dep)
+    }
+  }
+
+  // ── Options section ──────────────────────────────────────────────────────────
+  function renderOptions (container) {
+    container.innerHTML = ''
+    let open = false
+
+    const toggleBtn = h('div', { class: 'adcp-opts-header' })
+    const arrow     = h('span', { class: 'adcp-opts-arrow' }, '▶')
+    toggleBtn.appendChild(arrow)
+    toggleBtn.appendChild(document.createTextNode(' Processing Options'))
+    toggleBtn.addEventListener('click', () => {
+      open = !open
+      optBody.style.display = open ? '' : 'none'
+      arrow.textContent     = open ? '▼' : '▶'
+    })
+
+    const xSel = h('select', { class: 'adcp-input' })
+    ;[['1','Time'],['2','Profile'],['3','Distance']].forEach(([v, l]) => {
+      const o = h('option', { value: v }, l)
+      if (String(adcpOpts.xaxis) === v) o.selected = true
+      xSel.appendChild(o)
+    })
+    xSel.addEventListener('change', () => { adcpOpts.xaxis = parseInt(xSel.value) })
+
+    const yIn = h('input', { type: 'number', class: 'adcp-input',
+      placeholder: 'auto', value: adcpOpts.yaxis ?? '' })
+    yIn.addEventListener('input', () => { adcpOpts.yaxis = yIn.value ? parseInt(yIn.value) : null })
+
+    const dMinIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.depth_min, min: '0', max: '2000' })
+    dMinIn.addEventListener('input', () => { adcpOpts.depth_min = parseFloat(dMinIn.value) || 10 })
+
+    const dMaxIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.depth_max, min: '0', max: '2000' })
+    dMaxIn.addEventListener('input', () => { adcpOpts.depth_max = parseFloat(dMaxIn.value) || 1000 })
+
+    const optBody = h('div', { class: 'adcp-opts-body', style: 'display:none' },
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'X-axis:'), xSel),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Y-axis (m):'), yIn,
+        h('span', { class: 'adcp-opt-hint' }, 'blank = use ADCP cell size')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Depth slice (m):'),
+        dMinIn, h('span', { class: 'adcp-opt-sep' }, ' – '), dMaxIn),
+    )
+
+    container.appendChild(toggleBtn)
+    container.appendChild(optBody)
+  }
+
+  // ── Stage card ───────────────────────────────────────────────────────────────
+  function buildAdcpStageCard (id, label, initStatus, dep, inputsMet, stagesContainer, stagesDefs, statusMap, refreshFn) {
+    const badge = h('span', { class: `status-badge ${inputsMet ? statusClass(initStatus) : 'not_run'}` },
+      inputsMet ? statusLabel(initStatus) : 'WAITING')
+
+    const logEl   = h('div', { class: 'log-pane hidden' })
+    const elapsed = h('span', { class: 'adcp-elapsed hidden' })
+
+    if (adcpLogs[id]?.length) {
+      adcpLogs[id].forEach(l => appendLog(logEl, l))
+      logEl.classList.remove('hidden')
+    }
+
+    const btnRun = h('button', {
+      class: `btn-success${inputsMet ? '' : ' disabled'}`,
+    }, initStatus === 'done' ? 'Re-run' : 'Run')
+    btnRun.disabled = !inputsMet
+
+    const btnAbort = h('button', { class: 'btn-danger hidden' }, 'Cancel')
+    const btnClear = h('button', { class: 'btn-secondary' }, 'Clear log')
+
+    btnClear.addEventListener('click', () => {
+      logEl.innerHTML = ''; logEl.classList.add('hidden'); adcpLogs[id] = []
+    })
+
+    btnRun.addEventListener('click', () =>
+      runAdcpStage(id, label, dep, badge, btnRun, btnAbort, logEl, elapsed,
+                   stagesContainer, stagesDefs, statusMap, refreshFn))
+
+    btnAbort.addEventListener('click', () => {
+      const ctrl = adcpCtrl[id]
+      if (ctrl) { ctrl.abort(); delete adcpCtrl[id] }
+      badge.className   = 'status-badge failed'
+      badge.textContent = 'CANCELLED'
+      btnRun.classList.remove('hidden')
+      btnAbort.classList.add('hidden')
+      elapsed.classList.add('hidden')
+    })
+
+    return h('div', { class: 'stage-card' },
+      h('div', { class: 'stage-card-header' },
+        h('span', { class: 'stage-title' }, label), badge),
+      h('div', { class: 'stage-body' },
+        h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear, elapsed),
+        logEl),
+    )
+  }
+
+  // ── Run a stage via SSE ──────────────────────────────────────────────────────
+  async function runAdcpStage (id, label, dep, badge, btnRun, btnAbort, logEl, elapsed,
+                                stagesContainer, stagesDefs, statusMap, refreshFn) {
+    adcpLogs[id] = []
+    logEl.innerHTML = ''
+    logEl.classList.remove('hidden')
+    btnRun.classList.add('hidden')
+    btnAbort.classList.remove('hidden')
+    badge.className   = 'status-badge running'
+    badge.textContent = 'RUNNING…'
+
+    const t0 = Date.now()
+    elapsed.classList.remove('hidden')
+    const iv = setInterval(() => {
+      const s = Math.round((Date.now() - t0) / 1000)
+      elapsed.textContent = `${Math.floor(s / 60)}m ${s % 60}s`
+    }, 1000)
+
+    const ctrl = new AbortController()
+    adcpCtrl[id] = ctrl
+
+    try {
+      const resp = await fetch(`${API}/api/adcp/run/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dep, is_test: isTest, adcp_file: selectedFile, options: adcpOpts }),
+        signal: ctrl.signal,
+      })
+
+      const reader  = resp.body.getReader()
+      const decoder = new TextDecoder()
+      let   buf     = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n'); buf = lines.pop()
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          try {
+            const evt = JSON.parse(line.slice(6))
+            if (evt.type === 'log') {
+              adcpLogs[id].push(evt.line)
+              appendLog(logEl, evt.line)
+            } else if (evt.type === 'done') {
+              clearInterval(iv); elapsed.classList.add('hidden')
+              const success = evt.success
+              const msg     = success ? 'Completed successfully.' : 'Finished with errors.'
+              adcpLogs[id].push(msg)
+              appendLog(logEl, msg)
+              badge.className   = `status-badge ${success ? 'done' : 'failed'}`
+              badge.textContent = success ? '✔ DONE' : '✖ FAILED'
+              btnRun.textContent = 'Re-run'
+              btnRun.disabled    = false
+              btnRun.classList.remove('hidden', 'disabled')
+              btnAbort.classList.add('hidden')
+              delete adcpCtrl[id]
+              // Refresh stage cards so downstream stages unlock (without scrolling to top)
+              if (success && refreshFn) refreshFn()
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      clearInterval(iv); elapsed.classList.add('hidden')
+      if (e.name !== 'AbortError') {
+        appendLog(logEl, 'Stream error: ' + e.message)
+        badge.className   = 'status-badge failed'
+        badge.textContent = '✖ FAILED'
+      }
+      btnRun.classList.remove('hidden')
+      btnAbort.classList.add('hidden')
+      delete adcpCtrl[id]
+    }
+  }
+
+  // ── Export panel ─────────────────────────────────────────────────────────────
+  function buildAdcpExportPanel (dep, statusMap, allRuns, currentRun) {
+    const panel = h('div', { class: 'adcp-export-panel' })
+    panel.appendChild(h('div', { class: 'adcp-section-title', style: 'margin-top:24px' }, 'Outputs & Export'))
+
+    const baseQs    = `dep=${encodeURIComponent(dep)}&is_test=${isTest}`
+    const currentQs = `${baseQs}&run=${encodeURIComponent(currentRun)}`
+
+    // Shared data files (no run param needed — live in base_dir)
+    const sharedDataMap = isTest ? {} : {
+      load_nc:         ['adcp_glider_combined.csv'],
+      write_glider_nc: ['glider_ad2cp_datetime_timecoord.nc'],
+    }
+    // Option-specific data files (need run= param)
+    const runDataMap = isTest
+      ? { process_shear: ['shear_processed.nc'] }
+      : { bias_correction: ['currents_bias_corrected.nc'] }
+
+    const dataRow = h('div', { class: 'adcp-export-row' })
+    Object.entries(sharedDataMap).forEach(([stageId, files]) => {
+      if (!statusMap[stageId]?.done) return
+      files.forEach(fn => {
+        const a = h('a', { class: 'btn-secondary btn-sm',
+          href: `${API}/api/adcp/download/${encodeURIComponent(fn)}?${baseQs}` }, `⬇ ${fn}`)
+        a.setAttribute('download', fn)
+        dataRow.appendChild(a)
+      })
+    })
+    Object.entries(runDataMap).forEach(([stageId, files]) => {
+      if (!statusMap[stageId]?.done) return
+      files.forEach(fn => {
+        const a = h('a', { class: 'btn-secondary btn-sm',
+          href: `${API}/api/adcp/download/${encodeURIComponent(fn)}?${currentQs}` }, `⬇ ${fn}`)
+        a.setAttribute('download', fn)
+        dataRow.appendChild(a)
+      })
+    })
+    if (dataRow.children.length) panel.appendChild(dataRow)
+
+    // Plots for current run (inline preview + download) — collected from all stages
+    const stagePlots = isTest
+      ? [{ stage: 'generate_plots', plots: ['velocity_sections.png', 'speed_section.png'] }]
+      : [
+          { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
+          { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
+                                               'shear_sections.png', 'backscatter.png',
+                                               'dac_timeseries.png', 'dac_map_cartopy.png'] },
+          { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
+          { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },
+        ]
+
+    const allPlots = stagePlots.flatMap(({ stage, plots }) =>
+      statusMap[stage]?.done ? plots : [])
+
+    if (allPlots.length > 0) {
+      const plotsArea = h('div', { class: 'adcp-plots-area' })
+      allPlots.forEach(fn => {
+        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${currentQs}`
+        const dlUrl = `${API}/api/adcp/download/${encodeURIComponent(fn)}?${currentQs}`
+        const img   = h('img', { class: 'adcp-plot-img', src: url, alt: fn })
+        img.onerror = () => img.parentElement?.remove()
+        const foot  = h('div', { class: 'adcp-plot-footer' },
+          h('span', {}, fn),
+          h('a', { class: 'btn-secondary btn-sm', href: dlUrl }, '⬇ Download'),
+        )
+        plotsArea.appendChild(h('div', { class: 'adcp-plot-wrap' }, img, foot))
+      })
+      panel.appendChild(plotsArea)
+    }
+
+    // Per-run export buttons for all saved runs
+    const runLabels = Object.keys(allRuns)
+    if (runLabels.length > 0) {
+      panel.appendChild(h('div', { class: 'adcp-section-title', style: 'margin-top:16px;font-size:12px' }, 'Saved Runs'))
+      const runsRow = h('div', { class: 'adcp-export-row' })
+      runLabels.forEach(run => {
+        const runQs = `${baseQs}&run=${encodeURIComponent(run)}`
+        const isCurrent = run === currentRun
+        const a = h('a', {
+          class: `btn-secondary btn-sm${isCurrent ? ' adcp-run-current' : ''}`,
+          href:  `${API}/api/adcp/export?${runQs}`,
+          title: isCurrent ? 'Current options' : '',
+        }, `⬇ ${run}${isCurrent ? ' ★' : ''}`)
+        runsRow.appendChild(a)
+      })
+      panel.appendChild(runsRow)
+    }
+
+    // Export everything as ZIP
+    const exportRow = h('div', { class: 'adcp-export-all-row' })
+    const zipLink   = h('a', { class: 'btn-primary btn-sm',
+      href: `${API}/api/adcp/export?${baseQs}` }, '⬇ Export All (ZIP)')
+    exportRow.appendChild(zipLink)
+    panel.appendChild(exportRow)
+
+    // Cloud upload (only for deployment mode, not test mode)
+    if (!isTest && dep) {
+      const cloudRow = h('div', { class: 'adcp-export-all-row', style: 'margin-top:8px' })
+      const uploadStatus = h('span', { class: 'adcp-cloud-status' })
+      cloudRow.appendChild(uploadStatus)
+
+      ;(async () => {
+        let accounts
+        try { accounts = await apiFetch('/api/cloud/accounts') } catch { return }
+        const services = []
+        if (accounts.google?.connected)  services.push({ key: 'google',  label: '↑ Drive' })
+        if (accounts.dropbox?.connected) services.push({ key: 'dropbox', label: '↑ Dropbox' })
+        if (!services.length) return
+
+        services.forEach(({ key, label }) => {
+          const btn = h('button', { class: 'btn-secondary btn-sm' }, label)
+          btn.addEventListener('click', async () => {
+            btn.disabled       = true
+            uploadStatus.textContent = 'Uploading…'
+
+            // Collect relative paths for all generated files in this run + shared files
+            const filesToUpload = []
+            const adcpBase = isTest
+              ? `ad2cp/tests/${dep}/output`
+              : `post_processing/${dep}/adcp`
+
+            const sharedFiles = ['adcp_glider_combined.csv', 'gps_data.npz', 'glider_ad2cp_datetime_timecoord.nc']
+            sharedFiles.forEach(f => filesToUpload.push(`${adcpBase}/${f}`))
+
+            if (currentRun) {
+              const runFiles = ['shear_processed.nc', 'currents.nc', 'dac.npz',
+                                'currents_bias_corrected.nc', 'velocity_sections.png',
+                                'speed_section.png', 'dac_map_cartopy.png']
+              runFiles.forEach(f => filesToUpload.push(`${adcpBase}/${currentRun}/${f}`))
+            }
+
+            try {
+              const r = await apiFetch('/api/cloud/upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ service: key, files: filesToUpload, dest: '', conflict: 'overwrite' }),
+              })
+              const ok = (r.ok_count ?? r.ok) || 0
+              uploadStatus.textContent = `✔ ${r.ok} file(s) uploaded${r.skipped ? `, ${r.skipped} skipped` : ''}`
+            } catch (e) {
+              uploadStatus.textContent = `✖ Upload failed: ${e.message}`
+            }
+            btn.disabled = false
+          })
+          cloudRow.appendChild(btn)
+        })
+      })()
+
+      panel.appendChild(cloudRow)
+    }
+
+    return panel
+  }
+
+  // Initial render
+  renderMain()
+}
+
 /* ── Navigation ──────────────────────────────────────────────────────────────*/
 const pageRenderers = {
   dashboard:     renderDashboard,
@@ -2999,6 +5388,8 @@ const pageRenderers = {
   reports:       renderReports,
   metadata:      renderMetadata,
   'dat-browser': renderDatBrowser,
+  cloud:         renderCloud,
+  adcp:          renderAdcp,
 }
 
 async function navigate (page) {
@@ -3019,32 +5410,198 @@ async function navigate (page) {
 
 /* ── Init ────────────────────────────────────────────────────────────────────*/
 async function init () {
-  const { deployments } = await loadAppState()
+  const [{ deployments }, nicknamesRaw] = await Promise.all([
+    loadAppState(),
+    apiFetch('/api/nicknames').catch(() => ({})),
+  ])
+  nicknames = nicknamesRaw || {}
 
-  const sel = document.getElementById('dep-select')
+  const sel         = document.getElementById('dep-select')
+  const nicknameLbl = document.getElementById('dep-nickname-lbl')
+
+  function optionLabel (dep) {
+    return dep
+  }
+
+  function rebuildSelect (deps, selectVal) {
+    sel.innerHTML = ''
+    sel.appendChild(h('option', { value: '' }, '— select deployment —'))
+    deps.forEach(dep => sel.appendChild(h('option', { value: dep }, optionLabel(dep))))
+    sel.value = selectVal || ''
+  }
+
+  function updateNicknameLabel () {
+    const dep  = state.deployment
+    const nick = dep && nicknames[dep]
+    if (nick) {
+      nicknameLbl.textContent = nick
+      nicknameLbl.classList.remove('hidden')
+    } else {
+      nicknameLbl.classList.add('hidden')
+    }
+  }
+
   if (!deployments.length) {
     sel.appendChild(h('option', { value: '' }, 'No deployments'))
   } else {
-    // Blank "choose" option so nothing is selected until the user picks
-    sel.appendChild(h('option', { value: '' }, '— select deployment —'))
-    deployments.forEach(dep => sel.appendChild(h('option', { value: dep }, dep)))
-
-    // Restore last deployment from localStorage (e.g. after a page refresh)
+    rebuildSelect(deployments, '')
     const lastDep = localStorage.getItem('lastDeployment')
     if (lastDep && deployments.includes(lastDep)) {
       state.deployment = lastDep
       sel.value = lastDep
     } else {
-      // First launch (or stored deployment no longer exists) — stay on dashboard
       state.deployment = null
-      sel.value = ''
     }
   }
+  updateNicknameLabel()
 
   sel.addEventListener('change', e => {
     state.deployment = e.target.value || null
     if (state.deployment) localStorage.setItem('lastDeployment', state.deployment)
+    updateRenameBtn()
+    updateNicknameLabel()
     navigate(state.page)
+  })
+
+  // ── Deployment nickname ────────────────────────────────────────────────────
+  const nicknameBtn    = document.getElementById('dep-nickname-btn')
+  const nicknameForm   = document.getElementById('dep-nickname-form')
+  const nicknameInput  = document.getElementById('dep-nickname-input')
+  const nicknameSave   = document.getElementById('dep-nickname-save')
+  const nicknameCancel = document.getElementById('dep-nickname-cancel')
+
+  function updateNicknameBtn () {
+    nicknameBtn.disabled = !state.deployment
+    renameBtn.disabled   = !state.deployment
+  }
+
+  function openNicknameForm () {
+    nicknameInput.value = (state.deployment && nicknames[state.deployment]) || ''
+    nicknameForm.classList.remove('hidden')
+    nicknameBtn.style.display = 'none'
+    renameBtn.style.display   = 'none'
+    sel.style.display         = 'none'
+    nicknameInput.focus()
+    nicknameInput.select()
+  }
+
+  function closeNicknameForm () {
+    nicknameForm.classList.add('hidden')
+    nicknameBtn.style.display = ''
+    renameBtn.style.display   = ''
+    sel.style.display         = ''
+  }
+
+  nicknameBtn.addEventListener('click', openNicknameForm)
+  nicknameCancel.addEventListener('click', closeNicknameForm)
+
+  nicknameSave.addEventListener('click', async () => {
+    const dep      = state.deployment
+    const newNick  = nicknameInput.value.trim()
+    if (!dep) { closeNicknameForm(); return }
+
+    nicknameSave.disabled    = true
+    nicknameSave.textContent = 'Saving…'
+    try {
+      await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/nickname`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ nickname: newNick }),
+      })
+      if (newNick) nicknames[dep] = newNick
+      else         delete nicknames[dep]
+
+      // Rebuild select so option labels refresh
+      const { deployments: deps } = await loadAppState()
+      rebuildSelect(deps, dep)
+      updateNicknameLabel()
+      closeNicknameForm()
+    } catch (err) {
+      nicknameInput.setCustomValidity(err.message)
+      nicknameInput.reportValidity()
+    } finally {
+      nicknameSave.disabled    = false
+      nicknameSave.textContent = 'Save'
+    }
+  })
+
+  nicknameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  nicknameSave.click()
+    if (e.key === 'Escape') closeNicknameForm()
+  })
+
+  // ── Deployment rename ──────────────────────────────────────────────────────
+  const renameBtn    = document.getElementById('dep-rename-btn')
+  const renameForm   = document.getElementById('dep-rename-form')
+  const renameInput  = document.getElementById('dep-rename-input')
+  const renameSave   = document.getElementById('dep-rename-save')
+  const renameCancel = document.getElementById('dep-rename-cancel')
+
+  function updateRenameBtn () {
+    updateNicknameBtn()
+  }
+  updateNicknameBtn()
+
+  function openRenameForm () {
+    renameInput.value = state.deployment || ''
+    renameForm.classList.remove('hidden')
+    sel.style.display         = 'none'
+    nicknameBtn.style.display = 'none'
+    renameBtn.style.display   = 'none'
+    renameInput.focus()
+    renameInput.select()
+  }
+
+  function closeRenameForm () {
+    renameForm.classList.add('hidden')
+    sel.style.display         = ''
+    nicknameBtn.style.display = ''
+    renameBtn.style.display   = ''
+    renameInput.setCustomValidity('')
+  }
+
+  renameBtn.addEventListener('click', openRenameForm)
+  renameCancel.addEventListener('click', closeRenameForm)
+
+  renameSave.addEventListener('click', async () => {
+    const newName = renameInput.value.trim()
+    if (!newName || newName === state.deployment) { closeRenameForm(); return }
+
+    renameSave.disabled    = true
+    renameSave.textContent = 'Saving…'
+    try {
+      const r = await apiFetch(`/api/deployment/${encodeURIComponent(state.deployment)}/rename`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ new_name: newName }),
+      })
+
+      // Transfer nickname in local cache too
+      if (nicknames[state.deployment]) {
+        nicknames[newName] = nicknames[state.deployment]
+        delete nicknames[state.deployment]
+      }
+
+      const { deployments: deps } = await loadAppState()
+      rebuildSelect(deps, r.name)
+      state.deployment = r.name
+      localStorage.setItem('lastDeployment', r.name)
+      delete state.depStates[state.deployment]
+      updateNicknameLabel()
+      closeRenameForm()
+      navigate(state.page)
+    } catch (err) {
+      renameInput.setCustomValidity(err.message)
+      renameInput.reportValidity()
+    } finally {
+      renameSave.disabled    = false
+      renameSave.textContent = 'Save'
+    }
+  })
+
+  renameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  renameSave.click()
+    if (e.key === 'Escape') closeRenameForm()
   })
 
   document.querySelectorAll('.nav-item').forEach(li =>

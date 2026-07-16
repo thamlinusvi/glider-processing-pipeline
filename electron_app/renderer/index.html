@@ -17,7 +17,28 @@
 
       <div class="dep-section">
         <div class="dep-label">DEPLOYMENT</div>
-        <select id="dep-select"></select>
+        <div class="dep-select-row">
+          <select id="dep-select"></select>
+        </div>
+        <div class="dep-action-row">
+          <button id="dep-nickname-btn" title="Set short name"   disabled>Set nickname</button>
+          <button id="dep-rename-btn"   title="Rename deployment" disabled>Rename</button>
+        </div>
+        <div id="dep-nickname-lbl" class="dep-nickname-lbl hidden"></div>
+        <div id="dep-nickname-form" class="dep-rename-form hidden">
+          <input id="dep-nickname-input" type="text" class="dep-rename-input" placeholder="Short name (or blank to clear)" />
+          <div class="dep-rename-btns">
+            <button id="dep-nickname-save"   class="dep-rename-save">Save</button>
+            <button id="dep-nickname-cancel" class="dep-rename-cancel">Cancel</button>
+          </div>
+        </div>
+        <div id="dep-rename-form" class="dep-rename-form hidden">
+          <input id="dep-rename-input" type="text" class="dep-rename-input" />
+          <div class="dep-rename-btns">
+            <button id="dep-rename-save"   class="dep-rename-save">Save</button>
+            <button id="dep-rename-cancel" class="dep-rename-cancel">Cancel</button>
+          </div>
+        </div>
       </div>
 
       <ul id="nav-list">
@@ -27,6 +48,8 @@
         <li data-page="logs"        class="nav-item">Logs</li>
         <li data-page="reports"     class="nav-item">Reports</li>
         <li data-page="dat-browser" class="nav-item">Files</li>
+        <li data-page="cloud"       class="nav-item">☁ Cloud</li>
+        <li data-page="adcp"        class="nav-item">AD2CP</li>
       </ul>
 
       <div class="sidebar-footer">
@@ -43,6 +66,8 @@
       <div id="page-reports"     class="page"></div>
       <div id="page-metadata"    class="page"></div>
       <div id="page-dat-browser" class="page"></div>
+      <div id="page-cloud"       class="page"></div>
+      <div id="page-adcp"        class="page"></div>
     </main>
 
   </div>

@@ -425,15 +425,20 @@ def main(args):
     base_dir   = args.base_dir
     deployment = args.deployment
     apply_json = args.apply
+    apply_file = getattr(args, 'apply_file', '')
 
     year       = deployment.split('-')[1][:4]
     config_dir = os.path.join(base_dir, 'deployments', year, deployment, 'config', 'qc')
 
     # ── Apply mode ────────────────────────────────────────────────────────────
-    if apply_json:
+    if apply_file or apply_json:
         try:
-            data = json.loads(apply_json)
-        except json.JSONDecodeError as e:
+            if apply_file:
+                with open(apply_file, 'r', encoding='utf-8') as _f:
+                    data = json.load(_f)
+            else:
+                data = json.loads(apply_json)
+        except (json.JSONDecodeError, OSError) as e:
             print(f'ERROR: Invalid JSON: {e}', flush=True)
             return 1
         os.makedirs(config_dir, exist_ok=True)
@@ -572,4 +577,6 @@ if __name__ == '__main__':
     parser.add_argument('deployment',  help='Glider deployment name (glider-YYYYmmddTHHMM)')
     parser.add_argument('--apply', default='', metavar='JSON',
                         help='JSON string from analysis phase — writes config files when set')
+    parser.add_argument('--apply-file', default='', metavar='PATH',
+                        help='Path to JSON file from analysis phase (avoids command-line length limits)')
     sys.exit(main(parser.parse_args()))

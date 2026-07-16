@@ -34,10 +34,17 @@ def save_state(deployment_dir, state):
 
 def set_stage_status(deployment_dir, stage, status):
     state = load_state(deployment_dir)
-    state[stage] = {
-        'status': status,
-        'timestamp': datetime.now().isoformat(timespec='seconds'),
-    }
+    now   = datetime.now().isoformat(timespec='seconds')
+    prev  = state.get(stage) or {}
+    entry = {'status': status, 'timestamp': now}
+    if status == STATUS_RUNNING:
+        entry['started_at'] = now
+    else:
+        if 'started_at' in prev:
+            entry['started_at'] = prev['started_at']
+        if status in (STATUS_DONE, STATUS_FAILED):
+            entry['finished_at'] = now
+    state[stage] = entry
     save_state(deployment_dir, state)
 
 
