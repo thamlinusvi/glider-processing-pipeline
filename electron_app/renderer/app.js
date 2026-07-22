@@ -1488,17 +1488,48 @@ async function renderReports () {
   // Flight Stats tab
   const flightTab = h('div', { class: 'tab-panel', id: 'tab-flight' })
 
-  // AD2CP tab — iframe like QC Report
-  const adcpReportSrc = dep
+  // AD2CP tab — iframe with per-run switcher
+  const adcpAllSrc = dep
     ? `${API}/api/adcp/report-html?dep=${encodeURIComponent(dep)}`
     : 'about:blank'
-  const adcpReportFrame = h('iframe', { id: 'adcp-report-frame', src: adcpReportSrc })
-  const adcpDlBtn = dep ? h('a', {
-    class: 'btn-secondary btn-sm',
-    href: `${adcpReportSrc}&dl=1`,
-  }, '⬇ Download Report') : null
+  const adcpReportFrame = h('iframe', { id: 'adcp-report-frame', src: adcpAllSrc })
+
+  const adcpDlBtn = dep ? h('a', { class: 'btn-secondary btn-sm', href: `${adcpAllSrc}&dl=1` }, '⬇ Download') : null
+
+  const switcherRow = h('div', { class: 'adcp-run-switcher' })
+  if (dep) {
+    switcherRow.appendChild(h('span', { class: 'adcp-run-switcher-label' }, 'View:'))
+    ;(async () => {
+      try {
+        const statusR = await apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=false`)
+        const runs = Object.keys(statusR.runs || {})
+        const allBtns = []
+
+        const makeBtn = (label, url) => {
+          const btn = h('button', { class: 'adcp-run-btn' }, label)
+          btn.addEventListener('click', () => {
+            adcpReportFrame.src = url
+            if (adcpDlBtn) adcpDlBtn.href = `${url}&dl=1`
+            allBtns.forEach(b => b.classList.remove('active'))
+            btn.classList.add('active')
+          })
+          allBtns.push(btn)
+          return btn
+        }
+
+        const allBtn = makeBtn('All runs', adcpAllSrc)
+        allBtn.classList.add('active')
+        switcherRow.appendChild(allBtn)
+        runs.forEach(run => {
+          const url = `${API}/api/adcp/report-html?dep=${encodeURIComponent(dep)}&run=${encodeURIComponent(run)}`
+          switcherRow.appendChild(makeBtn(run, url))
+        })
+      } catch (_) {}
+    })()
+  }
+
   const adcpReportTab = h('div', { class: 'tab-panel', id: 'tab-adcp' },
-    h('div', { class: 'report-toolbar' }, adcpDlBtn),
+    h('div', { class: 'report-toolbar' }, switcherRow, adcpDlBtn),
     adcpReportFrame,
   )
 
@@ -1703,10 +1734,13 @@ async function renderNcVariablesTab (dep, container) {
     const card = h('div', { class: 'vars-card' })
 
     // Card header
-    const stagePill = h('span', { class: 'nc-section-stage' }, `Stage ${stage}`)
+    const varCount = (sec && sec.variables && sec.variables.length)
+      ? h('span', { class: 'nc-section-count' }, `${sec.variables.length} variables`)
+      : null
     card.appendChild(h('div', { class: 'vars-card-header' },
       h('span', { class: 'vars-card-title' }, label),
-      stagePill
+      h('span', { class: 'nc-section-stage' }, `Stage ${stage}`),
+      varCount,
     ))
 
     if (!sec || !sec.exists) {
@@ -3303,10 +3337,11 @@ async function renderRawTab (dep, container) {
   // Summary badges by extension
   const extCounts = {}
   files.forEach(f => { extCounts[f.ext] = (extCounts[f.ext] || 0) + 1 })
-  const totalSize  = files.reduce((s, f) => s + f.size, 0)
-  const summaryEl  = h('div', { class: 'raw-summary' },
-    ...Object.entries(extCounts).sort().map(([ext, n]) =>
-      h('span', { class: 'raw-ext-badge' }, `${ext.slice(1).toUpperCase()}: ${n}`)),
+  const totalSize = files.reduce((s, f) => s + f.size, 0)
+  const extBadges = Object.entries(extCounts).sort().map(([ext, n]) =>
+    h('span', { class: 'raw-ext-badge' }, `${ext.slice(1).toUpperCase()}: ${n}`))
+  const summaryEl = h('div', { class: 'raw-summary' },
+    ...extBadges,
     h('span', { class: 'raw-total-size' }, files.length ? `— ${_fmtBytes(totalSize)} total` : '')
   )
 
@@ -3384,8 +3419,17 @@ async function renderRawTab (dep, container) {
 
   buildFileRows(files)
 
-  container.appendChild(h('div', { class: 'raw-controls' }, summaryEl, dropzone, errorEl, statusEl))
-  container.appendChild(listEl)
+  // Drop zone for adding more files
+  container.appendChild(h('div', { class: 'raw-controls' }, dropzone, errorEl, statusEl))
+
+  // File list as a card
+  const card = h('div', { class: 'raw-section-card' })
+  card.appendChild(h('div', { class: 'raw-section-header' },
+    h('span', { class: 'raw-section-title' }, 'Raw Binary Files'),
+    summaryEl,
+  ))
+  card.appendChild(listEl)
+  container.appendChild(card)
 }
 
 
@@ -3460,9 +3504,11 @@ function renderNcSection (title, stageLabel, data, container) {
   const { files = [], dir = '', exists = false } = data
   const totalSize = files.reduce((s, f) => s + f.size, 0)
 
-  // Section header row
+  const card = h('div', { class: 'nc-section-card' })
+  container.appendChild(card)
+
   const canOpen = exists && window.APP && window.APP.shellOpen
-  container.appendChild(h('div', { class: 'nc-section-header' },
+  card.appendChild(h('div', { class: 'nc-section-header' },
     h('div', { class: 'nc-section-meta' },
       h('span', { class: 'nc-section-title' }, title),
       h('span', { class: 'nc-section-stage' }, stageLabel),
@@ -3470,17 +3516,11 @@ function renderNcSection (title, stageLabel, data, container) {
         ? h('span', { class: 'nc-section-count' }, `${files.length} files · ${_fmtBytes(totalSize)}`)
         : h('span', { class: 'nc-section-count nc-section-empty' }, 'no files yet'),
     ),
-    h('div', { class: 'nc-section-path' },
-      h('code', { class: 'nc-dir-path', title: dir }, dir),
-      canOpen
-        ? h('button', { class: 'btn-secondary btn-xs',
-            onclick: () => window.APP.shellOpen(dir) }, 'Open ↗')
-        : null,
-    ),
+    canOpen ? h('button', { class: 'btn-secondary btn-xs', onclick: () => window.APP.shellOpen(dir) }, 'Open ↗') : null,
   ))
 
   if (!files.length) {
-    container.appendChild(h('div', { class: 'nc-empty' },
+    card.appendChild(h('div', { class: 'nc-empty' },
       exists ? 'No .nc files in this directory.' : 'Directory does not exist yet — run the stage first.'))
     return
   }
@@ -3498,7 +3538,7 @@ function renderNcSection (title, stageLabel, data, container) {
       h('span', { class: 'nc-file-size' }, _fmtBytes(f.size)),
     ))
   })
-  container.appendChild(listEl)
+  card.appendChild(listEl)
 }
 
 async function _fetchNcFiles (dep) {
@@ -3534,16 +3574,6 @@ async function renderQcOutputTab (dep, container) {
 async function renderCacTab (container) {
   container.innerHTML = ''
 
-  // ── Header ────────────────────────────────────────────────────────────────
-  const header = h('div', { class: 'cac-header' },
-    h('h2', { class: 'cac-title' }, 'CAC Files'),
-    h('p',  { class: 'cac-subtitle' },
-      'Slocum glider cache files (.cac / .ccc) used by Stage 1 to decode binary data. ' +
-      'Files are stored in master_cac/ and shared across all deployments.'
-    )
-  )
-  container.appendChild(header)
-
   // ── File list ─────────────────────────────────────────────────────────────
   const listWrap = h('div', { class: 'cac-list-wrap' })
   container.appendChild(listWrap)
@@ -3558,12 +3588,19 @@ async function renderCacTab (container) {
     }
 
     const files = data.files
-    const dirEl = h('div', { class: 'cac-dir-path' }, data.dir)
-    const countEl = h('span', { class: 'cac-count' }, `${files.length} files`)
-    listWrap.appendChild(h('div', { class: 'cac-list-header' }, dirEl, countEl))
+    const card = h('div', { class: 'cac-section-card' })
+    listWrap.appendChild(card)
+
+    card.appendChild(h('div', { class: 'cac-section-header' },
+      h('div', { class: 'cac-section-meta' },
+        h('span', { class: 'cac-section-title' }, 'CAC Files'),
+        h('span', { class: 'cac-section-subtitle' }, 'Shared cache files for Stage 1 decoding · master_cac/'),
+      ),
+      h('span', { class: 'cac-count' }, `${files.length} files`),
+    ))
 
     if (!files.length) {
-      listWrap.appendChild(h('div', { class: 'empty-state' }, 'No CAC files found. Upload some using the drop zone below.'))
+      card.appendChild(h('div', { class: 'nc-empty' }, 'No CAC files found. Upload some using the drop zone below.'))
       return
     }
 
@@ -3586,7 +3623,7 @@ async function renderCacTab (container) {
       )
       table.appendChild(row)
     }
-    listWrap.appendChild(table)
+    card.appendChild(table)
   }
 
   await refreshList()
@@ -3774,8 +3811,10 @@ async function renderAdcpFilesTab (dep, container) {
       const list = h('div', { class: 'adcp-file-list' })
       stageGroups.forEach(({ stage, label, files }) => {
         list.appendChild(h('div', { class: 'adcp-stage-divider' }, label))
-        files.forEach(file =>
-          list.appendChild(fileRow(file, runStatus[stage]?.files?.[file] ?? false, runLabel)))
+        files.forEach(file => {
+          const prefixed = `${runLabel}_${file}`
+          list.appendChild(fileRow(prefixed, runStatus[stage]?.files?.[prefixed] ?? false, runLabel))
+        })
       })
 
       scroll.appendChild(buildSection(`Run: ${runLabel}`, null, list, zipBtn))
@@ -3853,6 +3892,8 @@ async function renderLogs () {
   const page = document.getElementById('page-logs')
   page.innerHTML = ''
 
+  const dep = state.deployment || ''
+
   const header = h('div', { class: 'page-header' },
     h('h1', {}, 'Run Logs'),
     h('p',  {}, 'History of every pipeline stage run — pass and fail.')
@@ -3863,7 +3904,8 @@ async function renderLogs () {
 
   let logs
   try {
-    const d = await apiFetch('/api/logs')
+    const url = dep ? `/api/logs?dep=${encodeURIComponent(dep)}` : '/api/logs'
+    const d = await apiFetch(url)
     logs = d.logs
   } catch (e) {
     body.appendChild(h('p', { style: 'color:#c0392b;padding:8px' }, `Error loading logs: ${e.message}`))
@@ -3879,68 +3921,35 @@ async function renderLogs () {
     return
   }
 
-  // Filter bar
-  const allDeps = [...new Set(logs.map(l => l.dep))].sort()
-  const filterSel = h('select', { class: 'log-filter-sel' })
-  filterSel.appendChild(h('option', { value: '' }, 'All deployments'))
-  allDeps.forEach(d => filterSel.appendChild(h('option', { value: d }, d)))
-  if (state.deployment) filterSel.value = state.deployment
+  const table = h('table', { class: 'log-table' })
+  table.appendChild(h('thead', {},
+    h('tr', {},
+      h('th', {}, 'Result'),
+      h('th', {}, 'Stage'),
+      h('th', {}, 'Date / Time'),
+      h('th', {}, 'Size'),
+      h('th', {}, '')
+    )
+  ))
+  const tbody = h('tbody', {})
+  logs.forEach(entry => {
+    const badge = h('span', {
+      class: `badge ${entry.result === 'pass' ? 'done' : 'failed'}`
+    }, entry.result === 'pass' ? '✔ Pass' : '✖ Fail')
 
-  const filterRow = h('div', { class: 'log-filter-row' },
-    h('label', { style: 'font-size:12px;color:#607d8b;margin-right:6px' }, 'Deployment:'),
-    filterSel
-  )
-  body.appendChild(filterRow)
+    const viewBtn = h('button', { class: 'btn-secondary btn-sm' }, 'View')
+    viewBtn.onclick = () => showLogFileViewer(entry)
 
-  // Table container (re-rendered on filter change)
-  const tableWrap = h('div', {})
-  body.appendChild(tableWrap)
-
-  function renderTable () {
-    tableWrap.innerHTML = ''
-    const dep = filterSel.value
-    const filtered = dep ? logs.filter(l => l.dep === dep) : logs
-
-    if (!filtered.length) {
-      tableWrap.appendChild(h('p', { style: 'color:#8a9bac;margin-top:12px' }, 'No logs for this deployment yet.'))
-      return
-    }
-
-    const table = h('table', { class: 'log-table' })
-    table.appendChild(h('thead', {},
-      h('tr', {},
-        h('th', {}, 'Result'),
-        h('th', {}, 'Stage'),
-        h('th', {}, 'Deployment'),
-        h('th', {}, 'Date / Time'),
-        h('th', {}, 'Size'),
-        h('th', {}, '')
-      )
+    tbody.appendChild(h('tr', {},
+      h('td', {}, badge),
+      h('td', {}, state.stageInfo[entry.stage]?.label || entry.stage),
+      h('td', { style: 'font-family:monospace;font-size:11px' }, entry.timestamp),
+      h('td', { style: 'color:#8a9bac;font-size:11px' }, formatBytes(entry.size)),
+      h('td', {}, viewBtn)
     ))
-    const tbody = h('tbody', {})
-    filtered.forEach(entry => {
-      const badge = h('span', {
-        class: `badge ${entry.result === 'pass' ? 'done' : 'failed'}`
-      }, entry.result === 'pass' ? '✔ Pass' : '✖ Fail')
-
-      const viewBtn = h('button', { class: 'btn-secondary btn-sm' }, 'View')
-      viewBtn.onclick = () => showLogFileViewer(entry)
-
-      tbody.appendChild(h('tr', {},
-        h('td', {}, badge),
-        h('td', {}, state.stageInfo[entry.stage]?.label || entry.stage),
-        h('td', { style: 'font-family:monospace;font-size:11px' }, entry.dep),
-        h('td', { style: 'font-family:monospace;font-size:11px' }, entry.timestamp),
-        h('td', { style: 'color:#8a9bac;font-size:11px' }, formatBytes(entry.size)),
-        h('td', {}, viewBtn)
-      ))
-    })
-    table.appendChild(tbody)
-    tableWrap.appendChild(table)
-  }
-
-  filterSel.onchange = renderTable
-  renderTable()
+  })
+  table.appendChild(tbody)
+  body.appendChild(table)
 }
 
 /* ── Folder Picker Modal ─────────────────────────────────────────────────────*/
@@ -4163,14 +4172,27 @@ function showFolderPicker (service, onConfirm, options = {}) {
   // Footer (path display + action buttons)
   footerDestEl = h('div', { class: 'fp-dest' })
   renderFooterDest()
+
+  let mirrorFolders = false
+  let subdirToggleEl = null
+  if (options.showSubdirToggle) {
+    const subdirCb = h('input', { type: 'checkbox' })
+    subdirToggleEl = h('div', { class: 'fp-subdir-toggle' },
+      subdirCb,
+      h('label', {}, ' Create subdirectories for each run folder'))
+    subdirCb.addEventListener('change', () => { mirrorFolders = subdirCb.checked })
+  }
+
   modal.appendChild(h('div', { class: 'fp-footer' },
     footerDestEl,
+    ...(subdirToggleEl ? [subdirToggleEl] : []),
     h('div', { class: 'fp-footer-btns' },
       h('button', { class: 'btn-secondary', onclick: () => overlay.remove() }, 'Cancel'),
       h('button', { class: 'btn-primary',
         onclick: () => {
           overlay.remove()
-          const dest = { id: currentId(), path: currentPath(), breadcrumb: [...breadcrumb] }
+          const dest = { id: currentId(), path: currentPath(), breadcrumb: [...breadcrumb],
+                         mirrorFolders }
           if (lsKey) localStorage.setItem(lsKey, JSON.stringify(dest))
           onConfirm(dest)
         },
@@ -4418,7 +4440,11 @@ async function renderCloud () {
   async function doUploadWithStatus (svc, fileObjs, destId, destPath, statusEl, options = {}) {
     const total      = fileObjs.length
     const totalBytes = fileObjs.reduce((s, f) => s + (f.size || 0), 0)
-    const paths      = fileObjs.map(f => f.path)
+    const useSubdirs = options.autoSubdirs || false
+    const items      = fileObjs.map(f => {
+      if (!useSubdirs || !f.label || !/[\\/]/.test(f.label)) return f.path
+      return { path: f.path, subdir: f.label.split(/[\\/]/)[0] }
+    })
     if (!total) return
 
     const conflict = options.conflict != null
@@ -4451,12 +4477,12 @@ async function renderCloud () {
     const RETRY_DELAY  = 1500  // ms; multiplied by attempt number
     let queueIndex = 0, completed = 0, ok = 0, failed = 0, skipped = 0
 
-    async function tryUpload (path) {
+    async function tryUpload (item) {
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
           return await apiFetch('/api/cloud/upload', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ service: svc, files: [path], dest: destId, conflict }),
+            body: JSON.stringify({ service: svc, files: [item], dest: destId, conflict }),
           })
         } catch (err) {
           if (attempt === MAX_RETRIES) throw err
@@ -4472,13 +4498,14 @@ async function renderCloud () {
         const i = queueIndex++
         if (i >= total) break
         try {
-          const r = await tryUpload(paths[i])
+          const r = await tryUpload(items[i])
           if (r.skipped) skipped++; else ok++
         } catch (_) { failed++ }
         completed++
         barFill.style.width = `${Math.round((completed / total) * 100)}%`
         counter.textContent = `${completed} / ${total}`
-        curFile.textContent = paths[i].split(/[\\/]/).pop()
+        const itemPath = typeof items[i] === 'string' ? items[i] : items[i].path
+        curFile.textContent = itemPath.split(/[\\/]/).pop()
       }
     })
     await Promise.all(workers)
@@ -4508,6 +4535,8 @@ async function renderCloud () {
 
     let sectionStatusEl
     let catBody
+    let lastClickedIdx = -1
+    const hasSubdirs = files.some(f => /[\\/]/.test(f.label))
 
     const section = h('div', { class: 'cloud-cat-section' })
 
@@ -4557,8 +4586,9 @@ async function renderCloud () {
           if (!files.length) return
           expandSection()
           showFolderPicker(svc, dest => {
-            doUploadWithStatus(svc, files, dest.id, dest.path, sectionStatusEl)
-          }, { catId })
+            doUploadWithStatus(svc, files, dest.id, dest.path, sectionStatusEl,
+              { autoSubdirs: dest.mirrorFolders })
+          }, { catId, showSubdirToggle: hasSubdirs })
         },
       }, btnLabel)
     }
@@ -4570,6 +4600,7 @@ async function renderCloud () {
           if (!files.length) return
           expandSection()
           showFolderPicker(svc, async dest => {
+            const mirrorFolders = dest.mirrorFolders || false
             sectionStatusEl.innerHTML = ''
             sectionStatusEl.appendChild(
               h('div', { class: 'cloud-resume-checking' }, '⏳ Checking destination…'))
@@ -4600,14 +4631,14 @@ async function renderCloud () {
               updateSelBtns()
 
               doUploadWithStatus(svc, missing, dest.id, dest.path, sectionStatusEl,
-                { conflict: 'overwrite' })
+                { conflict: 'overwrite', autoSubdirs: mirrorFolders })
             } catch (err) {
               sectionStatusEl.innerHTML = ''
               sectionStatusEl.appendChild(
                 h('div', { class: 'cloud-resume-info error' },
                   '⚠ Could not check destination: ' + err.message))
             }
-          }, { catId })
+          }, { catId, showSubdirToggle: hasSubdirs })
         },
       }, btnLabel)
     }
@@ -4651,15 +4682,17 @@ async function renderCloud () {
         selBtnsRow.appendChild(h('button', { class: 'btn-primary btn-sm',
           onclick: () => showFolderPicker('google', dest => {
             const sel = files.filter(f => checkedPaths.has(f.path))
-            doUploadWithStatus('google', sel, dest.id, dest.path, sectionStatusEl)
-          }, { catId }),
+            doUploadWithStatus('google', sel, dest.id, dest.path, sectionStatusEl,
+              { autoSubdirs: dest.mirrorFolders })
+          }, { catId, showSubdirToggle: hasSubdirs }),
         }, `⬆ Upload ${n} to Drive`))
       if (accounts.dropbox.connected)
         selBtnsRow.appendChild(h('button', { class: 'btn-primary btn-sm',
           onclick: () => showFolderPicker('dropbox', dest => {
             const sel = files.filter(f => checkedPaths.has(f.path))
-            doUploadWithStatus('dropbox', sel, dest.id, dest.path, sectionStatusEl)
-          }, { catId }),
+            doUploadWithStatus('dropbox', sel, dest.id, dest.path, sectionStatusEl,
+              { autoSubdirs: dest.mirrorFolders })
+          }, { catId, showSubdirToggle: hasSubdirs }),
         }, `⬆ Upload ${n} to Dropbox`))
     }
 
@@ -4676,24 +4709,42 @@ async function renderCloud () {
         return
       }
 
-      currentVisible.forEach(f => {
+      const rowCbs = []
+      currentVisible.forEach((f, idx) => {
         const cb = h('input', { type: 'checkbox' })
         cb.checked = checkedPaths.has(f.path)
-        cb.addEventListener('change', () => {
-          if (cb.checked) checkedPaths.add(f.path)
-          else            checkedPaths.delete(f.path)
-          updateSelBtns()
-          updateHeaderCb()
-        })
-        fileListEl.appendChild(h('label', { class: 'cloud-file-row' },
+        rowCbs.push(cb)
+
+        const row = h('label', { class: 'cloud-file-row' },
           cb,
           h('span', { class: 'cloud-file-name' }, f.label),
           h('span', { class: 'cloud-file-size' }, fmtSize(f.size))
-        ))
+        )
+        row.addEventListener('click', e => {
+          e.preventDefault()
+          const nowChecked = !checkedPaths.has(f.path)
+          if (e.shiftKey && lastClickedIdx >= 0 && lastClickedIdx !== idx) {
+            const lo = Math.min(lastClickedIdx, idx)
+            const hi = Math.max(lastClickedIdx, idx)
+            for (let i = lo; i <= hi; i++) {
+              if (nowChecked) checkedPaths.add(currentVisible[i].path)
+              else            checkedPaths.delete(currentVisible[i].path)
+              rowCbs[i].checked = nowChecked
+            }
+          } else {
+            if (nowChecked) checkedPaths.add(f.path)
+            else            checkedPaths.delete(f.path)
+            cb.checked = nowChecked
+            lastClickedIdx = idx
+          }
+          updateSelBtns()
+          updateHeaderCb()
+        })
+        fileListEl.appendChild(row)
       })
     }
 
-    searchInput.addEventListener('input', e => renderFiles(e.target.value))
+    searchInput.addEventListener('input', e => { lastClickedIdx = -1; renderFiles(e.target.value) })
 
     header.addEventListener('click', () => {
       expanded = !expanded
@@ -4786,16 +4837,32 @@ async function renderAdcp () {
   let isTest       = false
   let testDep      = null
   let selectedFile = null
-  const adcpOpts   = { xaxis: 3, yaxis: null, depth_min: 10, depth_max: 1000 }
+  const adcpOpts   = { xaxis: 1, yaxis: null, depth_min: 10, depth_max: 1000,
+                       qc_corr: 80, qc_amp: 80, qc_vel: 0.8, qc_snr: 3,
+                       mounting: 'auto', weight_bias: false, vel_dep_bias: false,
+                       pitch_offset: 0, roll_offset: 0, heading_offset: 0 }
   const adcpLogs   = {}    // stage -> [lines]
   const adcpCtrl   = {}    // stage -> AbortController
+  const adcpIvs    = {}    // stage -> setInterval id (timer)
 
   function adcpRunLabel (opts) {
-    const xaxis = parseInt(opts.xaxis ?? 3)
+    const xaxis = parseInt(opts.xaxis ?? 1)
     const dmin  = parseInt(parseFloat(opts.depth_min ?? 10))
     const dmax  = parseInt(parseFloat(opts.depth_max ?? 1000))
     let label = `xaxis${xaxis}_d${dmin}-${dmax}`
     if (opts.yaxis != null) label += `_y${parseInt(parseFloat(opts.yaxis))}`
+    const corr = parseFloat(opts.qc_corr ?? 80)
+    const amp  = parseFloat(opts.qc_amp  ?? 80)
+    const vel  = parseFloat(opts.qc_vel  ?? 0.8)
+    const snr  = parseFloat(opts.qc_snr  ?? 3)
+    if (corr !== 80 || amp !== 80 || vel !== 0.8 || snr !== 3)
+      label += `_qc${corr}-${amp}-${vel}-${snr}`
+    const mount = opts.mounting ?? 'auto'
+    if (mount !== 'auto') label += `_${mount}`
+    const p = parseFloat(opts.pitch_offset ?? 0)
+    const r = parseFloat(opts.roll_offset  ?? 0)
+    const hd = parseFloat(opts.heading_offset ?? 0)
+    if (p !== 0 || r !== 0 || hd !== 0) label += `_off${p}p${r}r${hd}h`
     return label
   }
 
@@ -4991,10 +5058,19 @@ async function renderAdcp () {
       // Stages
       belowArea.appendChild(h('div', { class: 'adcp-section-title', style: 'margin-top:20px' }, 'Processing Stages'))
 
-      let statusR
+      let statusR, liveR
       try {
-        statusR = await apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=${isTest}`)
-      } catch { statusR = { shared: {}, runs: {} } }
+        ;[statusR, liveR] = await Promise.all([
+          apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=${isTest}`),
+          apiFetch(`/api/adcp/live-stages?dep=${encodeURIComponent(dep)}&is_test=${isTest}`).catch(() => ({ running: [] })),
+        ])
+      } catch { statusR = { shared: {}, runs: {} }; liveR = { running: [] } }
+
+      // Stages currently streaming in this JS context or still running on the server
+      const liveStages = new Set([
+        ...(liveR.running || []),
+        ...Object.keys(adcpCtrl),   // active fetch loops pointing at old DOM
+      ])
 
       // Merge shared-stage statuses with the current run's option-stage statuses
       const currentRun = adcpRunLabel(adcpOpts)
@@ -5005,30 +5081,35 @@ async function renderAdcp () {
 
       const stagesDefs = isTest
         ? [
-            { id: 'process_shear',  label: 'Process Shear',  needs: [] },
-            { id: 'generate_plots', label: 'Generate Plots', needs: ['process_shear'] },
+            { id: 'process_shear',   label: 'Process Shear',  needs: [] },
+            { id: 'generate_plots',  label: 'Generate Plots', needs: ['process_shear'] },
+            { id: 'lab_diagnostics', label: 'Lab Diagnostics', needs: ['process_shear'] },
           ]
         : [
-            { id: 'load_nc',          label: 'Load & Combine Profile NCs', needs: [] },
+            { id: 'load_nc',          label: 'Load & Combine Profile NCs', needs: [],                                        section: 'Shared stages — run once per deployment, regardless of processing options' },
             { id: 'gps_pairing',      label: 'GPS Pairing',                needs: ['load_nc'] },
             { id: 'write_glider_nc',  label: 'Write Glider NetCDF',        needs: ['load_nc'] },
-            { id: 'process_shear',    label: 'Process Shear',                          needs: ['write_glider_nc'] },
-            { id: 'compute_currents', label: 'Compute Absolute Currents',               needs: ['process_shear', 'gps_pairing'] },
-            { id: 'bias_correction',  label: 'Bias Correction',                         needs: ['compute_currents'] },
-            { id: 'generate_plots',   label: 'Generate Plots',                          needs: ['bias_correction'] },
-            { id: 'tidal_filter',     label: 'Tidal Filtering (40-h low-pass)',         needs: ['bias_correction'] },
-            { id: 'diagnostics',      label: 'Diagnostics (EKE · Transport · Ri)',      needs: ['bias_correction', 'process_shear'] },
+            { id: 'process_shear',    label: 'Process Shear',              needs: ['write_glider_nc'],                       section: 'Option-specific stages — re-run when X-axis, Y-axis, or Depth slice changes' },
+            { id: 'compute_currents', label: 'Compute Absolute Currents',  needs: ['process_shear', 'gps_pairing'] },
+            { id: 'bias_correction',  label: 'Bias Correction',            needs: ['compute_currents'] },
+            { id: 'generate_plots',   label: 'Generate Plots',             needs: ['bias_correction'] },
+            { id: 'tidal_filter',     label: 'Tidal Filtering (40-h low-pass)',       needs: ['bias_correction'] },
+            { id: 'diagnostics',      label: 'Diagnostics (EKE · Transport · Ri)',    needs: ['bias_correction', 'process_shear'] },
           ]
 
       const stagesContainer = h('div', {})
       belowArea.appendChild(stagesContainer)
 
-      stagesDefs.forEach(({ id, label, needs }) => {
+      stagesDefs.forEach(({ id, label, needs, section }) => {
+        if (section) {
+          stagesContainer.appendChild(
+            h('div', { class: 'adcp-section-title', style: 'margin-top:18px' }, section))
+        }
         const inputsMet   = needs.every(n => statusMap[n]?.done)
         const initStatus  = statusMap[id]?.done ? 'done' : 'not_run'
         stagesContainer.appendChild(
           buildAdcpStageCard(id, label, initStatus, dep, inputsMet, stagesContainer, stagesDefs, statusMap,
-            () => renderBelow(dep)))
+            () => renderBelow(dep), liveStages.has(id)))
       })
 
       // Export panel
@@ -5063,7 +5144,7 @@ async function renderAdcp () {
     })
 
     const xSel = h('select', { class: 'adcp-input' })
-    ;[['1','Time'],['2','Profile'],['3','Distance']].forEach(([v, l]) => {
+    ;[['1','1 — Time (1 profile per column, max resolution)'],['2','2 — Profile (2 profiles per column, balanced)'],['3','3 — Distance (3 profiles per column, smoother)']].forEach(([v, l]) => {
       const o = h('option', { value: v }, l)
       if (String(adcpOpts.xaxis) === v) o.selected = true
       xSel.appendChild(o)
@@ -5082,15 +5163,97 @@ async function renderAdcp () {
       value: adcpOpts.depth_max, min: '0', max: '2000' })
     dMaxIn.addEventListener('input', () => { adcpOpts.depth_max = parseFloat(dMaxIn.value) || 1000 })
 
+    const qcCorrIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.qc_corr, min: '0', max: '128', step: '5' })
+    qcCorrIn.addEventListener('input', () => { adcpOpts.qc_corr = parseFloat(qcCorrIn.value) || 80 })
+
+    const qcAmpIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.qc_amp, min: '0', max: '255', step: '5' })
+    qcAmpIn.addEventListener('input', () => { adcpOpts.qc_amp = parseFloat(qcAmpIn.value) || 80 })
+
+    const qcVelIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.qc_vel, min: '0', max: '5', step: '0.1' })
+    qcVelIn.addEventListener('input', () => { adcpOpts.qc_vel = parseFloat(qcVelIn.value) || 0.8 })
+
+    const qcSnrIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.qc_snr, min: '0', max: '20', step: '1' })
+    qcSnrIn.addEventListener('input', () => { adcpOpts.qc_snr = parseFloat(qcSnrIn.value) || 3 })
+
+    // Mounting direction
+    const mountSel = h('select', { class: 'adcp-input' })
+    ;[['auto','Auto-detect'],['top','Top-mounted (faces up)'],['bottom','Bottom-mounted (faces down)']].forEach(([v, l]) => {
+      const o = h('option', { value: v }, l)
+      if ((adcpOpts.mounting ?? 'auto') === v) o.selected = true
+      mountSel.appendChild(o)
+    })
+    mountSel.addEventListener('change', () => { adcpOpts.mounting = mountSel.value })
+
+    // Attitude offsets
+    const pitchIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.pitch_offset, min: '-30', max: '30', step: '0.5' })
+    pitchIn.addEventListener('input', () => { adcpOpts.pitch_offset = parseFloat(pitchIn.value) || 0 })
+
+    const rollIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.roll_offset, min: '-30', max: '30', step: '0.5' })
+    rollIn.addEventListener('input', () => { adcpOpts.roll_offset = parseFloat(rollIn.value) || 0 })
+
+    const headingIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
+      value: adcpOpts.heading_offset, min: '-180', max: '180', step: '1' })
+    headingIn.addEventListener('input', () => { adcpOpts.heading_offset = parseFloat(headingIn.value) || 0 })
+
+    // Bias correction toggles
+    const weightChk = h('input', { type: 'checkbox', class: 'adcp-checkbox' })
+    weightChk.checked = !!adcpOpts.weight_bias
+    weightChk.addEventListener('change', () => { adcpOpts.weight_bias = weightChk.checked })
+
+    const velDepChk = h('input', { type: 'checkbox', class: 'adcp-checkbox' })
+    velDepChk.checked = !!adcpOpts.vel_dep_bias
+    velDepChk.addEventListener('change', () => { adcpOpts.vel_dep_bias = velDepChk.checked })
+
     const optBody = h('div', { class: 'adcp-opts-body', style: 'display:none' },
+      h('div', { class: 'adcp-opt-group-title' }, 'Binning / Output Grid  (changing these requires re-running Process Shear, Compute Currents, and Bias Correction)'),
       h('div', { class: 'adcp-opt-row' },
-        h('label', { class: 'adcp-opt-label' }, 'X-axis:'), xSel),
+        h('label', { class: 'adcp-opt-label' }, 'X-axis:'), xSel,
+        h('span', { class: 'adcp-opt-hint' }, 'Number of consecutive half-profiles (dive legs) averaged into each output column. Time/Profile/Distance are descriptive names — the library parameter is "x-axis resolution in number of profiles."')),
       h('div', { class: 'adcp-opt-row' },
         h('label', { class: 'adcp-opt-label' }, 'Y-axis (m):'), yIn,
         h('span', { class: 'adcp-opt-hint' }, 'blank = use ADCP cell size')),
       h('div', { class: 'adcp-opt-row' },
         h('label', { class: 'adcp-opt-label' }, 'Depth slice (m):'),
-        dMinIn, h('span', { class: 'adcp-opt-sep' }, ' – '), dMaxIn),
+        dMinIn, h('span', { class: 'adcp-opt-sep' }, ' – '), dMaxIn,
+        h('span', { class: 'adcp-opt-hint' }, 'depth range used for shear-bias regression only — does not clip the output depth range')),
+      h('div', { class: 'adcp-opt-group-title' }, 'Instrument  (changing these requires re-running Process Shear)'),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Mounting direction:'), mountSel),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Pitch offset (°):'), pitchIn,
+        h('span', { class: 'adcp-opt-hint' }, 'transducer misalignment correction')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Roll offset (°):'), rollIn,
+        h('span', { class: 'adcp-opt-hint' }, 'transducer misalignment correction')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Heading offset (°):'), headingIn,
+        h('span', { class: 'adcp-opt-hint' }, 'transducer misalignment correction')),
+      h('div', { class: 'adcp-opt-group-title' }, 'Quality Control  (changing these requires re-running Process Shear)'),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Min correlation:'), qcCorrIn,
+        h('span', { class: 'adcp-opt-hint' }, 'default 80 — lower = more data, more noise')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Max amplitude:'), qcAmpIn,
+        h('span', { class: 'adcp-opt-hint' }, 'default 80 — screens side-lobe contamination')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Max velocity (m/s):'), qcVelIn,
+        h('span', { class: 'adcp-opt-hint' }, 'default 0.8 — rejects obviously bad pings')),
+      h('div', { class: 'adcp-opt-row' },
+        h('label', { class: 'adcp-opt-label' }, 'Min SNR (dB):'), qcSnrIn,
+        h('span', { class: 'adcp-opt-hint' }, 'default 3 — min signal above noise floor')),
+      h('div', { class: 'adcp-opt-group-title' }, 'Bias Correction  (changing these requires re-running Bias Correction only)'),
+      h('div', { class: 'adcp-opt-row' },
+        weightChk, h('label', { class: 'adcp-opt-label adcp-opt-label-chk' }, 'Weight bias regression by dive distance'),
+        h('span', { class: 'adcp-opt-hint' }, 'improves correction when dive lengths vary significantly')),
+      h('div', { class: 'adcp-opt-row' },
+        velDepChk, h('label', { class: 'adcp-opt-label adcp-opt-label-chk' }, 'Velocity-dependent bias correction'),
+        h('span', { class: 'adcp-opt-hint' }, 'fits velocity-dependent coefficients instead of a constant bias')),
     )
 
     container.appendChild(toggleBtn)
@@ -5098,24 +5261,25 @@ async function renderAdcp () {
   }
 
   // ── Stage card ───────────────────────────────────────────────────────────────
-  function buildAdcpStageCard (id, label, initStatus, dep, inputsMet, stagesContainer, stagesDefs, statusMap, refreshFn) {
-    const badge = h('span', { class: `status-badge ${inputsMet ? statusClass(initStatus) : 'not_run'}` },
-      inputsMet ? statusLabel(initStatus) : 'WAITING')
+  function buildAdcpStageCard (id, label, initStatus, dep, inputsMet, stagesContainer, stagesDefs, statusMap, refreshFn, liveRunning = false) {
+    const badge = h('span', {
+      class: `status-badge ${liveRunning ? 'running' : (inputsMet ? statusClass(initStatus) : 'not_run')}`,
+    }, liveRunning ? 'RUNNING…' : (inputsMet ? statusLabel(initStatus) : 'WAITING'))
 
     const logEl   = h('div', { class: 'log-pane hidden' })
-    const elapsed = h('span', { class: 'adcp-elapsed hidden' })
+    const elapsed = h('span', { class: `adcp-elapsed${liveRunning ? '' : ' hidden'}` })
 
-    if (adcpLogs[id]?.length) {
+    if (!liveRunning && adcpLogs[id]?.length) {
       adcpLogs[id].forEach(l => appendLog(logEl, l))
       logEl.classList.remove('hidden')
     }
 
     const btnRun = h('button', {
-      class: `btn-success${inputsMet ? '' : ' disabled'}`,
+      class: `btn-success${(inputsMet && !liveRunning) ? '' : ' hidden'}`,
     }, initStatus === 'done' ? 'Re-run' : 'Run')
-    btnRun.disabled = !inputsMet
+    btnRun.disabled = !inputsMet || liveRunning
 
-    const btnAbort = h('button', { class: 'btn-danger hidden' }, 'Cancel')
+    const btnAbort = h('button', { class: `btn-danger${liveRunning ? '' : ' hidden'}` }, 'Cancel')
     const btnClear = h('button', { class: 'btn-secondary' }, 'Clear log')
 
     btnClear.addEventListener('click', () => {
@@ -5127,6 +5291,7 @@ async function renderAdcp () {
                    stagesContainer, stagesDefs, statusMap, refreshFn))
 
     btnAbort.addEventListener('click', () => {
+      if (adcpIvs[id])  { clearInterval(adcpIvs[id]);  delete adcpIvs[id] }
       const ctrl = adcpCtrl[id]
       if (ctrl) { ctrl.abort(); delete adcpCtrl[id] }
       badge.className   = 'status-badge failed'
@@ -5136,36 +5301,105 @@ async function renderAdcp () {
       elapsed.classList.add('hidden')
     })
 
-    return h('div', { class: 'stage-card' },
+    // Xaxis recommendation — shown for process_shear stage; falls back to any
+    // existing run's shear file so the tip appears even before the current
+    // config has been processed.
+    const recBox = h('div', {})
+    if (id === 'process_shear') {
+      const runLabel = adcpRunLabel(adcpOpts)
+      const qs = `dep=${encodeURIComponent(dep)}&run=${encodeURIComponent(runLabel)}&is_test=${isTest}`;
+      (async () => {
+        try {
+          const r = await apiFetch(`/api/adcp/shear_stats?${qs}`)
+          if (r.rec_xaxis != null) {
+            const isCurrent = adcpOpts.xaxis === r.rec_xaxis
+            const borderColor = r.rec_xaxis === 1 ? '#1e8449' : r.rec_xaxis === 2 ? '#2471a3' : '#b7770d'
+            const currentNote = isCurrent
+              ? ' <span style="color:#1e8449">✔ already set</span>'
+              : ` — <em>currently set to xaxis=${adcpOpts.xaxis}</em>`
+            const sourceNote = (r.source_run && r.source_run !== runLabel)
+              ? `<div style="margin-top:6px;font-size:11.5px;color:#888">` +
+                `Based on shear stats from existing run <code>${r.source_run}</code> ` +
+                `— ping rates are consistent across xaxis settings so this estimate is valid.</div>`
+              : ''
+            const actionHtml = r.rec_action && !isCurrent
+              ? `<div style="margin-top:8px;padding:7px 10px;background:rgba(0,0,0,0.04);` +
+                `border-radius:3px;font-size:12px"><strong>To apply:</strong> ${r.rec_action.replace('To apply: ', '')}</div>`
+              : ''
+            recBox.innerHTML =
+              `<div style="margin:12px 0 4px;padding:12px 16px;background:var(--card-bg,#f4f6fb);` +
+              `border-left:4px solid ${borderColor};border-radius:3px;font-size:12.5px;line-height:1.65">` +
+              `<div style="font-weight:700;margin-bottom:6px">` +
+              `X-axis recommendation: xaxis=${r.rec_xaxis}${currentNote}</div>` +
+              `<div style="color:var(--text-muted,#555)">${r.rec_reason}</div>` +
+              actionHtml + sourceNote +
+              `</div>`
+          }
+        } catch (_) {}
+      })()
+    }
+
+    const card = h('div', { class: 'stage-card' },
       h('div', { class: 'stage-card-header' },
         h('span', { class: 'stage-title' }, label), badge),
       h('div', { class: 'stage-body' },
         h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear, elapsed),
-        logEl),
+        logEl, recBox),
     )
+
+    if (liveRunning) {
+      // Abort any old fetch loop that has closures over detached DOM elements,
+      // then reconnect using the freshly built DOM refs.
+      setTimeout(() => {
+        if (adcpIvs[id]) { clearInterval(adcpIvs[id]); delete adcpIvs[id] }
+        if (adcpCtrl[id]) { adcpCtrl[id].abort(); delete adcpCtrl[id] }
+        runAdcpStage(id, label, dep, badge, btnRun, btnAbort, logEl, elapsed,
+                     stagesContainer, stagesDefs, statusMap, refreshFn, true)
+      }, 0)
+    }
+
+    return card
   }
 
   // ── Run a stage via SSE ──────────────────────────────────────────────────────
   async function runAdcpStage (id, label, dep, badge, btnRun, btnAbort, logEl, elapsed,
-                                stagesContainer, stagesDefs, statusMap, refreshFn) {
+                                stagesContainer, stagesDefs, statusMap, refreshFn, reconnect = false) {
+    // On reconnect the backend replays the full log buffer, so clear local state
+    // and let the replay fill it in fresh (avoids duplicates).
     adcpLogs[id] = []
     logEl.innerHTML = ''
+    if (reconnect) {
+      const sep = '↩ Reconnected — replaying log from server…'
+      adcpLogs[id].push(sep)
+      appendLog(logEl, sep)
+    }
     logEl.classList.remove('hidden')
-    btnRun.classList.add('hidden')
-    btnAbort.classList.remove('hidden')
-    badge.className   = 'status-badge running'
-    badge.textContent = 'RUNNING…'
+    if (!reconnect) {
+      btnRun.classList.add('hidden')
+      btnAbort.classList.remove('hidden')
+      badge.className   = 'status-badge running'
+      badge.textContent = 'RUNNING…'
+    }
+
+    // Clear any leftover interval from a previous run on this stage
+    if (adcpIvs[id]) { clearInterval(adcpIvs[id]); delete adcpIvs[id] }
 
     const t0 = Date.now()
     elapsed.classList.remove('hidden')
-    const iv = setInterval(() => {
+    adcpIvs[id] = setInterval(() => {
       const s = Math.round((Date.now() - t0) / 1000)
       elapsed.textContent = `${Math.floor(s / 60)}m ${s % 60}s`
     }, 1000)
 
+    const stopTimer = () => {
+      if (adcpIvs[id]) { clearInterval(adcpIvs[id]); delete adcpIvs[id] }
+      elapsed.classList.add('hidden')
+    }
+
     const ctrl = new AbortController()
     adcpCtrl[id] = ctrl
 
+    let receivedDone = false
     try {
       const resp = await fetch(`${API}/api/adcp/run/${id}`, {
         method: 'POST',
@@ -5191,9 +5425,18 @@ async function renderAdcp () {
               adcpLogs[id].push(evt.line)
               appendLog(logEl, evt.line)
             } else if (evt.type === 'done') {
-              clearInterval(iv); elapsed.classList.add('hidden')
+              receivedDone = true
+              stopTimer()
               const success = evt.success
-              const msg     = success ? 'Completed successfully.' : 'Finished with errors.'
+              // If compute_currents detected the actual cell size, update opts so
+              // all subsequent stages target the renamed run directory.
+              if (success && evt.actual_yaxis != null && adcpOpts.yaxis == null) {
+                adcpOpts.yaxis = evt.actual_yaxis
+                const note = `Y-axis auto-detected: ${evt.actual_yaxis} m (ADCP cell size) — run directory renamed to include _y${evt.actual_yaxis}.`
+                adcpLogs[id].push(note)
+                appendLog(logEl, note)
+              }
+              const msg = success ? 'Completed successfully.' : 'Finished with errors.'
               adcpLogs[id].push(msg)
               appendLog(logEl, msg)
               badge.className   = `status-badge ${success ? 'done' : 'failed'}`
@@ -5203,14 +5446,36 @@ async function renderAdcp () {
               btnRun.classList.remove('hidden', 'disabled')
               btnAbort.classList.add('hidden')
               delete adcpCtrl[id]
-              // Refresh stage cards so downstream stages unlock (without scrolling to top)
-              if (success && refreshFn) refreshFn()
+              // Delay refresh so logs are readable before the stage area rebuilds.
+              // Save and restore scroll position so the page doesn't jump to the top.
+              if (success && refreshFn) setTimeout(() => {
+                const pageBody = document.querySelector('.page-body')
+                const savedScroll = pageBody ? pageBody.scrollTop : 0
+                refreshFn()
+                if (pageBody) requestAnimationFrame(() => { pageBody.scrollTop = savedScroll })
+              }, 800)
             }
           } catch (_) {}
         }
       }
+
+      // Stream ended without a done event — connection dropped while backend
+      // may still be running. Reset UI so the user can reload or re-run.
+      if (!receivedDone) {
+        stopTimer()
+        const msg = 'Connection lost — the stage may still be running on the server. Navigate away and back to reconnect.'
+        adcpLogs[id].push(msg)
+        appendLog(logEl, msg)
+        badge.className   = 'status-badge failed'
+        badge.textContent = '⚠ DISCONNECTED'
+        btnRun.textContent = 'Re-run'
+        btnRun.disabled    = false
+        btnRun.classList.remove('hidden', 'disabled')
+        btnAbort.classList.add('hidden')
+        delete adcpCtrl[id]
+      }
     } catch (e) {
-      clearInterval(iv); elapsed.classList.add('hidden')
+      stopTimer()
       if (e.name !== 'AbortError') {
         appendLog(logEl, 'Stream error: ' + e.message)
         badge.className   = 'status-badge failed'
@@ -5607,6 +5872,22 @@ async function init () {
   document.querySelectorAll('.nav-item').forEach(li =>
     li.addEventListener('click', () => navigate(li.dataset.page))
   )
+
+  // Silently verify cloud tokens in background; show warning dot if reconnect needed
+  apiFetch('/api/cloud/verify').then(v => {
+    const needsReconnect =
+      (v.google.has_creds  && v.google.has_token  && !v.google.live) ||
+      (v.dropbox.has_creds && v.dropbox.has_token && !v.dropbox.live)
+    if (needsReconnect) {
+      const navCloud = document.querySelector('.nav-item[data-page="cloud"]')
+      if (navCloud && !navCloud.querySelector('.nav-warn-dot')) {
+        const dot = document.createElement('span')
+        dot.className = 'nav-warn-dot'
+        dot.title = 'Cloud storage: reconnection needed'
+        navCloud.appendChild(dot)
+      }
+    }
+  }).catch(() => {})
 
   await navigate('dashboard')
 }

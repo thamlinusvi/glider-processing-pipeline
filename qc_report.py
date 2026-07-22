@@ -393,8 +393,8 @@ def html_summary(n_files, s):
                  if depth_max > -np.inf else 'N/A')
 
     cards = [
-        ('NC Files',           f'{n_files:,}',           ''),
-        ('No-science files',   f'{s["nosci_count"]:,}',  'all NaN temperature'),
+        ('Total Profiles',     f'{n_files:,}',           'one per dive leg (NC file)'),
+        ('Profiles missing science data', f'{s["nosci_count"]:,}', 'all NaN temperature'),
         ('Time observations',  f'{s["total_obs"]:,}',    ''),
         ('Start',              start_str,                 ''),
         ('End',                end_str,                   ''),
