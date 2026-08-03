@@ -2585,7 +2585,9 @@ def _adcp_pipeline_summary_html(base, run_dirs):
             'velocity_sections.png': ('Eastward &amp; northward velocity sections (±0.5 m/s)', 'currents_bias_corrected.nc'),
             'speed_section.png':     ('Current speed section (0–0.5 m/s)',                     'currents_bias_corrected.nc'),
             'shear_sections.png':    ('Vertical shear sections (s⁻¹)',                         'shear_processed.nc'),
-            'backscatter.png':       ('Acoustic backscatter / amplitude',                       'shear_processed.nc'),
+            'backscatter.png':       ('Acoustic backscatter / amplitude (range axis)',           'shear_processed.nc'),
+            'correlation.png':       ('Beam correlation (0–100%, depth axis)',                  'shear_processed.nc'),
+            'beam_amplitude.png':    ('Beam amplitude / SNR proxy (counts, depth axis)',        'shear_processed.nc'),
             'dac_timeseries.png':    ('Depth-averaged current time series',                     'dac.npz'),
             'dac_map_cartopy.png':   ('Glider track &amp; current vector map',                  'dac.npz + gps_data.npz'),
             'tidal_filter.png':      ('Tidal partition (40-h low-pass)',                        'currents_bias_corrected.nc'),
@@ -2636,6 +2638,7 @@ def adcp_report_html():
 
     dep = request.args.get('dep', '')
     run = request.args.get('run', '')
+    is_dl = request.args.get('dl') == '1'
     if not dep:
         return jsonify({'error': 'dep required'}), 400
 
@@ -2655,6 +2658,30 @@ def adcp_report_html():
     if not run_dirs:
         return jsonify({'error': 'No runs found'}), 404
 
+    # Serve cached HTML if it exists and is newer than every file in the run dir(s)
+    fname     = f'adcp_report_{dep}{"_"+run if run else ""}.html'
+    save_path = os.path.join(base, fname)
+    if not is_dl and os.path.isfile(save_path):
+        cache_mtime = os.path.getmtime(save_path)
+        stale = False
+        for rd in run_dirs.values():
+            try:
+                for f in os.listdir(rd):
+                    fp = os.path.join(rd, f)
+                    if os.path.isfile(fp) and os.path.getmtime(fp) > cache_mtime:
+                        stale = True
+                        break
+            except OSError:
+                stale = True
+            if stale:
+                break
+        if not stale:
+            try:
+                with open(save_path, 'r', encoding='utf-8') as fh:
+                    return Response(fh.read(), mimetype='text/html')
+            except Exception:
+                pass  # fall through to regenerate
+
     # Plot groups — matches the stage order in the pipeline
     PLOT_GROUPS = [
         ('Bias Correction',            [('bias_diagnostic.png',   'Bias Diagnostic')]),
@@ -2662,6 +2689,8 @@ def adcp_report_html():
                                         ('speed_section.png',     'Speed Section')]),
         ('Shear &amp; Backscatter',    [('shear_sections.png',    'Shear Sections'),
                                         ('backscatter.png',       'Backscatter (Acoustic Amplitude)')]),
+        ('Beam Quality',               [('correlation.png',       'Beam Correlation'),
+                                        ('beam_amplitude.png',    'Beam Amplitude (SNR Proxy)')]),
         ('Depth-Averaged Currents',    [('dac_timeseries.png',    'DAC Time Series'),
                                         ('dac_map_cartopy.png',   'Current Vectors Map')]),
         ('Tidal Analysis',             [('tidal_filter.png',      'Tidal Filter (40-h low-pass)')]),
@@ -3962,7 +3991,8 @@ _ADCP_OUTPUTS = {
     'compute_currents': ['currents.nc', 'dac.npz'],
     'bias_correction':  ['currents_bias_corrected.nc', 'bias_diagnostic.png'],
     'generate_plots':   ['velocity_sections.png', 'speed_section.png', 'shear_sections.png',
-                         'backscatter.png', 'dac_timeseries.png', 'dac_map_cartopy.png'],
+                         'backscatter.png', 'correlation.png', 'beam_amplitude.png',
+                         'dac_timeseries.png', 'dac_map_cartopy.png'],
     'tidal_filter':     ['currents_subtidal.nc', 'tidal_filter.png'],
     'diagnostics':      ['eke.png', 'transport.png', 'richardson_number.png'],
 }
@@ -3991,6 +4021,20 @@ def _adcp_run_label(opts):
     label = f'xaxis{xaxis}_d{dmin}-{dmax}'
     if opts.get('yaxis') is not None:
         label += f'_y{int(float(opts["yaxis"]))}'
+    corr = float(opts.get('qc_corr', 80))
+    amp  = float(opts.get('qc_amp',  80))
+    vel  = float(opts.get('qc_vel',  0.8))
+    snr  = float(opts.get('qc_snr',  3))
+    if corr != 80 or amp != 80 or vel != 0.8 or snr != 3:
+        label += f'_qc{corr}-{amp}-{vel}-{snr}'
+    mount = opts.get('mounting', 'auto')
+    if mount and mount != 'auto':
+        label += f'_{mount}'
+    p  = float(opts.get('pitch_offset',   0))
+    r  = float(opts.get('roll_offset',    0))
+    hd = float(opts.get('heading_offset', 0))
+    if p != 0 or r != 0 or hd != 0:
+        label += f'_off{p}p{r}r{hd}h'
     return label
 
 
@@ -4370,6 +4414,14 @@ def _adcp_compute_currents(base_dir, run_dir, opts, log):
                 os.rename(run_dir, new_run_dir)
                 log(f'Detected cell size: {actual_yaxis} m — renamed run directory:')
                 log(f'  {old_label} → {new_label}')
+                old_prefix = old_label + '_'
+                new_prefix = new_label + '_'
+                for fname in os.listdir(new_run_dir):
+                    if fname.startswith(old_prefix):
+                        os.rename(
+                            os.path.join(new_run_dir, fname),
+                            os.path.join(new_run_dir, new_prefix + fname[len(old_prefix):])
+                        )
     return actual_yaxis
 
 
@@ -4707,7 +4759,7 @@ below assess instrument health and configuration, not acoustic performance in wa
     log(f'Overall result: {ok_str} ({n_pass}/{n_total} checks)')
 
 
-def _adcp_generate_plots(base_dir, run_dir, is_test, log):
+def _adcp_generate_plots(base_dir, run_dir, is_test, opts, log):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -4811,9 +4863,11 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, log):
 
         depth = currents_bias.depth.values
 
-        # Plot 1: E/N velocity sections
+        # Depth axis limits — surface anchored at 0, max from data
+        d_min = 0.0
         d_max = float(np.nanmax(depth))
-        d_min = float(np.nanmin(depth))
+
+        # Plot 1: E/N velocity sections
         fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
         for ax, var, label in zip(axes, [vel_E, vel_N],
                                   ['Eastward velocity (m/s)', 'Northward velocity (m/s)']):
@@ -4821,9 +4875,9 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, log):
                               cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
             plt.colorbar(p, ax=ax, label=label, pad=0.01)
             ax.set_ylabel('Depth (m)')
-            ax.invert_yaxis()
-            ax.set_ylim([d_max, d_min])
         axes[1].set_xlabel('Date')
+        # Apply depth clipping and inversion ONCE on the shared axis
+        axes[0].set_ylim(d_max, d_min)
         fig.suptitle('Bias-corrected absolute velocities', fontsize=13)
         plt.tight_layout()
         p1 = _rf(run_dir, 'velocity_sections.png')
@@ -4839,8 +4893,7 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, log):
         plt.colorbar(p, ax=ax, label='Speed (m/s)', pad=0.01)
         ax.set_ylabel('Depth (m)')
         ax.set_xlabel('Date')
-        ax.invert_yaxis()
-        ax.set_ylim([d_max, d_min])
+        ax.set_ylim(d_max, d_min)
         ax.set_title('Current speed')
         plt.tight_layout()
         p2 = _rf(run_dir, 'speed_section.png')
@@ -4927,7 +4980,93 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, log):
         except Exception as exc:
             log(f'Backscatter plot skipped ({exc})')
 
-        # Plot 5: DAC time series
+        # Plot 5: Correlation and amplitude heatmaps on absolute depth axis
+        # Groups raw beam pings by profile_number, grids onto regular depth axis using D1-D4 mean depths
+        try:
+            ds_q        = xr.open_dataset(_rf(run_dir, 'shear_processed.nc'))
+            corr_vars_q = [f'CorrelationBeam{b}' for b in range(1, 5) if f'CorrelationBeam{b}' in ds_q]
+            amp_vars_q  = [f'AmplitudeBeam{b}'   for b in range(1, 5) if f'AmplitudeBeam{b}'   in ds_q]
+            d_vars_q    = [v for v in ['D1', 'D2', 'D3', 'D4'] if v in ds_q]
+
+            if corr_vars_q and d_vars_q and 'profile_number' in ds_q:
+                # Per-profile time axis
+                profile_nums          = ds_q.profile_number.values.astype(int)
+                prof_labels, prof_inv = np.unique(profile_nums, return_inverse=True)
+                n_prof                = len(prof_labels)
+                t_float = pd.Series(ds_q.time.values).interpolate(method='linear').values.astype('float64')
+                t_sum   = np.bincount(prof_inv, weights=t_float, minlength=n_prof)
+                t_cnt   = np.bincount(prof_inv, minlength=n_prof)
+                q_time  = (t_sum / np.maximum(t_cnt, 1)).astype('datetime64[ns]')
+
+                # Mean absolute depth across D1-D4 per (ping, bin)
+                D_arr = np.nanmean(np.stack([ds_q[v].values for v in d_vars_q], axis=0), axis=0)
+
+                # Depth grid using yaxis parameter as step size (default 10 m)
+                grid_step     = float(opts.get('yaxis', 10))
+                dg            = np.arange(d_min, d_max + grid_step, grid_step)
+                n_depth       = max(len(dg) - 1, 1)
+                depth_centers = (dg[:-1] + dg[1:]) / 2
+
+                # Precompute flat indices once — reused for both plots
+                n_bins     = ds_q.sizes['bin']
+                depth_flat = D_arr.ravel()
+                prof_flat  = np.repeat(prof_inv, n_bins)
+                depth_idx  = np.searchsorted(dg[1:], depth_flat).clip(0, n_depth - 1)
+                in_range   = np.isfinite(depth_flat) & (depth_flat >= d_min) & (depth_flat <= d_max)
+                lin_base   = prof_flat * n_depth + depth_idx
+
+                def _pdgrid(var_arr):
+                    var_flat = var_arr.ravel()
+                    valid    = in_range & np.isfinite(var_flat)
+                    lin      = lin_base[valid]
+                    vsum     = np.bincount(lin, weights=var_flat[valid].astype(float), minlength=n_prof * n_depth)
+                    vcnt     = np.bincount(lin, minlength=n_prof * n_depth)
+                    return np.where(vcnt > 0, vsum / np.maximum(vcnt, 1), np.nan).reshape(n_prof, n_depth)
+
+                # Correlation heatmap
+                corr_data = np.nanmean(np.stack([ds_q[v].values for v in corr_vars_q], axis=0), axis=0)
+                corr_grid = _pdgrid(corr_data)
+                qc_thresh = float(opts.get('qc_corr', 80))
+                fig, ax   = plt.subplots(figsize=(16, 5))
+                p = ax.pcolormesh(q_time, depth_centers, corr_grid.T,
+                                  cmap='RdYlGn', vmin=0, vmax=100, shading='auto')
+                plt.colorbar(p, ax=ax, label=f'Mean beam correlation (%, {len(corr_vars_q)} beams)', pad=0.01)
+                ax.set_ylabel('Depth (m)')
+                ax.set_xlabel('Date')
+                ax.set_ylim(d_max, d_min)
+                ax.set_title(f'Beam correlation  (QC threshold: {qc_thresh:.0f}%  —  green = above threshold)')
+                plt.tight_layout()
+                p_corr = _rf(run_dir, 'correlation.png')
+                plt.savefig(p_corr, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_corr}')
+
+                # Amplitude / SNR proxy heatmap
+                if amp_vars_q:
+                    amp_data = np.nanmean(np.stack([ds_q[v].values for v in amp_vars_q], axis=0), axis=0)
+                    amp_grid = _pdgrid(amp_data)
+                    fig, ax  = plt.subplots(figsize=(16, 5))
+                    p = ax.pcolormesh(q_time, depth_centers, amp_grid.T,
+                                      cmap='inferno', shading='auto')
+                    plt.colorbar(p, ax=ax,
+                                 label=f'Mean beam amplitude — SNR proxy (counts, {len(amp_vars_q)} beams)',
+                                 pad=0.01)
+                    ax.set_ylabel('Depth (m)')
+                    ax.set_xlabel('Date')
+                    ax.set_ylim(d_max, d_min)
+                    ax.set_title('Beam amplitude (SNR proxy)')
+                    plt.tight_layout()
+                    p_ba = _rf(run_dir, 'beam_amplitude.png')
+                    plt.savefig(p_ba, dpi=150)
+                    plt.close(fig)
+                    log(f'Saved: {p_ba}')
+            else:
+                log('Beam quality heatmaps: CorrelationBeam/D1-D4/profile_number not found — skipping')
+            ds_q.close()
+        except Exception as exc:
+            log(f'Beam quality heatmaps skipped ({exc})')
+
+        # Plot 6: DAC time series
         try:
             dac_data   = np.load(dac_path, allow_pickle=True)
             dac_E_ts   = dac_data['dac'][:, 0].astype(float)
@@ -5066,6 +5205,9 @@ def _adcp_tidal_filter(run_dir, opts, log):
     depth = currents.depth.values
     times = pd.to_datetime(currents.time.values)
 
+    # Depth axis limits — surface anchored at 0, max from data
+    d_max = float(np.nanmax(depth))
+
     # currents_bias_corrected.nc layout: (depth, profile_index)
     # depth axis = axis 0 (vel_E.shape[0]), profile/time axis = axis 1 (vel_E.shape[1])
     n_dep  = vel_E.shape[0]   # depth levels  (e.g. 501)
@@ -5145,8 +5287,6 @@ def _adcp_tidal_filter(run_dir, opts, log):
                           cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
         plt.colorbar(p, ax=ax, label=label, pad=0.01)
         ax.set_ylabel('Depth (m)')
-        ax.invert_yaxis()
-        ax.set_ylim([depth.max(), 0])
 
     tidal_spd = np.sqrt(u_tidal**2 + v_tidal**2)
     p = axes[2].pcolormesh(time_clean, depth, tidal_spd,
@@ -5154,8 +5294,8 @@ def _adcp_tidal_filter(run_dir, opts, log):
     plt.colorbar(p, ax=axes[2], label='Tidal signal speed (m/s)', pad=0.01)
     axes[2].set_ylabel('Depth (m)')
     axes[2].set_xlabel('Date')
-    axes[2].invert_yaxis()
-    axes[2].set_ylim([depth.max(), 0])
+    # Depth orientation — surface at 0, max from data
+    axes[0].set_ylim(d_max, 0)
     fig.suptitle(f'Tidal filtering ({CUTOFF_HOURS}-h low-pass Butterworth)', fontsize=13)
     plt.tight_layout()
     out_png = _rf(run_dir, 'tidal_filter.png')
@@ -5193,6 +5333,9 @@ def _adcp_diagnostics(base_dir, run_dir, opts, log):
     depth      = currents.depth.values
     time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
 
+    # Depth axis limits — surface anchored at 0, max from data
+    d_max = float(np.nanmax(depth))
+
     # Layout: (depth=axis0, profile_index=axis1) — same as currents_bias_corrected.nc
     n_dep  = vel_E.shape[0]
     n_prof = vel_E.shape[1]
@@ -5218,8 +5361,7 @@ def _adcp_diagnostics(base_dir, run_dir, opts, log):
                                cmap=cmo_amp, vmin=0, vmax=0.05, shading='auto')
         plt.colorbar(p, ax=axes[0], label='EKE (m²/s²)', pad=0.01)
         axes[0].set_ylabel('Depth (m)')
-        axes[0].invert_yaxis()
-        axes[0].set_ylim([depth.max(), 0])
+        axes[0].set_ylim(d_max, 0)
         axes[0].set_title('Eddy Kinetic Energy')
         axes[1].fill_between(time_clean, eke_int, color='firebrick', alpha=0.7)
         axes[1].set_ylabel('Depth-int. EKE (m³/s²)')
@@ -5284,8 +5426,8 @@ def _adcp_diagnostics(base_dir, run_dir, opts, log):
             Sh_N     = ds_sh['Sh_N'].values
             bin_d    = ds_sh['bin_depth'].values   # (time, gridded_bin) — actual depths
 
-            dmin = float(opts.get('depth_min', 10))
-            dmax = float(opts.get('depth_max', 1000))
+            dmin = 0.0
+            dmax = d_max  # from np.nanmax(depth) — surface anchored, full data range
             dg   = np.arange(dmin, dmax + 1.0, 5.0)  # 5 m depth grid
 
             unique_profs = np.unique(prof_raw[np.isfinite(prof_raw)])
@@ -5575,16 +5717,20 @@ def adcp_shear_stats():
     run     = request.args.get('run', '')
     is_test = request.args.get('is_test', 'false').lower() == 'true'
     base    = _adcp_base_dir(dep, is_test)
-    path    = os.path.join(base, run, 'shear_processed.nc')
+    run_dir = os.path.join(base, run) if run else base
+    path    = _rf(run_dir, 'shear_processed.nc') if run else ''
 
     # If the requested run's file doesn't exist, fall back to the most recent
-    # shear_processed.nc from any run in this deployment so the recommendation
-    # can appear before the current config has been processed.
+    # prefixed shear_processed.nc from any run in this deployment so the
+    # recommendation can appear before the current config has been processed.
     source_run = run
     if not os.path.exists(path) and os.path.isdir(base):
         candidates = []
         for entry in os.listdir(base):
-            p = os.path.join(base, entry, 'shear_processed.nc')
+            sub = os.path.join(base, entry)
+            if not os.path.isdir(sub):
+                continue
+            p = os.path.join(sub, entry + '_shear_processed.nc')
             if os.path.exists(p):
                 candidates.append((os.path.getmtime(p), entry, p))
         if candidates:
@@ -5722,7 +5868,7 @@ def adcp_run_stage(stage):
         elif stage == 'bias_correction':
             _adcp_bias_correction(run_dir, opts, log)
         elif stage == 'generate_plots':
-            _adcp_generate_plots(base_dir, run_dir, is_test, log)
+            _adcp_generate_plots(base_dir, run_dir, is_test, opts, log)
         elif stage == 'lab_diagnostics':
             _adcp_lab_diagnostics(run_dir, log)
         elif stage == 'tidal_filter':
@@ -5744,7 +5890,10 @@ def adcp_download(filename):
     run     = request.args.get('run', '')
     base    = _adcp_base_dir(dep, is_test)
     if run:
-        fpath = os.path.join(base, run, filename)
+        run_dir = os.path.join(base, run)
+        fpath = os.path.join(run_dir, run + '_' + filename)
+        if not os.path.isfile(fpath):
+            fpath = os.path.join(run_dir, filename)
         if not os.path.isfile(fpath):
             fpath = os.path.join(base, filename)
     else:
@@ -5761,7 +5910,10 @@ def adcp_plot(filename):
     run     = request.args.get('run', '')
     base    = _adcp_base_dir(dep, is_test)
     if run:
-        fpath = os.path.join(base, run, filename)
+        run_dir = os.path.join(base, run)
+        fpath = os.path.join(run_dir, run + '_' + filename)
+        if not os.path.isfile(fpath):
+            fpath = os.path.join(run_dir, filename)
         if not os.path.isfile(fpath):
             fpath = os.path.join(base, filename)
     else:

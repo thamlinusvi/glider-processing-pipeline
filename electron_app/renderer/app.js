@@ -1488,32 +1488,48 @@ async function renderReports () {
   // Flight Stats tab
   const flightTab = h('div', { class: 'tab-panel', id: 'tab-flight' })
 
-  // AD2CP tab — iframe with per-run switcher
+  // AD2CP tab — iframe with per-run switcher and loading overlay
   const adcpAllSrc = dep
     ? `${API}/api/adcp/report-html?dep=${encodeURIComponent(dep)}`
     : 'about:blank'
-  const adcpReportFrame = h('iframe', { id: 'adcp-report-frame', src: adcpAllSrc })
+  const adcpReportFrame   = h('iframe', { id: 'adcp-report-frame', src: adcpAllSrc })
+  const adcpLoadOverlay   = h('div', { class: 'adcp-report-loading' }, 'Generating report…')
 
   const adcpDlBtn = dep ? h('a', { class: 'btn-secondary btn-sm', href: `${adcpAllSrc}&dl=1` }, '⬇ Download') : null
+
+  // Shared list of run buttons — populated async; needed by the load handler.
+  let _adcpRunBtns = []
+
+  function _switchAdcpReport (url) {
+    adcpLoadOverlay.classList.add('visible')
+    _adcpRunBtns.forEach(b => { b.disabled = true })
+    if (adcpDlBtn) adcpDlBtn.href = `${url}&dl=1`
+    adcpReportFrame.src = url
+  }
+
+  adcpReportFrame.addEventListener('load', () => {
+    adcpLoadOverlay.classList.remove('visible')
+    _adcpRunBtns.forEach(b => { b.disabled = false })
+  })
 
   const switcherRow = h('div', { class: 'adcp-run-switcher' })
   if (dep) {
     switcherRow.appendChild(h('span', { class: 'adcp-run-switcher-label' }, 'View:'))
+    // Show loading overlay for the initial "All runs" report that fires immediately
+    adcpLoadOverlay.classList.add('visible')
     ;(async () => {
       try {
         const statusR = await apiFetch(`/api/adcp/status?dep=${encodeURIComponent(dep)}&is_test=false`)
         const runs = Object.keys(statusR.runs || {})
-        const allBtns = []
 
         const makeBtn = (label, url) => {
           const btn = h('button', { class: 'adcp-run-btn' }, label)
           btn.addEventListener('click', () => {
-            adcpReportFrame.src = url
-            if (adcpDlBtn) adcpDlBtn.href = `${url}&dl=1`
-            allBtns.forEach(b => b.classList.remove('active'))
+            _adcpRunBtns.forEach(b => b.classList.remove('active'))
             btn.classList.add('active')
+            _switchAdcpReport(url)
           })
-          allBtns.push(btn)
+          _adcpRunBtns.push(btn)
           return btn
         }
 
@@ -1530,7 +1546,7 @@ async function renderReports () {
 
   const adcpReportTab = h('div', { class: 'tab-panel', id: 'tab-adcp' },
     h('div', { class: 'report-toolbar' }, switcherRow, adcpDlBtn),
-    adcpReportFrame,
+    h('div', { class: 'adcp-frame-wrapper' }, adcpReportFrame, adcpLoadOverlay),
   )
 
   page.appendChild(reportTab)
@@ -2267,6 +2283,7 @@ async function renderAdcpReportTab (dep, container) {
       { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
       { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
                                            'shear_sections.png', 'backscatter.png',
+                                           'correlation.png', 'beam_amplitude.png',
                                            'dac_timeseries.png', 'dac_map_cartopy.png'] },
       { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
       { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },
@@ -4837,10 +4854,16 @@ async function renderAdcp () {
   let isTest       = false
   let testDep      = null
   let selectedFile = null
-  const adcpOpts   = { xaxis: 1, yaxis: null, depth_min: 10, depth_max: 1000,
-                       qc_corr: 80, qc_amp: 80, qc_vel: 0.8, qc_snr: 3,
-                       mounting: 'auto', weight_bias: false, vel_dep_bias: false,
-                       pitch_offset: 0, roll_offset: 0, heading_offset: 0 }
+  const _ADCP_OPTS_KEY  = 'adcp_opts'
+  const _adcpOptsDflt   = { xaxis: 1, yaxis: null, depth_min: 10, depth_max: 1000,
+                             qc_corr: 80, qc_amp: 80, qc_vel: 0.8, qc_snr: 3,
+                             mounting: 'auto', weight_bias: false, vel_dep_bias: false,
+                             pitch_offset: 0, roll_offset: 0, heading_offset: 0 }
+  const _savedAdcpOpts  = (() => {
+    try { return JSON.parse(localStorage.getItem(_ADCP_OPTS_KEY) || 'null') } catch (_) { return null }
+  })() || {}
+  const adcpOpts   = { ..._adcpOptsDflt, ..._savedAdcpOpts }
+  function saveAdcpOpts () { localStorage.setItem(_ADCP_OPTS_KEY, JSON.stringify(adcpOpts)) }
   const adcpLogs   = {}    // stage -> [lines]
   const adcpCtrl   = {}    // stage -> AbortController
   const adcpIvs    = {}    // stage -> setInterval id (timer)
@@ -5053,7 +5076,7 @@ async function renderAdcp () {
       // Options
       const optsSec = h('div', { class: 'adcp-section' })
       belowArea.appendChild(optsSec)
-      renderOptions(optsSec)
+      renderOptions(optsSec, () => renderBelow(dep))
 
       // Stages
       belowArea.appendChild(h('div', { class: 'adcp-section-title', style: 'margin-top:20px' }, 'Processing Stages'))
@@ -5129,19 +5152,8 @@ async function renderAdcp () {
   }
 
   // ── Options section ──────────────────────────────────────────────────────────
-  function renderOptions (container) {
+  function renderOptions (container, onBinChange) {
     container.innerHTML = ''
-    let open = false
-
-    const toggleBtn = h('div', { class: 'adcp-opts-header' })
-    const arrow     = h('span', { class: 'adcp-opts-arrow' }, '▶')
-    toggleBtn.appendChild(arrow)
-    toggleBtn.appendChild(document.createTextNode(' Processing Options'))
-    toggleBtn.addEventListener('click', () => {
-      open = !open
-      optBody.style.display = open ? '' : 'none'
-      arrow.textContent     = open ? '▼' : '▶'
-    })
 
     const xSel = h('select', { class: 'adcp-input' })
     ;[['1','1 — Time (1 profile per column, max resolution)'],['2','2 — Profile (2 profiles per column, balanced)'],['3','3 — Distance (3 profiles per column, smoother)']].forEach(([v, l]) => {
@@ -5149,35 +5161,38 @@ async function renderAdcp () {
       if (String(adcpOpts.xaxis) === v) o.selected = true
       xSel.appendChild(o)
     })
-    xSel.addEventListener('change', () => { adcpOpts.xaxis = parseInt(xSel.value) })
+    xSel.addEventListener('change', () => { adcpOpts.xaxis = parseInt(xSel.value); saveAdcpOpts(); onBinChange?.() })
 
     const yIn = h('input', { type: 'number', class: 'adcp-input',
       placeholder: 'auto', value: adcpOpts.yaxis ?? '' })
-    yIn.addEventListener('input', () => { adcpOpts.yaxis = yIn.value ? parseInt(yIn.value) : null })
+    yIn.addEventListener('input', () => { adcpOpts.yaxis = yIn.value ? parseInt(yIn.value) : null; saveAdcpOpts() })
+    yIn.addEventListener('change', () => onBinChange?.())
 
     const dMinIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.depth_min, min: '0', max: '2000' })
-    dMinIn.addEventListener('input', () => { adcpOpts.depth_min = parseFloat(dMinIn.value) || 10 })
+    dMinIn.addEventListener('input', () => { adcpOpts.depth_min = parseFloat(dMinIn.value) || 10; saveAdcpOpts() })
+    dMinIn.addEventListener('change', () => onBinChange?.())
 
     const dMaxIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.depth_max, min: '0', max: '2000' })
-    dMaxIn.addEventListener('input', () => { adcpOpts.depth_max = parseFloat(dMaxIn.value) || 1000 })
+    dMaxIn.addEventListener('input', () => { adcpOpts.depth_max = parseFloat(dMaxIn.value) || 1000; saveAdcpOpts() })
+    dMaxIn.addEventListener('change', () => onBinChange?.())
 
     const qcCorrIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.qc_corr, min: '0', max: '128', step: '5' })
-    qcCorrIn.addEventListener('input', () => { adcpOpts.qc_corr = parseFloat(qcCorrIn.value) || 80 })
+    qcCorrIn.addEventListener('input', () => { adcpOpts.qc_corr = parseFloat(qcCorrIn.value) || 80; saveAdcpOpts() })
 
     const qcAmpIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.qc_amp, min: '0', max: '255', step: '5' })
-    qcAmpIn.addEventListener('input', () => { adcpOpts.qc_amp = parseFloat(qcAmpIn.value) || 80 })
+    qcAmpIn.addEventListener('input', () => { adcpOpts.qc_amp = parseFloat(qcAmpIn.value) || 80; saveAdcpOpts() })
 
     const qcVelIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.qc_vel, min: '0', max: '5', step: '0.1' })
-    qcVelIn.addEventListener('input', () => { adcpOpts.qc_vel = parseFloat(qcVelIn.value) || 0.8 })
+    qcVelIn.addEventListener('input', () => { adcpOpts.qc_vel = parseFloat(qcVelIn.value) || 0.8; saveAdcpOpts() })
 
     const qcSnrIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.qc_snr, min: '0', max: '20', step: '1' })
-    qcSnrIn.addEventListener('input', () => { adcpOpts.qc_snr = parseFloat(qcSnrIn.value) || 3 })
+    qcSnrIn.addEventListener('input', () => { adcpOpts.qc_snr = parseFloat(qcSnrIn.value) || 3; saveAdcpOpts() })
 
     // Mounting direction
     const mountSel = h('select', { class: 'adcp-input' })
@@ -5186,31 +5201,31 @@ async function renderAdcp () {
       if ((adcpOpts.mounting ?? 'auto') === v) o.selected = true
       mountSel.appendChild(o)
     })
-    mountSel.addEventListener('change', () => { adcpOpts.mounting = mountSel.value })
+    mountSel.addEventListener('change', () => { adcpOpts.mounting = mountSel.value; saveAdcpOpts() })
 
     // Attitude offsets
     const pitchIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.pitch_offset, min: '-30', max: '30', step: '0.5' })
-    pitchIn.addEventListener('input', () => { adcpOpts.pitch_offset = parseFloat(pitchIn.value) || 0 })
+    pitchIn.addEventListener('input', () => { adcpOpts.pitch_offset = parseFloat(pitchIn.value) || 0; saveAdcpOpts() })
 
     const rollIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.roll_offset, min: '-30', max: '30', step: '0.5' })
-    rollIn.addEventListener('input', () => { adcpOpts.roll_offset = parseFloat(rollIn.value) || 0 })
+    rollIn.addEventListener('input', () => { adcpOpts.roll_offset = parseFloat(rollIn.value) || 0; saveAdcpOpts() })
 
     const headingIn = h('input', { type: 'number', class: 'adcp-input adcp-input-sm',
       value: adcpOpts.heading_offset, min: '-180', max: '180', step: '1' })
-    headingIn.addEventListener('input', () => { adcpOpts.heading_offset = parseFloat(headingIn.value) || 0 })
+    headingIn.addEventListener('input', () => { adcpOpts.heading_offset = parseFloat(headingIn.value) || 0; saveAdcpOpts() })
 
     // Bias correction toggles
     const weightChk = h('input', { type: 'checkbox', class: 'adcp-checkbox' })
     weightChk.checked = !!adcpOpts.weight_bias
-    weightChk.addEventListener('change', () => { adcpOpts.weight_bias = weightChk.checked })
+    weightChk.addEventListener('change', () => { adcpOpts.weight_bias = weightChk.checked; saveAdcpOpts() })
 
     const velDepChk = h('input', { type: 'checkbox', class: 'adcp-checkbox' })
     velDepChk.checked = !!adcpOpts.vel_dep_bias
-    velDepChk.addEventListener('change', () => { adcpOpts.vel_dep_bias = velDepChk.checked })
+    velDepChk.addEventListener('change', () => { adcpOpts.vel_dep_bias = velDepChk.checked; saveAdcpOpts() })
 
-    const optBody = h('div', { class: 'adcp-opts-body', style: 'display:none' },
+    const optBody = h('div', { class: 'adcp-opts-body' },
       h('div', { class: 'adcp-opt-group-title' }, 'Binning / Output Grid  (changing these requires re-running Process Shear, Compute Currents, and Bias Correction)'),
       h('div', { class: 'adcp-opt-row' },
         h('label', { class: 'adcp-opt-label' }, 'X-axis:'), xSel,
@@ -5256,7 +5271,6 @@ async function renderAdcp () {
         h('span', { class: 'adcp-opt-hint' }, 'fits velocity-dependent coefficients instead of a constant bias')),
     )
 
-    container.appendChild(toggleBtn)
     container.appendChild(optBody)
   }
 
@@ -5339,10 +5353,59 @@ async function renderAdcp () {
       })()
     }
 
+    // ── File I/O row ──────────────────────────────────────────────────────────
+    const fmtSz = n => !n ? '' : n >= 1e9 ? `${(n/1e9).toFixed(1)} GB`
+                  : n >= 1e6 ? `${(n/1e6).toFixed(1)} MB`
+                  : n >= 1e3 ? `${(n/1e3).toFixed(0)} KB` : `${n} B`
+
+    const currentRunLabel = adcpRunLabel(adcpOpts)
+    const runPrefix       = currentRunLabel + '_'
+    const dlBaseQs        = `dep=${encodeURIComponent(dep)}&is_test=${isTest}`
+    const dlRunQs         = `${dlBaseQs}&run=${encodeURIComponent(currentRunLabel)}`
+
+    const makeChip = (fname, fi) => {
+      const isRunFile   = fname.startsWith(runPrefix)
+      const displayName = isRunFile ? fname.slice(runPrefix.length) : fname
+      const sizeStr     = (fi?.exists && fi.size) ? ` · ${fmtSz(fi.size)}` : ''
+      if (fi?.exists) {
+        const a = h('a', {
+          class: 'stage-file-chip chip-exists',
+          href: `${API}/api/adcp/download/${encodeURIComponent(displayName)}?${isRunFile ? dlRunQs : dlBaseQs}`,
+          download: displayName,
+        }, displayName + sizeStr)
+        return a
+      }
+      return h('span', { class: 'stage-file-chip chip-pending' }, displayName)
+    }
+
+    const stageDef      = stagesDefs.find(s => s.id === id)
+    const needIds       = stageDef?.needs || []
+    const usesEntries   = needIds.flatMap(nid => Object.entries(statusMap[nid]?.files || {}))
+    const writesEntries = Object.entries(statusMap[id]?.files || {})
+
+    const fileInfoRow = h('div', { class: 'stage-file-info' })
+    if (id === 'process_shear' && selectedFile) {
+      const rawName = selectedFile.split(/[\\/]/).pop()
+      fileInfoRow.appendChild(h('div', { class: 'stage-file-group' },
+        h('span', { class: 'stage-file-label' }, 'Uses'),
+        h('span', { class: 'stage-file-chip chip-exists', title: selectedFile }, rawName),
+        ...usesEntries.map(([f, fi]) => makeChip(f, fi))))
+    } else if (usesEntries.length) {
+      fileInfoRow.appendChild(h('div', { class: 'stage-file-group' },
+        h('span', { class: 'stage-file-label' }, 'Uses'),
+        ...usesEntries.map(([f, fi]) => makeChip(f, fi))))
+    }
+    if (writesEntries.length) {
+      fileInfoRow.appendChild(h('div', { class: 'stage-file-group' },
+        h('span', { class: 'stage-file-label' }, 'Writes'),
+        ...writesEntries.map(([f, fi]) => makeChip(f, fi))))
+    }
+
     const card = h('div', { class: 'stage-card' },
       h('div', { class: 'stage-card-header' },
         h('span', { class: 'stage-title' }, label), badge),
       h('div', { class: 'stage-body' },
+        fileInfoRow,
         h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear, elapsed),
         logEl, recBox),
     )
@@ -5431,7 +5494,7 @@ async function renderAdcp () {
               // If compute_currents detected the actual cell size, update opts so
               // all subsequent stages target the renamed run directory.
               if (success && evt.actual_yaxis != null && adcpOpts.yaxis == null) {
-                adcpOpts.yaxis = evt.actual_yaxis
+                adcpOpts.yaxis = evt.actual_yaxis; saveAdcpOpts()
                 const note = `Y-axis auto-detected: ${evt.actual_yaxis} m (ADCP cell size) — run directory renamed to include _y${evt.actual_yaxis}.`
                 adcpLogs[id].push(note)
                 appendLog(logEl, note)
@@ -5503,7 +5566,7 @@ async function renderAdcp () {
     // Option-specific data files (need run= param)
     const runDataMap = isTest
       ? { process_shear: ['shear_processed.nc'] }
-      : { bias_correction: ['currents_bias_corrected.nc'] }
+      : { compute_currents: ['currents.nc'], bias_correction: ['currents_bias_corrected.nc'] }
 
     const dataRow = h('div', { class: 'adcp-export-row' })
     Object.entries(sharedDataMap).forEach(([stageId, files]) => {
@@ -5533,6 +5596,7 @@ async function renderAdcp () {
           { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
           { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
                                                'shear_sections.png', 'backscatter.png',
+                                               'correlation.png', 'beam_amplitude.png',
                                                'dac_timeseries.png', 'dac_map_cartopy.png'] },
           { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
           { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },
@@ -5544,7 +5608,7 @@ async function renderAdcp () {
     if (allPlots.length > 0) {
       const plotsArea = h('div', { class: 'adcp-plots-area' })
       allPlots.forEach(fn => {
-        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${currentQs}`
+        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${currentQs}&_t=${Date.now()}`
         const dlUrl = `${API}/api/adcp/download/${encodeURIComponent(fn)}?${currentQs}`
         const img   = h('img', { class: 'adcp-plot-img', src: url, alt: fn })
         img.onerror = () => img.parentElement?.remove()
