@@ -4554,6 +4554,7 @@ async function renderCloud () {
     let catBody
     let lastClickedIdx = -1
     const hasSubdirs = files.some(f => /[\\/]/.test(f.label))
+    const folderExpandState = new Map() // folderName -> expanded bool, persists across re-renders
 
     const section = h('div', { class: 'cloud-cat-section' })
 
@@ -4726,39 +4727,131 @@ async function renderCloud () {
         return
       }
 
-      const rowCbs = []
-      currentVisible.forEach((f, idx) => {
-        const cb = h('input', { type: 'checkbox' })
-        cb.checked = checkedPaths.has(f.path)
-        rowCbs.push(cb)
-
-        const row = h('label', { class: 'cloud-file-row' },
-          cb,
-          h('span', { class: 'cloud-file-name' }, f.label),
-          h('span', { class: 'cloud-file-size' }, fmtSize(f.size))
-        )
-        row.addEventListener('click', e => {
-          e.preventDefault()
-          const nowChecked = !checkedPaths.has(f.path)
-          if (e.shiftKey && lastClickedIdx >= 0 && lastClickedIdx !== idx) {
-            const lo = Math.min(lastClickedIdx, idx)
-            const hi = Math.max(lastClickedIdx, idx)
-            for (let i = lo; i <= hi; i++) {
-              if (nowChecked) checkedPaths.add(currentVisible[i].path)
-              else            checkedPaths.delete(currentVisible[i].path)
-              rowCbs[i].checked = nowChecked
-            }
-          } else {
-            if (nowChecked) checkedPaths.add(f.path)
-            else            checkedPaths.delete(f.path)
-            cb.checked = nowChecked
-            lastClickedIdx = idx
-          }
-          updateSelBtns()
-          updateHeaderCb()
+      if (hasSubdirs) {
+        // ── Grouped by first path segment (run folder) ────────────────────────
+        const groups = new Map()
+        currentVisible.forEach(f => {
+          const sep    = f.label.search(/[\\/]/)
+          const folder = sep >= 0 ? f.label.slice(0, sep) : ''
+          if (!groups.has(folder)) groups.set(folder, [])
+          groups.get(folder).push(f)
         })
-        fileListEl.appendChild(row)
-      })
+
+        groups.forEach((groupFiles, folderName) => {
+          const isExp    = folderExpandState.get(folderName) ?? true
+          const groupCbs = []
+
+          const folderCb = h('input', { type: 'checkbox', class: 'cloud-folder-cb' })
+          function syncFolderCb () {
+            const n = groupFiles.filter(f => checkedPaths.has(f.path)).length
+            folderCb.checked       = n === groupFiles.length && groupFiles.length > 0
+            folderCb.indeterminate = n > 0 && n < groupFiles.length
+          }
+          syncFolderCb()
+          folderCb.addEventListener('click', e => {
+            e.stopPropagation()
+            const allSel = groupFiles.every(f => checkedPaths.has(f.path))
+            groupFiles.forEach((f, i) => {
+              if (allSel) { checkedPaths.delete(f.path); groupCbs[i].checked = false }
+              else        { checkedPaths.add(f.path);    groupCbs[i].checked = true  }
+            })
+            syncFolderCb(); updateHeaderCb(); updateSelBtns()
+          })
+
+          const colIcon    = h('span', { class: 'cloud-folder-toggle' }, isExp ? '▼' : '▶')
+          const totalSize  = groupFiles.reduce((s, f) => s + f.size, 0)
+          const folderBody = h('div', { class: 'cloud-folder-body',
+            style: isExp ? '' : 'display:none' })
+
+          const folderHdr = h('div', { class: 'cloud-folder-header' },
+            folderCb, colIcon,
+            h('span', { class: 'cloud-folder-name' }, folderName || '(shared files)'),
+            h('span', { class: 'cloud-folder-meta' },
+              `${groupFiles.length} file${groupFiles.length !== 1 ? 's' : ''} · ${fmtSize(totalSize)}`)
+          )
+          folderHdr.addEventListener('click', e => {
+            if (e.target === folderCb) return
+            const nowExp = !(folderExpandState.get(folderName) ?? true)
+            folderExpandState.set(folderName, nowExp)
+            colIcon.textContent      = nowExp ? '▼' : '▶'
+            folderBody.style.display = nowExp ? '' : 'none'
+          })
+          fileListEl.appendChild(folderHdr)
+          fileListEl.appendChild(folderBody)
+
+          groupFiles.forEach(f => {
+            const cb = h('input', { type: 'checkbox' })
+            cb.checked = checkedPaths.has(f.path)
+            groupCbs.push(cb)
+
+            const sep   = f.label.search(/[\\/]/)
+            const fname = sep >= 0 ? f.label.slice(sep + 1) : f.label
+            const row = h('label', { class: 'cloud-file-row cloud-file-row--nested' },
+              cb,
+              h('span', { class: 'cloud-file-name' }, fname),
+              h('span', { class: 'cloud-file-size' }, fmtSize(f.size))
+            )
+            row.addEventListener('click', e => {
+              if (e.target === cb) {
+                if (cb.checked) checkedPaths.add(f.path)
+                else            checkedPaths.delete(f.path)
+              } else {
+                e.preventDefault()
+                const nowChecked = !checkedPaths.has(f.path)
+                if (nowChecked) checkedPaths.add(f.path)
+                else            checkedPaths.delete(f.path)
+                cb.checked = nowChecked
+              }
+              syncFolderCb(); updateHeaderCb(); updateSelBtns()
+            })
+            folderBody.appendChild(row)
+          })
+        })
+
+      } else {
+        // ── Flat list ─────────────────────────────────────────────────────────
+        const rowCbs = []
+        currentVisible.forEach((f, idx) => {
+          const cb = h('input', { type: 'checkbox' })
+          cb.checked = checkedPaths.has(f.path)
+          rowCbs.push(cb)
+
+          const row = h('label', { class: 'cloud-file-row' },
+            cb,
+            h('span', { class: 'cloud-file-name' }, f.label),
+            h('span', { class: 'cloud-file-size' }, fmtSize(f.size))
+          )
+          row.addEventListener('click', e => {
+            if (e.target === cb) {
+              if (cb.checked) checkedPaths.add(f.path)
+              else            checkedPaths.delete(f.path)
+              lastClickedIdx = idx
+              updateSelBtns()
+              updateHeaderCb()
+              return
+            }
+            e.preventDefault()
+            const nowChecked = !checkedPaths.has(f.path)
+            if (e.shiftKey && lastClickedIdx >= 0 && lastClickedIdx !== idx) {
+              const lo = Math.min(lastClickedIdx, idx)
+              const hi = Math.max(lastClickedIdx, idx)
+              for (let i = lo; i <= hi; i++) {
+                if (nowChecked) checkedPaths.add(currentVisible[i].path)
+                else            checkedPaths.delete(currentVisible[i].path)
+                rowCbs[i].checked = nowChecked
+              }
+            } else {
+              if (nowChecked) checkedPaths.add(f.path)
+              else            checkedPaths.delete(f.path)
+              cb.checked = nowChecked
+              lastClickedIdx = idx
+            }
+            updateSelBtns()
+            updateHeaderCb()
+          })
+          fileListEl.appendChild(row)
+        })
+      }
     }
 
     searchInput.addEventListener('input', e => { lastClickedIdx = -1; renderFiles(e.target.value) })

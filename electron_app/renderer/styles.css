@@ -2722,6 +2722,28 @@ button {
 .cloud-file-name { flex: 1; font-family: monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cloud-file-size { color: #4a6580; font-size: 10px; white-space: nowrap; flex-shrink: 0; }
 
+/* ── Grouped (subfolder) view ─────────────────────────────────────────────── */
+.cloud-folder-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  user-select: none;
+  background: #0f1e2e;
+  margin-top: 4px;
+}
+.cloud-folder-header:hover { background: #142030; }
+.cloud-folder-cb   { accent-color: #3498db; flex-shrink: 0; }
+.cloud-folder-toggle { font-size: 10px; color: #4a6580; flex-shrink: 0; }
+.cloud-folder-name { font-size: 12px; font-family: monospace; font-weight: 600; color: #b8d4ee; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-folder-meta { font-size: 10px; color: #4a6580; white-space: nowrap; flex-shrink: 0; }
+
+.cloud-folder-body { padding-left: 24px; }
+
+.cloud-file-row--nested { padding-left: 4px; }
+
 .cloud-upload-status {
   font-size: 12px;
   color: #7fb3d3;
