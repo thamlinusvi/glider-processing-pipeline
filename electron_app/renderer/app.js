@@ -2283,7 +2283,7 @@ async function renderAdcpReportTab (dep, container) {
       { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
       { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
                                            'shear_sections.png', 'backscatter.png',
-                                           'correlation.png', 'beam_amplitude.png',
+                                           'correlation.png', 'beam_amplitude.png', 'snr.png',
                                            'dac_timeseries.png', 'dac_map_cartopy.png'] },
       { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
       { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },
@@ -5659,7 +5659,8 @@ async function renderAdcp () {
     // Option-specific data files (need run= param)
     const runDataMap = isTest
       ? { process_shear: ['shear_processed.nc'] }
-      : { compute_currents: ['currents.nc'], bias_correction: ['currents_bias_corrected.nc'] }
+      : { compute_currents: ['currents.nc'], bias_correction: ['currents_bias_corrected.nc'],
+          generate_plots: ['beam_quality.nc'] }
 
     const dataRow = h('div', { class: 'adcp-export-row' })
     Object.entries(sharedDataMap).forEach(([stageId, files]) => {
@@ -5689,7 +5690,7 @@ async function renderAdcp () {
           { stage: 'bias_correction', plots: ['bias_diagnostic.png'] },
           { stage: 'generate_plots',  plots: ['velocity_sections.png', 'speed_section.png',
                                                'shear_sections.png', 'backscatter.png',
-                                               'correlation.png', 'beam_amplitude.png',
+                                               'correlation.png', 'beam_amplitude.png', 'snr.png',
                                                'dac_timeseries.png', 'dac_map_cartopy.png'] },
           { stage: 'tidal_filter',    plots: ['tidal_filter.png'] },
           { stage: 'diagnostics',     plots: ['eke.png', 'transport.png', 'richardson_number.png'] },

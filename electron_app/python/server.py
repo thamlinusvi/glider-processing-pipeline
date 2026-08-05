@@ -2588,6 +2588,7 @@ def _adcp_pipeline_summary_html(base, run_dirs):
             'backscatter.png':       ('Acoustic backscatter / amplitude (range axis)',           'shear_processed.nc'),
             'correlation.png':       ('Beam correlation (0–100%, depth axis)',                  'shear_processed.nc'),
             'beam_amplitude.png':    ('Beam amplitude / SNR proxy (counts, depth axis)',        'shear_processed.nc'),
+            'snr.png':               ('Beam SNR (dB, depth axis)',                              'shear_processed.nc'),
             'dac_timeseries.png':    ('Depth-averaged current time series',                     'dac.npz'),
             'dac_map_cartopy.png':   ('Glider track &amp; current vector map',                  'dac.npz + gps_data.npz'),
             'tidal_filter.png':      ('Tidal partition (40-h low-pass)',                        'currents_bias_corrected.nc'),
@@ -2690,7 +2691,8 @@ def adcp_report_html():
         ('Shear &amp; Backscatter',    [('shear_sections.png',    'Shear Sections'),
                                         ('backscatter.png',       'Backscatter (Acoustic Amplitude)')]),
         ('Beam Quality',               [('correlation.png',       'Beam Correlation'),
-                                        ('beam_amplitude.png',    'Beam Amplitude (SNR Proxy)')]),
+                                        ('beam_amplitude.png',    'Beam Amplitude (SNR Proxy)'),
+                                        ('snr.png',               'Beam SNR (dB)')]),
         ('Depth-Averaged Currents',    [('dac_timeseries.png',    'DAC Time Series'),
                                         ('dac_map_cartopy.png',   'Current Vectors Map')]),
         ('Tidal Analysis',             [('tidal_filter.png',      'Tidal Filter (40-h low-pass)')]),
@@ -3991,7 +3993,8 @@ _ADCP_OUTPUTS = {
     'compute_currents': ['currents.nc', 'dac.npz'],
     'bias_correction':  ['currents_bias_corrected.nc', 'bias_diagnostic.png'],
     'generate_plots':   ['velocity_sections.png', 'speed_section.png', 'shear_sections.png',
-                         'backscatter.png', 'correlation.png', 'beam_amplitude.png',
+                         'backscatter.png', 'correlation.png', 'beam_amplitude.png', 'snr.png',
+                         'beam_quality.nc',
                          'dac_timeseries.png', 'dac_map_cartopy.png'],
     'tidal_filter':     ['currents_subtidal.nc', 'tidal_filter.png'],
     'diagnostics':      ['eke.png', 'transport.png', 'richardson_number.png'],
@@ -5060,6 +5063,68 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, opts, log):
                     plt.savefig(p_ba, dpi=150)
                     plt.close(fig)
                     log(f'Saved: {p_ba}')
+
+                    # SNR heatmap — noise floor from 5th pct of last range bin (fully attenuated)
+                    noise_floor = float(np.nanmean(amp_data[:, -3:]))
+                    snr_grid    = None
+                    if noise_floor > 0:
+                        snr_data = 20.0 * np.log10(np.maximum(amp_data / noise_floor, 1e-9))
+                        snr_grid = _pdgrid(snr_data)
+                        fig, ax  = plt.subplots(figsize=(16, 5))
+                        p = ax.pcolormesh(q_time, depth_centers, snr_grid.T,
+                                          cmap='viridis', shading='auto')
+                        plt.colorbar(p, ax=ax,
+                                     label=f'SNR (dB, {len(amp_vars_q)} beams)', pad=0.01)
+                        ax.set_ylabel('Depth (m)')
+                        ax.set_xlabel('Date')
+                        ax.set_ylim(d_max, d_min)
+                        ax.set_title(
+                            f'Beam SNR  (noise floor: {noise_floor:.1f} counts '
+                            f'— mean of last 3 range bins)')
+                        plt.tight_layout()
+                        p_snr = _rf(run_dir, 'snr.png')
+                        plt.savefig(p_snr, dpi=150)
+                        plt.close(fig)
+                        log(f'Saved: {p_snr}')
+
+                    # Save depth-gridded beam quality data as NetCDF
+                    try:
+                        bq_coords = {
+                            'time':  xr.DataArray(q_time, dims=['profile'],
+                                         attrs={'long_name': 'Profile mean time'}),
+                            'depth': xr.DataArray(depth_centers, dims=['depth'],
+                                         attrs={'units': 'm', 'long_name': 'Depth bin centre',
+                                                'positive': 'down'}),
+                        }
+                        bq_vars = {
+                            'correlation': xr.DataArray(
+                                corr_grid, dims=['profile', 'depth'],
+                                attrs={'units': '%',
+                                       'long_name': f'Mean beam correlation ({len(corr_vars_q)} beams)'}),
+                            'amplitude': xr.DataArray(
+                                amp_grid, dims=['profile', 'depth'],
+                                attrs={'units': 'counts',
+                                       'long_name': f'Mean beam amplitude ({len(amp_vars_q)} beams)'}),
+                        }
+                        if snr_grid is not None:
+                            bq_vars['snr'] = xr.DataArray(
+                                snr_grid, dims=['profile', 'depth'],
+                                attrs={'units': 'dB',
+                                       'long_name': f'Beam SNR ({len(amp_vars_q)} beams)',
+                                       'noise_floor_counts': noise_floor,
+                                       'noise_floor_method':
+                                           'mean of last 3 range bins across all pings'})
+                        ds_bq = xr.Dataset(bq_vars, coords=bq_coords,
+                            attrs={'title': 'AD2CP beam quality metrics gridded to depth',
+                                   'depth_grid_step_m': grid_step,
+                                   'n_corr_beams': len(corr_vars_q),
+                                   'n_amp_beams':  len(amp_vars_q)})
+                        p_bq = _rf(run_dir, 'beam_quality.nc')
+                        ds_bq.to_netcdf(p_bq)
+                        ds_bq.close()
+                        log(f'Saved: {p_bq}')
+                    except Exception as exc:
+                        log(f'beam_quality.nc save skipped ({exc})')
             else:
                 log('Beam quality heatmaps: CorrelationBeam/D1-D4/profile_number not found — skipping')
             ds_q.close()
