@@ -111,10 +111,10 @@ function h (tag, attrs = {}, ...children) {
 }
 
 function statusClass (s) {
-  return s === 'done' ? 'done' : s === 'failed' ? 'failed' : s === 'running' ? 'running' : 'not_run'
+  return s === 'done' ? 'done' : s === 'failed' ? 'failed' : s === 'running' ? 'running' : s === 'needs_review' ? 'needs_review' : 'not_run'
 }
 function statusLabel (s) {
-  return s === 'done' ? '✔ DONE' : s === 'failed' ? '✖ FAILED' : s === 'running' ? 'RUNNING…' : 'NOT RUN'
+  return s === 'done' ? '✔ DONE' : s === 'failed' ? '✖ FAILED' : s === 'running' ? 'RUNNING…' : s === 'needs_review' ? '⚠ REVIEW NEEDED' : 'NOT RUN'
 }
 function logColor (line) {
   const l = line.toLowerCase()
@@ -847,7 +847,7 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
         await setStageStatus(dep, sk, st)
         badge.className   = `status-badge ${statusClass(st)}`
         badge.textContent = statusLabel(st)
-        btnRun.textContent = st === 'done' ? '↺  Re-run Stage' : '▶  Run Stage'
+        btnRun.textContent = (st === 'done' || st === 'needs_review') ? '↺  Re-run Stage' : '▶  Run Stage'
       })
     }, 'Set status ▾')
     const btnRow   = h('div', { class: 'btn-row' }, btnRun, btnAbort, btnClear, btnSetStatus)
@@ -1288,16 +1288,21 @@ function showPreflightPanel (dep, data, bodyEl, badge) {
     btnSkip.disabled = false
   })
 
-  btnSkip.addEventListener('click', () => {
-    // If nothing needs changing, mark stage done; otherwise leave as-is
-    if (!needsApply) {
-      apiFetch(`/api/deployment/${encodeURIComponent(dep)}/set-status/preflight`,
+  btnSkip.addEventListener('click', async () => {
+    // Skip is an explicit acknowledgment — always record it server-side, even when
+    // there are pending changes, so the stage doesn't stay stuck at NEEDS_REVIEW.
+    btnSkip.disabled = true
+    try {
+      await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/set-status/preflight`,
         { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: 'done' }) })
       badge.className   = 'status-badge done'
       badge.textContent = statusLabel('done')
+      panel.remove()
+    } catch (e) {
+      btnSkip.disabled = false
+      alert(`Could not update status: ${e.message || e}`)
     }
-    panel.remove()
   })
 
   const btnRow = h('div', { class: 'btn-row' }, ...(needsApply ? [btnApply, btnSkip] : [btnSkip]))
@@ -1393,7 +1398,7 @@ async function doAbort (dep, sk, badge, btnRun, btnAbort) {
   el.btnAbort.classList.add('hidden')
   el.badge.className   = `status-badge ${statusClass(st)}`
   el.badge.textContent = statusLabel(st)
-  el.btnRun.textContent = st === 'done' ? '↺  Re-run Stage' : '▶  Run Stage'
+  el.btnRun.textContent = (st === 'done' || st === 'needs_review') ? '↺  Re-run Stage' : '▶  Run Stage'
   delete stageEls[sk]
 }
 

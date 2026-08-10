@@ -468,6 +468,7 @@ body {
 .status-badge.running  { background: #c8e0f5; color: #0f3f6a; border: 1px solid #85b8dc; }
 .status-badge.done     { background: #3dbfb8; color: #fff;    border: 1px solid #2aa39d; }
 .status-badge.failed   { background: #ffe8c8; color: #7a3e00; border: 1px solid #f0a85a; }
+.status-badge.needs_review { background: #fff4c2; color: #6b5900; border: 1px solid #e8c547; }
 
 /* ── Log pane ───────────────────────────────────────────────────────────────── */
 .log-pane {

@@ -8,10 +8,11 @@ from datetime import datetime
 
 STAGES = ['dbd_to_dat', 'dbd_to_dat_flight', 'dat_to_profile_nc', 'dat_to_trajectory_nc', 'dat_to_trajectory_flight_nc', 'fix_metadata', 'preflight', 'qc', 'report']
 
-STATUS_NOT_RUN  = 'not_run'
-STATUS_RUNNING  = 'running'
-STATUS_DONE     = 'done'
-STATUS_FAILED   = 'failed'
+STATUS_NOT_RUN      = 'not_run'
+STATUS_RUNNING      = 'running'
+STATUS_DONE         = 'done'
+STATUS_FAILED       = 'failed'
+STATUS_NEEDS_REVIEW = 'needs_review'
 
 
 def _state_path(deployment_dir):
@@ -42,7 +43,7 @@ def set_stage_status(deployment_dir, stage, status):
     else:
         if 'started_at' in prev:
             entry['started_at'] = prev['started_at']
-        if status in (STATUS_DONE, STATUS_FAILED):
+        if status in (STATUS_DONE, STATUS_FAILED, STATUS_NEEDS_REVIEW):
             entry['finished_at'] = now
     state[stage] = entry
     save_state(deployment_dir, state)

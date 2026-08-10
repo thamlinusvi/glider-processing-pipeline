@@ -6,38 +6,41 @@ current behavior; this file tracks things that are actually wrong — including 
 scientific-data-quality consequences. When something here gets fixed, **remove its entry**
 rather than letting this file accumulate stale claims.
 
-## Preflight (Stage 3) apply step is unreliable — confirmed broken/unreachable in all three places it's implemented
-
-⚠️ **The Electron frontend marks Stage 3 "done" in `pipeline_state.json` before the user ever
-clicks Apply.** `server.py`'s generic `run_stage()` (~499-501) sets `STATUS_DONE` the moment the
-**analysis** subprocess exits 0 — there's no special-case for preflight's two-phase design
-(analysis, then a separate `POST /preflight/apply` to actually write config). Client-side,
-`app.js`'s `doRun` success callback (~1072-1082) only locally overrides the badge to "REVIEW
-NEEDED" while `showPreflightPanel` is on screen — pure in-memory DOM state, never persisted. If
-the user navigates away (or the app restarts) before clicking Apply/Skip, the next status fetch
-shows a plain DONE badge with no confirm panel — the proposed `time_shift.yml`/`qctests.yml`/
-regional-boundary config were never actually written, but nothing blocks proceeding to Stage 4
-(QC) against missing/stale config, and there's no visual indication anything is wrong.
+## Standalone PyQt5 UI: preflight apply mode is entirely unreachable
 
 ⚠️ **The standalone PyQt5 UI can never reach preflight's apply mode at all.**
 `app/pipeline/stages.py`'s `preflight_command()` (183-195) invokes `pre_qaqc_config_check.py`
 with only `[base_dir, deployment]` — never `--apply`/`--apply-file` (confirmed via grep: those
 flags aren't referenced anywhere in `app/ui` or `app/workers`). The apply branch that actually
 writes config files (`pre_qaqc_config_check.py` 427-482) is therefore unreachable from this UI —
-Stage 3 here can only ever run in scan/report mode, yet `StageCard._on_finished` still marks it
-`STATUS_DONE` on a clean exit, showing a normal green "done" badge even though no config was
-ever written. Stage 4 then runs against whatever QC config already existed. Separately: when
-regional-boundary coverage fails, the analysis embeds a base64 map PNG in the single
-`=== PREFLIGHT_JSON ===` log line, which `StageCard._append_log()` inserts as one giant
-unbroken `insertHtml()` span — unreadable, and a real risk of degrading `QTextEdit`
+Stage 3 here can only ever run in scan/report mode. `StageCard._on_finished`
+(`pipeline_page.py:262`) still unconditionally sets `STATUS_DONE`/`STATUS_FAILED` on any
+subprocess exit, the same premature-DONE pattern already fixed on the Electron side (see
+below) — Electron's fix was not ported here, since porting it means first building an apply
+flow that doesn't exist yet, a larger undertaking than the display-layer compatibility fix
+below. Separately: when regional-boundary coverage fails, the analysis embeds a base64 map PNG
+in the single `=== PREFLIGHT_JSON ===` log line, which `StageCard._append_log()` inserts as one
+giant unbroken `insertHtml()` span — unreadable, and a real risk of degrading `QTextEdit`
 responsiveness on a long line.
+**Fix:** add `--apply`/`--apply-file` wiring to `preflight_command()`, build an Apply/Skip UI
+comparable to the Electron confirm panel, and give `StageCard._on_finished` the same
+`NEEDS_REVIEW`-aware status logic `run_stage()` now has (see below) instead of collapsing
+straight to `DONE`.
 
-Both gaps point at the same root cause: `run_stage()`/`StageCard._on_finished` treat preflight
-like every other single-phase stage, when it's actually two phases with a required human
-checkpoint in between. **Fix:** give preflight its own status value (e.g. `NEEDS_REVIEW`) that
-persists to `pipeline_state.json` after analysis and only flips to `DONE` after a successful
-`/preflight/apply` call, in both the Electron backend and (once the missing `--apply` wiring is
-added) the PyQt5 worker.
+**Fixed on the Electron side (2026-08-10):** `server.py`'s `run_stage()` used to mark Stage 3
+`STATUS_DONE` the instant the *analysis* subprocess exited, with no special-case for preflight's
+two-phase design (analysis, then a separate `/preflight/apply` call to actually write config) —
+confirmed via real deployment data that this had already happened at least once
+(`uvi_02-20260429T1420`'s last preflight run proposed creating `ctd_hysteresis.yml` and an
+updated regional boundary, neither of which was ever applied, yet the stage showed `done`).
+Fixed by adding a `NEEDS_REVIEW` status (`app/pipeline/state.py`) that `run_stage()` now sets
+instead of `DONE` whenever the analysis reports anything pending, verified against real log
+data and a live end-to-end run. As a required side effect of adding this status value to the
+shared `pipeline_state.json` format, `app/ui/pipeline_page.py`'s `STATUS_LABEL`/
+`STATUS_BADGE_STYLE` dicts (previously unguarded lookups) were also hardened against it so the
+PyQt5 UI doesn't crash (`KeyError`) when displaying a deployment whose preflight status was set
+by the Electron side — this is a display-layer compatibility fix only; PyQt5's own
+`_on_finished` status-setting logic is unchanged, per the unresolved item above.
 
 ## Active bugs affecting real QC output
 

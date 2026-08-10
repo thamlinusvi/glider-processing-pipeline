@@ -41,7 +41,7 @@ from flask import Flask, jsonify, request, Response, send_file, abort
 from pipeline.stages import STAGE_INFO
 from pipeline.state  import (
     STAGES, load_state, set_stage_status,
-    STATUS_RUNNING, STATUS_DONE, STATUS_FAILED, STATUS_NOT_RUN,
+    STATUS_RUNNING, STATUS_DONE, STATUS_FAILED, STATUS_NOT_RUN, STATUS_NEEDS_REVIEW,
 )
 
 app = Flask(__name__)
@@ -515,8 +515,29 @@ def run_stage(dep, stage):
             with _lock:
                 _procs.pop(key, None)
 
-            ok     = (proc.returncode == 0)
-            status = STATUS_DONE if ok else STATUS_FAILED
+            ok = (proc.returncode == 0)
+            if not ok:
+                status = STATUS_FAILED
+            elif stage == 'preflight':
+                # Preflight is two-phase: this subprocess only ran the analysis, not
+                # the apply. Default to NEEDS_REVIEW (safe-fail direction) unless the
+                # analysis positively reports nothing to apply — only a successful
+                # /preflight/apply call (or an explicit Skip) should ever set DONE.
+                status = STATUS_NEEDS_REVIEW
+                marker = '=== PREFLIGHT_JSON ==='
+                for _line in log_lines:
+                    if _line.startswith(marker):
+                        try:
+                            pf = json.loads(_line[len(marker):])
+                            any_changes = pf.get('any_changes', True)
+                            coverage_ok = pf.get('region_coverage', {}).get('coverage_ok', True)
+                            if not any_changes and coverage_ok:
+                                status = STATUS_DONE
+                        except (json.JSONDecodeError, AttributeError, TypeError):
+                            pass  # keep the safe NEEDS_REVIEW default
+                        break
+            else:
+                status = STATUS_DONE
             set_stage_status(dep_dir, stage, status)
             _save_run_log(dep, stage, start_ts, log_lines, ok)
             _prev_status.pop(key, None)

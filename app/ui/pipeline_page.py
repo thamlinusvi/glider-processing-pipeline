@@ -15,7 +15,7 @@ from PyQt5.QtGui import QTextCursor
 from pipeline.stages import STAGE_INFO
 from pipeline.state  import (
     load_state, set_stage_status,
-    STATUS_NOT_RUN, STATUS_RUNNING, STATUS_DONE, STATUS_FAILED,
+    STATUS_NOT_RUN, STATUS_RUNNING, STATUS_DONE, STATUS_FAILED, STATUS_NEEDS_REVIEW,
 )
 from workers.pipeline_worker import PipelineWorker
 
@@ -25,12 +25,14 @@ STATUS_LABEL = {
     STATUS_RUNNING: 'RUNNING…',
     STATUS_DONE:    '✔ DONE',
     STATUS_FAILED:  '✖ FAILED',
+    STATUS_NEEDS_REVIEW: '⚠ REVIEW NEEDED',
 }
 STATUS_BADGE_STYLE = {
     STATUS_NOT_RUN: 'background:#e8edf2; color:#6b7f94; border:1px solid #c8d4e0;',
     STATUS_RUNNING: 'background:#d6eaf8; color:#1a5276; border:1px solid #a9cce3;',
     STATUS_DONE:    'background:#d5f5e3; color:#1a7a40; border:1px solid #a9dfbf;',
     STATUS_FAILED:  'background:#fadbd8; color:#922b21; border:1px solid #f1948a;',
+    STATUS_NEEDS_REVIEW: 'background:#fff4c2; color:#6b5900; border:1px solid #e8c547;',
 }
 LOG_COLORS = {
     'error':   '#ff6b6b',
@@ -183,9 +185,9 @@ class StageCard(QGroupBox):
         dep_dir = os.path.join(self.base_dir, 'deployments', year, self.deployment)
         status  = load_state(dep_dir).get(self.stage_key, {}).get('status', STATUS_NOT_RUN)
 
-        self._badge.setText(STATUS_LABEL[status])
+        self._badge.setText(STATUS_LABEL.get(status, STATUS_LABEL[STATUS_NOT_RUN]))
         self._badge.setStyleSheet(
-            STATUS_BADGE_STYLE[status] +
+            STATUS_BADGE_STYLE.get(status, STATUS_BADGE_STYLE[STATUS_NOT_RUN]) +
             'border-radius:10px; padding:2px 8px; font-size:11px; font-weight:bold;'
         )
 
@@ -193,7 +195,7 @@ class StageCard(QGroupBox):
             is_running = (status == STATUS_RUNNING)
             self._run_btn.setVisible(not is_running)
             self._abort_btn.setVisible(is_running)
-            if status == STATUS_DONE:
+            if status in (STATUS_DONE, STATUS_NEEDS_REVIEW):
                 self._run_btn.setText('↺  Re-run Stage')
             else:
                 self._run_btn.setText('▶  Run Stage')
