@@ -41,24 +41,7 @@ added) the PyQt5 worker.
 
 ## Active bugs affecting real QC output
 
-⚠️ **1. Pressure gross-range QC test is unit-mismatched and effectively non-functional for
-every RBR/UVI glider.** Confirmed against live data (`uvi_02-20260429T1420`). The manual
-pressure gross-range test in `glider_qartod_qc.py` (~lines 258-282): the RBR
-pressure-variable-detection patch (documented in `CLAUDE.md`) fixed a crash, but the threshold
-itself was never rescaled. `pressure_rating = gsw.p_from_z(-depth_rating, ...)` returns **dbar**
-(~1112 dbar for a 1000m-rated glider, `fail_span=[0, ~2224]`), compared directly against
-`ds['sci_water_pressure'].values`, which is in **bar** (observed max ~70.5 bar over a 700m dive
-in the same deployment). The fail threshold is ~30x higher than the sensor's real max reading —
-this test can never flag SUSPECT/FAIL for an actual pressure-sensor malfunction on a UVI
-deployment, and there's no redundant check: `qc/config/gross_flatline/rbr_legato3_ctd_gross_flatline.yml`
-has a `flat_line_test` for `sci_water_pressure` but no `gross_range_test` entry.
-**Fix:** apply the same `÷10`-style rescale `CHANGES_FROM_RUTGERS.md` already documents applying
-elsewhere in this file. Confirmed this specific bug is NOT present in original upstream Rutgers
-code (`CHANGES_FROM_RUTGERS.md:40-57`): upstream hardcoded `sensor = 'pressure'` (already dbar,
-so unit-consistent); the UVI RBR-support patch correctly added `sci_water_pressure` detection
-but never added the corresponding unit rescale.
-
-⚠️ **2. `summarize_qartod_flags.py` folds its own prior output back into itself, ratcheting
+⚠️ **1. `summarize_qartod_flags.py` folds its own prior output back into itself, ratcheting
 flags to only ever get worse.** `rugliderqc/scripts/summarize_qartod_flags.py:121,127,133,141`:
 the variable-selection filter (`'_qartod_' in x`) and per-sensor filter
 (`f'{sensor}_qartod_' in x`) both match the script's own previous output variable name,
@@ -66,14 +49,14 @@ the variable-selection filter (`'_qartod_' in x`) and per-sensor filter
 this script ever runs a second time against a `qc_queue` file that already carries a summary
 flag from a prior pass, that stale value gets fed into `np.maximum(summary_flag, flag)` (line
 141) as if it were one of the individual tests — since `max` is monotonic, a SUSPECT/FAIL that
-gets corrected by a later config fix (e.g. bug #1 above, once fixed) stays stuck at the old,
-wrong, worse flag forever. Currently protected in the Electron-orchestrated pipeline because
+gets corrected by a later config fix stays stuck at the old, wrong, worse flag forever.
+Currently protected in the Electron-orchestrated pipeline because
 `app/pipeline/stages.py:248-251` unconditionally wipes and re-copies `qc_queue/` from pristine
 input at the start of every Stage 8 run — but it's a live landmine for the scripts' documented
 standalone/manual-CLI usage, and for any future refactor of that wipe step.
 **Fix:** exclude `_qartod_summary_flag`-suffixed variables from the aggregation input filter.
 
-⚠️ **3. `move_nc_files.py` discards its final-move subprocess's exit code, so a partial/failed
+⚠️ **2. `move_nc_files.py` discards its final-move subprocess's exit code, so a partial/failed
 move looks like success.** `rugliderqc/scripts/move_nc_files.py:72`:
 `subprocess.call("mv " + ... + "*.nc" + " " + data_path, shell=True)` — return value unused.
 `status` stays `0` regardless of a permission error, full disk, or locked file, and the log
@@ -83,7 +66,7 @@ the *next* Stage 8 run's queue-wipe (`stages.py:250`), forcing an invisible full
 no error anywhere in the chain. **Fix:** check the subprocess return code (or better, use
 `shutil.move` per file and catch exceptions individually) and set `status=1` on any failure.
 
-⚠️ **4. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
+⚠️ **3. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
 for USVI, silently.** Two independent gaps compound: (a) `usvi_configs.yml`'s tightened
 regional `pH` gross-range bounds (`qc/config/global_regional/usvi_configs.yml:94-101`) never
 fire, because `glider_qartod_qc` runs *before* `add_derived_variables` creates the `pH`
@@ -101,12 +84,12 @@ Saturation State will just silently never appear in the output, no error anywher
 **Fix:** add a USVI region block to `TA-salinity-regressions.yml`, and add explicit logging to
 `calculate_ta()`'s no-region-matched fallthrough.
 
-⚠️ **5. `mab_configs.yml` has no `sci_water_pressure` stream at all**
+⚠️ **4. `mab_configs.yml` has no `sci_water_pressure` stream at all**
 (`qc/config/global_regional/mab_configs.yml`, all 3 priority context blocks) — unlike
 `global_configs.yml` and `usvi_configs.yml`, which both correctly include it, properly
 ÷10-scaled. If an RBR/UVI-CTD glider ever transits into the MAB region (lon `-78..-66`, lat
 `35..45`), its `sci_water_pressure` stream gets zero regional spike/rate-of-change/pressure QC
-there — not mis-scaled like bug #1, just entirely absent, silently skipped via the same
+there — entirely absent (not mis-scaled), silently skipped via the same
 `if sensor not in ds.data_vars` pattern applied in reverse (the config key itself is missing).
 **Fix:** add a `sci_water_pressure` block mirroring `global_configs.yml`'s to all 3 contexts.
 
@@ -374,8 +357,8 @@ way the items above were checked.
 - **`plot_qc_data.py` has a depth-axis fallback that substitutes raw bar-unit pressure for
   meter-unit depth with no conversion.** `plot_profiles` (~172-175): if `depth` is missing,
   falls back to `ds['sci_water_pressure'].values` directly, still labeled `'Depth (m)'` for
-  every subplot — the same bar-vs-dbar confusion class as bug #1 above, would compress the
-  apparent depth axis ~10x. Every other depth fallback in this file (and in `qc_report.py`) uses
+  every subplot — the same bar-vs-dbar confusion class as the (now-fixed) pressure gross-range
+  test, would compress the apparent depth axis ~10x. Every other depth fallback in this file (and in `qc_report.py`) uses
   a safe NaN fill instead, making this one function look like a copy/paste slip. Traced as
   currently dormant — `depth` (`llat_depth`) is part of the standard `PROFILE_SENSORS` set and
   appears to always be emitted — but a live landmine if that ever changes.

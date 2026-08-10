@@ -275,7 +275,10 @@ def main(args):
                     # cinfo = {'fail_span': [0, pressure_rating]}
                     cinfo = {'suspect_span': [0, pressure_rating], 'fail_span': [0, pressure_rating * 2]}
                     qc_varname = f'{sensor}_qartod_gross_range_test'
-                    flag_vals = qartod.gross_range_test(inp=ds[sensor].values,
+                    # sci_water_pressure (RBR) is in bar; pressure_rating above is in dbar (1 bar = 10 dbar).
+                    # Convert to dbar before comparison so both sides of the test share units.
+                    pressure_values = ds[sensor].values * 10 if sensor == 'sci_water_pressure' else ds[sensor].values
+                    flag_vals = qartod.gross_range_test(inp=pressure_values,
                                                         **cinfo)
 
                     # Define QC variable attributes, add a comment about the conversion from depth_rating in meters to dbar
@@ -283,6 +286,8 @@ def main(args):
                     attrs = cf.set_qartod_attrs(test, sensor, cinfo)
                     attrs['comment'] = 'Glider depth rating (m) in flag_configurations converted to pressure (dbar) from ' \
                                        'pressure and profile_lat using gsw.p_from_z'
+                    if sensor == 'sci_water_pressure':
+                        attrs['comment'] += '. sci_water_pressure (bar) converted to dbar before comparison.'
                     if not hasattr(ds[sensor], 'ancillary_variables'):
                         ds[sensor].attrs['ancillary_variables'] = qc_varname
                     else:
