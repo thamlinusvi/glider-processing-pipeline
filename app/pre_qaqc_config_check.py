@@ -442,10 +442,14 @@ def main(args):
             print(f'ERROR: Invalid JSON: {e}', flush=True)
             return 1
         os.makedirs(config_dir, exist_ok=True)
+        config_dir_real = os.path.realpath(config_dir)
         for fname, info in data.get('configs', {}).items():
+            fpath = os.path.realpath(os.path.join(config_dir, fname))
+            if fpath != config_dir_real and not fpath.startswith(config_dir_real + os.sep):
+                print(f'  ERROR: Invalid config filename: {fname!r}', flush=True)
+                continue
             action  = info.get('action', 'unchanged')
             content = info.get('content', '')
-            fpath   = os.path.join(config_dir, fname)
             if action in ('create', 'update'):
                 with open(fpath, 'w', encoding='utf-8') as f:
                     f.write(content)
@@ -454,10 +458,14 @@ def main(args):
             else:
                 print(f'  Unchanged: {fname}', flush=True)
 
-        # Optional: update global regional_boundaries.yml if user confirmed
+        # Optional: update global regional_boundaries.yml if user confirmed.
+        # The write path is always recomputed here, never taken from the
+        # request body — `read_region_boundaries()` below computes the exact
+        # same path, so this is a no-op for any legitimate request and just
+        # removes the client's ability to redirect the write.
         rc = data.get('region_coverage', {})
-        if rc.get('update_requested') and rc.get('boundaries_path'):
-            bpath = rc['boundaries_path']
+        if rc.get('update_requested'):
+            bpath = os.path.join(base_dir, 'qc', 'config', 'global_regional', 'regional_boundaries.yml')
             try:
                 # If user edited the boundary values, rebuild YAML from their inputs;
                 # otherwise fall back to the auto-proposed content.

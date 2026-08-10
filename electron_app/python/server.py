@@ -235,9 +235,13 @@ def _save_disk_cache(dep, name, newest_mtime, data):
 
 
 # ── CORS (no external package needed) ────────────────────────────────────────
+# No Access-Control-Allow-Origin here: this server is unauthenticated and binds
+# to 127.0.0.1 only, so cross-origin reads from arbitrary web pages must stay
+# blocked by the browser's default same-origin policy. The Electron renderer
+# talks to this server with webSecurity disabled, so it isn't subject to that
+# restriction and needs no CORS headers to function.
 @app.after_request
 def _cors(resp):
-    resp.headers['Access-Control-Allow-Origin']  = '*'
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return resp
@@ -254,6 +258,19 @@ def _dep_dir(deployment):
     d = os.path.join(BASE_DIR, 'deployments', year, deployment)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def _is_within(path, root_dir):
+    """True if the realpath of `path` is `root_dir` itself or nested inside it."""
+    root_real = os.path.realpath(root_dir)
+    cand_real = os.path.realpath(path)
+    return cand_real == root_real or cand_real.startswith(root_real + os.sep)
+
+
+_DEPLOYMENT_NAME_RE = re.compile(r'^[\w]+-\d{8}T\d{4}$')
+
+def _valid_deployment_name(dep):
+    return bool(_DEPLOYMENT_NAME_RE.match(dep or ''))
 
 
 def _find_deployments():
@@ -419,6 +436,8 @@ def docker_wait():
 @app.route('/api/deployment/<dep>/run/<stage>', methods=['POST'])
 def run_stage(dep, stage):
     """Start a stage process; stream stdout as SSE."""
+    if not _valid_deployment_name(dep):
+        return abort(400, 'Invalid deployment name')
     if stage not in STAGE_INFO:
         return abort(404)
     info = STAGE_INFO[stage]
@@ -631,6 +650,9 @@ def preflight_apply(dep):
     the analysis phase of pre_qaqc_config_check.py.
     Body: the parsed PREFLIGHT_JSON object from the analysis run.
     """
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
+
     data   = request.json or {}
     script = os.path.join(BASE_DIR, 'app', 'pre_qaqc_config_check.py')
     if not os.path.isfile(script):
@@ -772,7 +794,7 @@ def serve_file():
     """Serve any file within BASE_DIR (used for plot images)."""
     fpath = request.args.get('path', '')
     real  = os.path.realpath(fpath)
-    if not real.startswith(os.path.realpath(BASE_DIR)):
+    if not _is_within(real, BASE_DIR):
         return abort(403)
     if not os.path.isfile(real):
         return abort(404)
@@ -1083,7 +1105,7 @@ def save_metadata(dep):
     full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
 
     # Security: must stay within config_dir
-    if not full_path.startswith(config_dir):
+    if not _is_within(full_path, config_dir):
         return jsonify({'error': 'Invalid path'}), 403
     if not full_path.endswith('.json'):
         return jsonify({'error': 'Only .json files allowed'}), 403
@@ -1104,7 +1126,7 @@ def delete_metadata(dep):
     config_dir = os.path.realpath(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep))
     full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
 
-    if not full_path.startswith(config_dir):
+    if not _is_within(full_path, config_dir):
         return jsonify({'error': 'Invalid path'}), 403
     if not full_path.endswith('.json'):
         return jsonify({'error': 'Only .json files allowed'}), 403
@@ -1168,7 +1190,7 @@ def import_metadata_files(dep):
             continue
 
         dst_dir = os.path.realpath(os.path.join(config_dir, subdir))
-        if not dst_dir.startswith(config_dir):
+        if not _is_within(dst_dir, config_dir):
             results.append({'path': src, 'ok': False, 'error': 'Invalid subdir'})
             continue
 
@@ -1463,6 +1485,9 @@ def set_nickname(dep):
 
 @app.route('/api/deployment/<dep>/rename', methods=['POST'])
 def rename_deployment(dep):
+    if not dep or os.path.basename(dep) != dep or dep in ('.', '..'):
+        return jsonify({'error': 'Invalid deployment name'}), 400
+
     new_name = (request.json or {}).get('new_name', '').strip()
     if not new_name:
         return jsonify({'error': 'new_name required'}), 400
@@ -1539,6 +1564,9 @@ def rename_deployment(dep):
 
 @app.route('/api/deployment/<dep>/delete', methods=['POST'])
 def delete_deployment(dep):
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
+
     running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
     if running:
         return jsonify({'error': 'A stage is currently running — stop it before deleting'}), 409
@@ -3918,8 +3946,8 @@ def cloud_upload():
             rel    = item
             subdir = ''
 
-        fpath = os.path.normpath(os.path.join(BASE_DIR, rel))
-        if not fpath.startswith(os.path.normpath(BASE_DIR)):
+        fpath = os.path.realpath(os.path.join(BASE_DIR, rel))
+        if not _is_within(fpath, BASE_DIR):
             results.append({'file': rel, 'error': 'Path not allowed'}); continue
         if not os.path.isfile(fpath):
             results.append({'file': rel, 'error': 'File not found'}); continue
@@ -5698,6 +5726,8 @@ def adcp_list_tests():
 @app.route('/api/adcp/tests/<label>', methods=['DELETE'])
 def adcp_delete_test(label):
     d = os.path.join(BASE_DIR, 'ad2cp', 'tests', label)
+    if not _is_within(d, os.path.join(BASE_DIR, 'ad2cp', 'tests')):
+        return abort(400)
     if not os.path.isdir(d):
         return abort(404)
     try:
@@ -5954,16 +5984,20 @@ def adcp_download(filename):
     is_test = request.args.get('is_test', 'false').lower() == 'true'
     run     = request.args.get('run', '')
     base    = _adcp_base_dir(dep, is_test)
+
+    def _ok(p):
+        return _is_within(p, BASE_DIR) and os.path.isfile(p)
+
     if run:
         run_dir = os.path.join(base, run)
         fpath = os.path.join(run_dir, run + '_' + filename)
-        if not os.path.isfile(fpath):
+        if not _ok(fpath):
             fpath = os.path.join(run_dir, filename)
-        if not os.path.isfile(fpath):
+        if not _ok(fpath):
             fpath = os.path.join(base, filename)
     else:
         fpath = os.path.join(base, filename)
-    if not os.path.isfile(fpath):
+    if not _ok(fpath):
         return abort(404)
     return send_file(fpath, as_attachment=True, download_name=os.path.basename(fpath))
 
@@ -5974,16 +6008,20 @@ def adcp_plot(filename):
     is_test = request.args.get('is_test', 'false').lower() == 'true'
     run     = request.args.get('run', '')
     base    = _adcp_base_dir(dep, is_test)
+
+    def _ok(p):
+        return _is_within(p, BASE_DIR) and os.path.isfile(p)
+
     if run:
         run_dir = os.path.join(base, run)
         fpath = os.path.join(run_dir, run + '_' + filename)
-        if not os.path.isfile(fpath):
+        if not _ok(fpath):
             fpath = os.path.join(run_dir, filename)
-        if not os.path.isfile(fpath):
+        if not _ok(fpath):
             fpath = os.path.join(base, filename)
     else:
         fpath = os.path.join(base, filename)
-    if not os.path.isfile(fpath):
+    if not _ok(fpath):
         return abort(404)
     return send_file(fpath, mimetype='image/png')
 
