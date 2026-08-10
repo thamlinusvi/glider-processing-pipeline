@@ -580,6 +580,34 @@ def abort_stage(dep, stage):
     return jsonify({'ok': True, 'killed': killed, 'restored_status': restored})
 
 
+@app.route('/api/shutdown-cleanup', methods=['POST'])
+def shutdown_cleanup():
+    """Kill every currently-running stage subprocess and its Docker container, and
+    restore each one's pre-run status. Called by main.js just before the Electron
+    app quits -- killing the 'docker run' process alone does not stop the
+    container itself (same reason abort_stage above does an explicit docker kill),
+    so without this a mid-stage container is left running invisibly, and the
+    deployment would otherwise come back up next launch permanently stuck showing
+    RUNNING with no process left to ever finish it.
+    """
+    with _lock:
+        keys = list(_procs.keys())
+    killed = []
+    for key in keys:
+        dep, stage = key
+        with _lock:
+            proc = _procs.pop(key, None)
+        if proc:
+            proc.terminate()
+        cname = _container_name(dep, stage)
+        subprocess.run(['docker', 'kill', cname],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        restored = _prev_status.pop(key, STATUS_NOT_RUN)
+        set_stage_status(_dep_dir(dep), stage, restored)
+        killed.append(f'{dep}/{stage}')
+    return jsonify({'ok': True, 'killed': killed})
+
+
 @app.route('/api/deployment/<dep>/stage-logs/<stage>')
 def stream_stage_logs(dep, stage):
     """Reconnect to a running stage's log stream.

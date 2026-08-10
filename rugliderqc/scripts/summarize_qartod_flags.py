@@ -117,8 +117,12 @@ def main(args):
                     status = 1
                     continue
 
-                # List the qartod flag variables, excluding the climatology test
-                qartod_vars = [x for x in ds.data_vars if np.logical_and('_qartod_' in x, '_qartod_climatology' not in x)]
+                # List the qartod flag variables, excluding the climatology test and this
+                # script's own prior summary-flag output (its name also contains '_qartod_',
+                # so a re-run would otherwise fold a stale summary back into the new one)
+                qartod_vars = [x for x in ds.data_vars
+                              if np.logical_and('_qartod_' in x, '_qartod_climatology' not in x)
+                              and not x.endswith('_qartod_summary_flag')]
 
                 if len(qartod_vars) == 0:
                     continue

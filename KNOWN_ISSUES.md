@@ -44,22 +44,7 @@ by the Electron side — this is a display-layer compatibility fix only; PyQt5's
 
 ## Active bugs affecting real QC output
 
-⚠️ **1. `summarize_qartod_flags.py` folds its own prior output back into itself, ratcheting
-flags to only ever get worse.** `rugliderqc/scripts/summarize_qartod_flags.py:121,127,133,141`:
-the variable-selection filter (`'_qartod_' in x`) and per-sensor filter
-(`f'{sensor}_qartod_' in x`) both match the script's own previous output variable name,
-`f'{sensor}_qartod_summary_flag'` (line 146), because that name itself contains `_qartod_`. If
-this script ever runs a second time against a `qc_queue` file that already carries a summary
-flag from a prior pass, that stale value gets fed into `np.maximum(summary_flag, flag)` (line
-141) as if it were one of the individual tests — since `max` is monotonic, a SUSPECT/FAIL that
-gets corrected by a later config fix stays stuck at the old, wrong, worse flag forever.
-Currently protected in the Electron-orchestrated pipeline because
-`app/pipeline/stages.py:248-251` unconditionally wipes and re-copies `qc_queue/` from pristine
-input at the start of every Stage 8 run — but it's a live landmine for the scripts' documented
-standalone/manual-CLI usage, and for any future refactor of that wipe step.
-**Fix:** exclude `_qartod_summary_flag`-suffixed variables from the aggregation input filter.
-
-⚠️ **2. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
+⚠️ **1. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
 for USVI, silently.** Two independent gaps compound: (a) `usvi_configs.yml`'s tightened
 regional `pH` gross-range bounds (`qc/config/global_regional/usvi_configs.yml:94-101`) never
 fire, because `glider_qartod_qc` runs *before* `add_derived_variables` creates the `pH`
@@ -85,7 +70,7 @@ calibration-shaped test data (numerically identical output to the dbar case, ~1e
 difference). This removes one of the chain's contributing causes — (a) and (b) above are still
 open.
 
-⚠️ **3. `mab_configs.yml` has no `sci_water_pressure` stream at all**
+⚠️ **2. `mab_configs.yml` has no `sci_water_pressure` stream at all**
 (`qc/config/global_regional/mab_configs.yml`, all 3 priority context blocks) — unlike
 `global_configs.yml` and `usvi_configs.yml`, which both correctly include it, properly
 ÷10-scaled. If an RBR/UVI-CTD glider ever transits into the MAB region (lon `-78..-66`, lat
@@ -275,13 +260,6 @@ way the items above were checked.
   these error branches repeatedly accumulates open HDF5 handles, compounding the segfault risk
   over time. (By contrast, `_nc_read_surf`/`_nc_read_traj` — the functions that *do* use the
   lock — are comparatively careful about closing before early returns.)
-- **Docker containers are likely orphaned when the Electron app quits mid-stage.**
-  `main.js`'s `window-all-closed` handler calls `pythonProcess.kill()` and nothing else.
-  `server.py`'s own `abort_stage` (~524-541) contains a comment that's direct evidence this is a
-  known problem: *"Also kill the Docker container by name (terminate() only kills 'docker run',
-  not the container itself)"* — `abort_stage` compensates with an explicit `docker kill
-  <cname>`, but the app-quit path has no equivalent step. Quitting mid-Stage-8 (QC, runs in
-  Docker) likely leaves an orphaned, still-running container behind indefinitely.
 
 ## Frontend (`electron_app/renderer/app.js`) issues
 
@@ -404,8 +382,9 @@ way the items above were checked.
   Qt warning/crash. Worse operationally: `PipelineWorker.run()` never reaches its
   `proc.terminate()` call in this path (only the explicit `_abort()` path does that), so a
   headless `docker run --rm ...` container is left running with no UI reference and no way to
-  reattach or abort it after restart — the same orphaned-container class as the Electron
-  app-quit issue above, via a different code path.
+  reattach or abort it after restart — the same orphaned-container problem already fixed on the
+  Electron side (`main.js`/`server.py`'s `shutdown_cleanup`), but via a different code path here
+  that hasn't been ported.
 - **Abort is only polled between subprocess output lines.** `PipelineWorker.run()`'s abort check
   (~line 37) happens only inside the `for raw_line in proc.stdout` loop — for a stage that goes
   quiet for a while (e.g. Stage 1/1b before any output, or a Docker image pull), clicking Abort

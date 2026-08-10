@@ -170,9 +170,33 @@ def identify_nans(dataset, varname, pressure_da=None):
 
 ### 4. `rugliderqc/scripts/summarize_qartod_flags.py`
 
-**Type:** Minor — Python compatibility only
+**Type:** Substantive — bug fix + Python compatibility
 
 `dt.datetime.now(dt.UTC)` → `dt.datetime.now(dt.timezone.utc)`
+
+**What changed (2026-08-10):** the script's own output variable, `f'{sensor}_qartod_summary_flag'`,
+contains the substring `_qartod_`, so its variable-selection filter matched its own prior output.
+A second run against a `qc_queue` file that already carried a summary flag from an earlier pass
+folded that stale value into `np.maximum(summary_flag, flag)` as if it were one of the individual
+tests — since `max` is monotonic, a SUSPECT/FAIL flag could never improve on a later run even
+after the underlying config/data issue was corrected.
+
+```python
+# ORIGINAL
+qartod_vars = [x for x in ds.data_vars if np.logical_and('_qartod_' in x, '_qartod_climatology' not in x)]
+```
+
+```python
+# PIPELINE
+qartod_vars = [x for x in ds.data_vars
+              if np.logical_and('_qartod_' in x, '_qartod_climatology' not in x)
+              and not x.endswith('_qartod_summary_flag')]
+```
+
+Verified by simulating exactly this scenario: a test flag starts at FAIL, gets corrected to GOOD,
+then the script runs a second time against the dataset (with the stale FAIL-valued summary flag
+still present from the first run). The original logic stayed stuck at FAIL; the fixed logic
+correctly reports GOOD.
 
 ---
 
@@ -725,7 +749,7 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `scripts/glider_qartod_qc.py` | RBR support + Py3.9 compat + unit fix | `pressure` hardcoded; `dt.UTC` not in Py3.9; gross-range threshold compared bar values against a dbar span |
 | `scripts/ctd_hysteresis_test.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/time_shift.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
-| `scripts/summarize_qartod_flags.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
+| `scripts/summarize_qartod_flags.py` | Bug fix + Py3.9 compat | Own summary-flag output matched its own input filter, ratcheting flags to only get worse on a re-run; `dt.UTC` not in Py3.9 |
 | `scripts/add_derived_variables.py` | RBR support + Py3.9 compat | `pressure` hardcoded (crashed calculate_ph, silently broke calculate_omega for RBR); `dt.UTC` not in Py3.9 |
 | `scripts/check_duplicate_timestamps.py` | Bug fix | Latent crash when renamed `.duplicate` file re-opened as "current" in next iteration; set `status=1` and broke pipeline chain |
 | `scripts/check_science_variables.py` | Bug fix | `ds.to_netcdf(f)` ran unconditionally, recreating the `.nc` file that was just renamed to `.nosci`; all 24 nosci profiles propagated through every downstream script |

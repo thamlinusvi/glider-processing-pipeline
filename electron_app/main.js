@@ -70,8 +70,28 @@ app.whenReady().then(() => {
   waitForServer(createWindow)
 })
 
-app.on('window-all-closed', () => {
-  if (pythonProcess) { pythonProcess.kill(); pythonProcess = null }
+// Ask the Python server to kill any running stage's Docker container before we
+// kill the server itself -- killing 'docker run' alone leaves the container
+// running (see server.py's shutdown_cleanup for why). Best-effort: never blocks
+// quitting for more than a couple seconds if the server is slow or unresponsive.
+function cleanupBeforeQuit () {
+  return new Promise(resolve => {
+    const req = http.request(
+      { hostname: '127.0.0.1', port: PORT, path: '/api/shutdown-cleanup', method: 'POST', timeout: 3000 },
+      res => { res.resume(); res.on('end', resolve) }
+    )
+    req.on('error', resolve)
+    req.on('timeout', () => { req.destroy(); resolve() })
+    req.end()
+  })
+}
+
+app.on('window-all-closed', async () => {
+  if (pythonProcess) {
+    await cleanupBeforeQuit()
+    pythonProcess.kill()
+    pythonProcess = null
+  }
   app.quit()
 })
 
