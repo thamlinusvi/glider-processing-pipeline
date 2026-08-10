@@ -243,23 +243,6 @@ way the items above were checked.
   out-of-order UI click — no gating logic found in `app.js` either) can run e.g. Stage 8 or 9
   against an empty/stale input directory; whether that's caught depends entirely on the invoked
   script's own robustness, which is uneven (see `data_gap_check.py` above).
-- **AD2CP code paths never acquire the documented `_nc_lock`, reintroducing the known HDF5
-  concurrency segfault risk.** `_nc_lock` (`server.py:89`) exists specifically to serialize
-  HDF5/netCDF4 opens (per `CLAUDE.md`'s documented "HDF5 can segfault with >1 concurrent reader"
-  concern) but is acquired only inside `_nc_read_surf`/`_nc_read_traj` (lines 108,130,168,190).
-  Every AD2CP dataset open — `_adcp_run_stats`, `_adcp_pipeline_summary_html`, `_adcp_load_nc`,
-  `_adcp_compute_currents`, `_adcp_generate_plots`, `_adcp_diagnostics`, etc., spanning roughly
-  lines 2190-5900 — opens files with no lock at all, and since Flask runs `threaded=True` with
-  these all reachable from independent HTTP requests (e.g. a status poll hitting
-  `/api/adcp/status` while a report/stats endpoint is mid-read), concurrent HDF5 opens from
-  different threads are possible in normal usage. **Compounded by unclosed handles on exception
-  paths in the same AD2CP code**: e.g. `_adcp_run_stats` (2196-2267) opens a dataset, does
-  several accesses that can raise, and only calls `.close()` after the risky lines, all wrapped
-  in a bare `except Exception: pass` — no `finally`, no `with`. Same shape repeats at roughly
-  2337-2452, 4395-4403, 4940-5130, 5230-5470, 5600-5820. A long AD2CP session hitting any of
-  these error branches repeatedly accumulates open HDF5 handles, compounding the segfault risk
-  over time. (By contrast, `_nc_read_surf`/`_nc_read_traj` — the functions that *do* use the
-  lock — are comparatively careful about closing before early returns.)
 
 ## Frontend (`electron_app/renderer/app.js`) issues
 

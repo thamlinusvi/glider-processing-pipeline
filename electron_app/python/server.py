@@ -86,7 +86,10 @@ _TRAJ_WORKERS = 1
 
 # Serialise all HDF5/netCDF4 file opens across threads.  Even with
 # _TRAJ_WORKERS=1 this ensures safety if the value is ever raised.
-_nc_lock = threading.Lock()
+# RLock (not Lock): some AD2CP functions hold one dataset open while opening
+# further datasets nested inside that same span, on the same thread -- a plain
+# Lock would deadlock the thread against itself in that case.
+_nc_lock = threading.RLock()
 
 # ── NC worker functions (called from ThreadPoolExecutor) ──────────────────────
 def _nc_read_surf(fpath):
@@ -2272,12 +2275,12 @@ def _adcp_run_stats(run_dir):
         try:
             import xarray as xr
             import pandas as pd
-            ds    = xr.open_dataset(bias_path, decode_times=True)
-            vel_E = ds['velocity_E_DAC_reference_sb_corrected'].values
-            vel_N = ds['velocity_N_DAC_reference_sb_corrected'].values
-            depth = ds.depth.values
-            t_raw = ds.time.values   # already datetime64 with decode_times=True
-            ds.close()
+            with _nc_lock:
+                with xr.open_dataset(bias_path, decode_times=True) as ds:
+                    vel_E = ds['velocity_E_DAC_reference_sb_corrected'].values
+                    vel_N = ds['velocity_N_DAC_reference_sb_corrected'].values
+                    depth = ds.depth.values
+                    t_raw = ds.time.values   # already datetime64 with decode_times=True
 
             spd   = np.sqrt(vel_E**2 + vel_N**2)
             valid = np.isfinite(spd)
@@ -2313,12 +2316,12 @@ def _adcp_run_stats(run_dir):
     if os.path.exists(sub_path):
         try:
             import xarray as xr
-            ds  = xr.open_dataset(sub_path, decode_times=False)
-            u_s = ds['velocity_E_subtidal'].values
-            v_s = ds['velocity_N_subtidal'].values
-            u_t = ds['velocity_E_tidal'].values
-            v_t = ds['velocity_N_tidal'].values
-            ds.close()
+            with _nc_lock:
+                with xr.open_dataset(sub_path, decode_times=False) as ds:
+                    u_s = ds['velocity_E_subtidal'].values
+                    v_s = ds['velocity_N_subtidal'].values
+                    u_t = ds['velocity_E_tidal'].values
+                    v_t = ds['velocity_N_tidal'].values
             total_var = float(np.nanvar(u_s + u_t) + np.nanvar(v_s + v_t))
             tidal_var = float(np.nanvar(u_t) + np.nanvar(v_t))
             if total_var > 0:
@@ -2334,16 +2337,16 @@ def _adcp_run_stats(run_dir):
     if os.path.exists(shear_path):
         try:
             import xarray as xr
-            ds = xr.open_dataset(shear_path, decode_times=False)
-            if 'Sh_E' in ds and 'Sh_N' in ds:
-                sh_mag = np.sqrt(ds['Sh_E'].values**2 + ds['Sh_N'].values**2)
-                finite = sh_mag[np.isfinite(sh_mag)]
-                if finite.size > 0:
-                    stats['shear'] = {
-                        'p99_shear': round(float(np.percentile(finite, 99)),   4),
-                        'p50_shear': round(float(np.percentile(finite, 50)),   4),
-                    }
-            ds.close()
+            with _nc_lock:
+                with xr.open_dataset(shear_path, decode_times=False) as ds:
+                    if 'Sh_E' in ds and 'Sh_N' in ds:
+                        sh_mag = np.sqrt(ds['Sh_E'].values**2 + ds['Sh_N'].values**2)
+                        finite = sh_mag[np.isfinite(sh_mag)]
+                        if finite.size > 0:
+                            stats['shear'] = {
+                                'p99_shear': round(float(np.percentile(finite, 99)),   4),
+                                'p50_shear': round(float(np.percentile(finite, 50)),   4),
+                            }
         except Exception:
             pass
 
@@ -2392,37 +2395,41 @@ def _adcp_pipeline_summary_html(base, run_dirs):
     glider_nc = os.path.join(base, 'glider_ad2cp_datetime_timecoord.nc')
     if os.path.exists(glider_nc):
         try:
-            ds = xr.open_dataset(glider_nc)
-            n_pts   = ds.sizes.get('time', 0)
-            t       = ds.time.values
-            t_start = str(t[0])[:10] if len(t) else '?'
-            t_end   = str(t[-1])[:10] if len(t) else '?'
-            pres    = ds.get('pressure')
-            temp    = ds.get('temperature')
-            sal     = ds.get('salinity')
-            lon     = ds.get('longitude')
-            lat     = ds.get('latitude')
-            def _rng(v):
-                if v is None: return '—'
-                a = v.values.astype(float)
-                f = a[np.isfinite(a)]
-                return f'{f.min():.2f} – {f.max():.2f}' if len(f) else '—'
-            def _valid(v):
-                if v is None: return '—', 0
-                a = v.values.astype(float)
-                n = int(np.isfinite(a).sum())
-                return f'{n:,} / {a.size:,}', n
-            sci_valid, _ = _valid(pres)
-            ds.close()
-            cards = (_card('Total Time Points', f'{n_pts:,}')
-                   + _card('Start Date', t_start, small=True)
-                   + _card('End Date', t_end, small=True)
-                   + _card('Valid Science Samples', sci_valid, small=True)
-                   + _card('Pressure', _rng(pres), 'dbar', small=True)
-                   + _card('Temperature', _rng(temp), '°C', small=True)
-                   + _card('Salinity', _rng(sal), 'PSU', small=True)
-                   + _card('Longitude', _rng(lon), '°', small=True)
-                   + _card('Latitude', _rng(lat), '°', small=True))
+            with _nc_lock:
+                with xr.open_dataset(glider_nc) as ds:
+                    n_pts   = ds.sizes.get('time', 0)
+                    t       = ds.time.values
+                    t_start = str(t[0])[:10] if len(t) else '?'
+                    t_end   = str(t[-1])[:10] if len(t) else '?'
+                    pres    = ds.get('pressure')
+                    temp    = ds.get('temperature')
+                    sal     = ds.get('salinity')
+                    lon     = ds.get('longitude')
+                    lat     = ds.get('latitude')
+                    def _rng(v):
+                        if v is None: return '—'
+                        a = v.values.astype(float)
+                        f = a[np.isfinite(a)]
+                        return f'{f.min():.2f} – {f.max():.2f}' if len(f) else '—'
+                    def _valid(v):
+                        if v is None: return '—', 0
+                        a = v.values.astype(float)
+                        n = int(np.isfinite(a).sum())
+                        return f'{n:,} / {a.size:,}', n
+                    sci_valid, _ = _valid(pres)
+                    # Build the value strings here, while ds is still open -- _rng()/_valid()
+                    # read .values on lazy DataArrays pulled from ds, so this must happen
+                    # before the file closes, not after (the original code read them after
+                    # close and only worked by luck of xarray's caching).
+                    cards = (_card('Total Time Points', f'{n_pts:,}')
+                           + _card('Start Date', t_start, small=True)
+                           + _card('End Date', t_end, small=True)
+                           + _card('Valid Science Samples', sci_valid, small=True)
+                           + _card('Pressure', _rng(pres), 'dbar', small=True)
+                           + _card('Temperature', _rng(temp), '°C', small=True)
+                           + _card('Salinity', _rng(sal), 'PSU', small=True)
+                           + _card('Longitude', _rng(lon), '°', small=True)
+                           + _card('Latitude', _rng(lat), '°', small=True))
             stages_html += (
                 f'<h3>Stage 1 — Load &amp; Combine</h3>'
                 + _desc('Merges all glider science files and AD2CP data into a single time-aligned NetCDF. '
@@ -2459,22 +2466,22 @@ def _adcp_pipeline_summary_html(base, run_dirs):
         shear_path = _rf(run_dir, 'shear_processed.nc')
         if os.path.exists(shear_path):
             try:
-                ds       = xr.open_dataset(shear_path)
-                n_pings  = ds.sizes.get('time', 0)
-                n_bins   = ds.sizes.get('bin', 0)
-                n_gbins  = ds.sizes.get('gridded_bin', 0)
-                t        = ds.time.values
-                t_start  = str(t[0])[:10] if len(t) else '?'
-                t_end    = str(t[-1])[:10] if len(t) else '?'
-                e_var    = ds.get('E');  sh_var = ds.get('Sh_E')
-                def _vpct(v):
-                    if v is None or not v.size: return '—', '—', 0
-                    a = v.values.astype(float)
-                    n = int(np.isfinite(a).sum())
-                    return f'{n:,}', f'{100*n/a.size:.1f}%', n
-                e_n, e_pct, _ = _vpct(e_var)
-                sh_n, sh_pct, _ = _vpct(sh_var)
-                ds.close()
+                with _nc_lock:
+                    with xr.open_dataset(shear_path) as ds:
+                        n_pings  = ds.sizes.get('time', 0)
+                        n_bins   = ds.sizes.get('bin', 0)
+                        n_gbins  = ds.sizes.get('gridded_bin', 0)
+                        t        = ds.time.values
+                        t_start  = str(t[0])[:10] if len(t) else '?'
+                        t_end    = str(t[-1])[:10] if len(t) else '?'
+                        e_var    = ds.get('E');  sh_var = ds.get('Sh_E')
+                        def _vpct(v):
+                            if v is None or not v.size: return '—', '—', 0
+                            a = v.values.astype(float)
+                            n = int(np.isfinite(a).sum())
+                            return f'{n:,}', f'{100*n/a.size:.1f}%', n
+                        e_n, e_pct, _ = _vpct(e_var)
+                        sh_n, sh_pct, _ = _vpct(sh_var)
                 total_bins = n_pings * n_gbins
                 cards = (_card('Total ADCP Pings', f'{n_pings:,}')
                        + _card('Raw Bins / Ping', str(n_bins))
@@ -2497,9 +2504,9 @@ def _adcp_pipeline_summary_html(base, run_dirs):
         shear_path = _rf(run_dir, 'shear_processed.nc')
         if os.path.exists(shear_path):
             try:
-                ds = xr.open_dataset(shear_path)
-                t  = ds.time.values
-                ds.close()
+                with _nc_lock:
+                    with xr.open_dataset(shear_path) as ds:
+                        t = ds.time.values
                 gps2  = np.load(gps_path, allow_pickle=True) if os.path.exists(gps_path) else None
                 n_gps = len(gps2['gps_predive']) if gps2 is not None else '—'
                 cards = (_card('ADCP Active From', str(t[0])[:10], small=True)
@@ -2523,12 +2530,12 @@ def _adcp_pipeline_summary_html(base, run_dirs):
                 n_dives     = len(dac['dive_time'])
                 n_valid_dac = int(np.isfinite(dac['dac']).all(axis=1).sum())
                 n_half      = n_dives * 2
-                ds2         = xr.open_dataset(curr_path)
-                n_profiles  = ds2.sizes.get('profile_index', 0)
-                n_depth     = ds2.sizes.get('depth', 0)
-                d_min       = float(ds2.depth.min()) if 'depth' in ds2.coords else 0
-                d_max       = float(ds2.depth.max()) if 'depth' in ds2.coords else 0
-                ds2.close()
+                with _nc_lock:
+                    with xr.open_dataset(curr_path) as ds2:
+                        n_profiles  = ds2.sizes.get('profile_index', 0)
+                        n_depth     = ds2.sizes.get('depth', 0)
+                        d_min       = float(ds2.depth.min()) if 'depth' in ds2.coords else 0
+                        d_max       = float(ds2.depth.max()) if 'depth' in ds2.coords else 0
 
                 # xaxis from run label (e.g. 'xaxis1_d10-1000' → 1)
                 xaxis = 1
@@ -2568,63 +2575,62 @@ def _adcp_pipeline_summary_html(base, run_dirs):
                 import matplotlib.pyplot as plt
                 import io, base64
 
-                ds3 = xr.open_dataset(bc_path)
-                def _vstats(key):
-                    v = ds3.get(key)
-                    if v is None: return None
-                    a = v.values.astype(float)
-                    f = a[np.isfinite(a)]
-                    if not len(f): return None
-                    p5, p95 = np.nanpercentile(f, [5, 95])
-                    return {'mean': f.mean(), 'min': f.min(), 'max': f.max(),
-                            'p5': p5, 'p95': p95, 'valid': len(f), 'total': a.size}
-                ve_pre  = _vstats('velocity_E_DAC_reference')
-                ve_post = _vstats('velocity_E_DAC_reference_sb_corrected')
-                vn_pre  = _vstats('velocity_N_DAC_reference')
-                vn_post = _vstats('velocity_N_DAC_reference_sb_corrected')
+                with _nc_lock:
+                    with xr.open_dataset(bc_path) as ds3:
+                        def _vstats(key):
+                            v = ds3.get(key)
+                            if v is None: return None
+                            a = v.values.astype(float)
+                            f = a[np.isfinite(a)]
+                            if not len(f): return None
+                            p5, p95 = np.nanpercentile(f, [5, 95])
+                            return {'mean': f.mean(), 'min': f.min(), 'max': f.max(),
+                                    'p5': p5, 'p95': p95, 'valid': len(f), 'total': a.size}
+                        ve_pre  = _vstats('velocity_E_DAC_reference')
+                        ve_post = _vstats('velocity_E_DAC_reference_sb_corrected')
+                        vn_pre  = _vstats('velocity_N_DAC_reference')
+                        vn_post = _vstats('velocity_N_DAC_reference_sb_corrected')
 
-                # Build daily datapoints chart
-                daily_chart_html = ''
-                try:
-                    import traceback as _tb
-                    df_bc = ds3.to_dataframe().reset_index()
-                    df_bc['date'] = pd.to_datetime(df_bc['time']).dt.date
-                    daily = df_bc.groupby('date')['velocity_E_DAC_reference_sb_corrected'].count()
-                    avg_pts = daily.mean()
+                        # Build daily datapoints chart
+                        daily_chart_html = ''
+                        try:
+                            import traceback as _tb
+                            df_bc = ds3.to_dataframe().reset_index()
+                            df_bc['date'] = pd.to_datetime(df_bc['time']).dt.date
+                            daily = df_bc.groupby('date')['velocity_E_DAC_reference_sb_corrected'].count()
+                            avg_pts = daily.mean()
 
-                    fig, ax = plt.subplots(figsize=(11, 3.2))
-                    low_thresh = avg_pts * 0.5
-                    colors = ['#c0392b' if v < low_thresh else '#2471a3' for v in daily.values]
-                    ax.bar(range(len(daily)), daily.values, color=colors, width=0.8)
-                    ax.axhline(avg_pts, color='#e67e22', linewidth=1.2, linestyle='--',
-                               label=f'Daily avg ({avg_pts:.0f})')
-                    tick_positions = [i for i, d in enumerate(daily.index)
-                                      if hasattr(d, 'day') and d.day in (1, 8, 15, 22)]
-                    tick_labels    = [f'{daily.index[i].strftime("%b")} {daily.index[i].day}'
-                                      for i in tick_positions]
-                    ax.set_xticks(tick_positions)
-                    ax.set_xticklabels(tick_labels, rotation=30, ha='right', fontsize=9)
-                    ax.set_ylabel('Valid velocity cells', fontsize=9)
-                    ax.set_title(f'Valid datapoints per day — {_run_label}/currents_bias_corrected.nc', fontsize=10)
-                    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x):,}'))
-                    ax.legend(fontsize=8)
-                    ax.grid(axis='y', alpha=0.3)
-                    fig.tight_layout()
-                    _buf = io.BytesIO()
-                    fig.savefig(_buf, format='png', dpi=130, bbox_inches='tight')
-                    plt.close(fig)
-                    b64 = base64.b64encode(_buf.getvalue()).decode()
-                    daily_chart_html = (
-                        f'<p class="ps-desc">Valid bias-corrected velocity cells produced each calendar day '
-                        f'({len(daily)} days, {daily.sum():,} total). Most days produce 1,700–2,900 cells; '
-                        f'lower days reflect fewer dives or partially overlapping dive legs.</p>'
-                        f'<img src="data:image/png;base64,{b64}" '
-                        f'style="width:100%;max-width:900px;margin:8px 0 16px" alt="Daily datapoints chart"/>'
-                    )
-                except Exception:
-                    pass
-
-                ds3.close()
+                            fig, ax = plt.subplots(figsize=(11, 3.2))
+                            low_thresh = avg_pts * 0.5
+                            colors = ['#c0392b' if v < low_thresh else '#2471a3' for v in daily.values]
+                            ax.bar(range(len(daily)), daily.values, color=colors, width=0.8)
+                            ax.axhline(avg_pts, color='#e67e22', linewidth=1.2, linestyle='--',
+                                       label=f'Daily avg ({avg_pts:.0f})')
+                            tick_positions = [i for i, d in enumerate(daily.index)
+                                              if hasattr(d, 'day') and d.day in (1, 8, 15, 22)]
+                            tick_labels    = [f'{daily.index[i].strftime("%b")} {daily.index[i].day}'
+                                              for i in tick_positions]
+                            ax.set_xticks(tick_positions)
+                            ax.set_xticklabels(tick_labels, rotation=30, ha='right', fontsize=9)
+                            ax.set_ylabel('Valid velocity cells', fontsize=9)
+                            ax.set_title(f'Valid datapoints per day — {_run_label}/currents_bias_corrected.nc', fontsize=10)
+                            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{int(x):,}'))
+                            ax.legend(fontsize=8)
+                            ax.grid(axis='y', alpha=0.3)
+                            fig.tight_layout()
+                            _buf = io.BytesIO()
+                            fig.savefig(_buf, format='png', dpi=130, bbox_inches='tight')
+                            plt.close(fig)
+                            b64 = base64.b64encode(_buf.getvalue()).decode()
+                            daily_chart_html = (
+                                f'<p class="ps-desc">Valid bias-corrected velocity cells produced each calendar day '
+                                f'({len(daily)} days, {daily.sum():,} total). Most days produce 1,700–2,900 cells; '
+                                f'lower days reflect fewer dives or partially overlapping dive legs.</p>'
+                                f'<img src="data:image/png;base64,{b64}" '
+                                f'style="width:100%;max-width:900px;margin:8px 0 16px" alt="Daily datapoints chart"/>'
+                            )
+                        except Exception:
+                            pass
 
                 fill_pct = 100 * ve_post['valid'] / ve_post['total'] if ve_post else 0
 
@@ -4221,15 +4227,15 @@ def _adcp_load_nc(dep, out_dir, log):
     all_dfs, skipped = [], []
     for f in nc_files:
         try:
-            ds      = xr.open_dataset(f, decode_times=False)
-            missing = [v for v in required if v not in ds.variables]
-            if missing:
-                skipped.append((os.path.basename(f), f'missing {missing}'))
-                ds.close(); continue
-            df = ds[required].to_dataframe().reset_index()
+            with _nc_lock:
+                with xr.open_dataset(f, decode_times=False) as ds:
+                    missing = [v for v in required if v not in ds.variables]
+                    if missing:
+                        skipped.append((os.path.basename(f), f'missing {missing}'))
+                        continue
+                    df = ds[required].to_dataframe().reset_index()
             df = df[[c for c in required if c in df.columns]].rename(columns=rename)
             all_dfs.append(df)
-            ds.close()
         except Exception as e:
             skipped.append((os.path.basename(f), str(e)))
 
@@ -4347,8 +4353,9 @@ def _adcp_gen_dummy_glider_nc(base_dir, adcp_path, log):
     import xarray as xr
 
     log('Generating synthetic glider file from AD2CP time range...')
-    with h5py.File(adcp_path, 'r') as hf:
-        t_unix = hf['Data/Average/time'][:]
+    with _nc_lock:
+        with h5py.File(adcp_path, 'r') as hf:
+            t_unix = hf['Data/Average/time'][:]
 
     t_min, t_max = float(t_unix.min()), float(t_unix.max())
     log(f'AD2CP time range: {pd.Timestamp(t_min, unit="s")} to {pd.Timestamp(t_max, unit="s")}')
@@ -4448,28 +4455,29 @@ def _adcp_compute_currents(base_dir, run_dir, opts, log):
             raise RuntimeError(f'Required file not found: {os.path.basename(p)}')
 
     log('Loading shear dataset...')
-    ds_adcp = xr.open_dataset(shear_path)
-    log(f'  Dimensions: {dict(ds_adcp.sizes)}')
+    with _nc_lock:
+        with xr.open_dataset(shear_path) as ds_adcp:
+            log(f'  Dimensions: {dict(ds_adcp.sizes)}')
 
-    log('Loading GPS arrays...')
-    gps          = np.load(gps_path, allow_pickle=True)
-    gps_predive  = gps['gps_predive']
-    gps_postdive = gps['gps_postdive']
-    log(f'  GPS pairs: {len(gps_predive)}')
+            log('Loading GPS arrays...')
+            gps          = np.load(gps_path, allow_pickle=True)
+            gps_predive  = gps['gps_predive']
+            gps_postdive = gps['gps_postdive']
+            log(f'  GPS pairs: {len(gps_predive)}')
 
-    options = tools.get_options(
-        xaxis=int(opts.get('xaxis', 1)),
-        yaxis=opts.get('yaxis') or None,
-        shear_bias_regression_depth_slice=(
-            float(opts.get('depth_min', 10)),
-            float(opts.get('depth_max', 1000)),
-        ),
-    )
-    log('Computing absolute currents...')
-    t0 = _t.time()
-    currents, DAC = process_currents.process(ds_adcp, gps_predive, gps_postdive, options=options)
-    elapsed = _t.time() - t0
-    log(f'Completed in {elapsed:.1f}s')
+            options = tools.get_options(
+                xaxis=int(opts.get('xaxis', 1)),
+                yaxis=opts.get('yaxis') or None,
+                shear_bias_regression_depth_slice=(
+                    float(opts.get('depth_min', 10)),
+                    float(opts.get('depth_max', 1000)),
+                ),
+            )
+            log('Computing absolute currents...')
+            t0 = _t.time()
+            currents, DAC = process_currents.process(ds_adcp, gps_predive, gps_postdive, options=options)
+            elapsed = _t.time() - t0
+            log(f'Completed in {elapsed:.1f}s')
 
     out_nc  = _rf(run_dir, 'currents.nc')
     out_dac = _rf(run_dir, 'dac.npz')
@@ -4479,7 +4487,6 @@ def _adcp_compute_currents(base_dir, run_dir, opts, log):
     log(f'Saved: {out_dac}')
     n_valid = int(np.isfinite(DAC['dac']).all(axis=1).sum())
     log(f'DAC: {len(DAC["dive_time"])} dives, {n_valid} with valid vectors')
-    ds_adcp.close()
 
     # If yaxis was auto (None), detect actual depth bin size from the output
     # and rename the run directory to include it (e.g. xaxis3_d10-1000 → xaxis3_d10-1000_y2).
@@ -4517,26 +4524,27 @@ def _adcp_bias_correction(run_dir, opts, log):
         raise RuntimeError('currents.nc not found — run Compute Absolute Currents first')
 
     log('Loading currents dataset...')
-    currents = xr.open_dataset(currents_path)
-    log(f'  Dimensions: {dict(currents.sizes)}')
+    with _nc_lock:
+        with xr.open_dataset(currents_path) as currents:
+            log(f'  Dimensions: {dict(currents.sizes)}')
 
-    options = tools.get_options(
-        xaxis=int(opts.get('xaxis', 1)),
-        yaxis=opts.get('yaxis') or None,
-        shear_bias_regression_depth_slice=(
-            float(opts.get('depth_min', 10)),
-            float(opts.get('depth_max', 1000)),
-        ),
-        weight_shear_bias_regression=bool(opts.get('weight_bias', False)),
-        velocity_dependent_shear_bias_correction=bool(opts.get('vel_dep_bias', False)),
-    )
-    log(f'Bias options: weight_regression={options["weight_shear_bias_regression"]}  '
-        f'velocity_dependent={options["velocity_dependent_shear_bias_correction"]}')
-    log('Applying bias correction...')
-    t0             = _t.time()
-    currents_bias  = process_bias.process(currents, options=options)
-    elapsed        = _t.time() - t0
-    log(f'Completed in {elapsed:.1f}s')
+            options = tools.get_options(
+                xaxis=int(opts.get('xaxis', 1)),
+                yaxis=opts.get('yaxis') or None,
+                shear_bias_regression_depth_slice=(
+                    float(opts.get('depth_min', 10)),
+                    float(opts.get('depth_max', 1000)),
+                ),
+                weight_shear_bias_regression=bool(opts.get('weight_bias', False)),
+                velocity_dependent_shear_bias_correction=bool(opts.get('vel_dep_bias', False)),
+            )
+            log(f'Bias options: weight_regression={options["weight_shear_bias_regression"]}  '
+                f'velocity_dependent={options["velocity_dependent_shear_bias_correction"]}')
+            log('Applying bias correction...')
+            t0             = _t.time()
+            currents_bias  = process_bias.process(currents, options=options)
+            elapsed        = _t.time() - t0
+            log(f'Completed in {elapsed:.1f}s')
 
     out_path = _rf(run_dir, 'currents_bias_corrected.nc')
     currents_bias.to_netcdf(out_path)
@@ -4556,8 +4564,6 @@ def _adcp_bias_correction(run_dir, opts, log):
     except Exception as exc:
         log(f'Bias diagnostic plot skipped ({exc})')
 
-    currents.close()
-
 
 def _adcp_lab_diagnostics(run_dir, log):
     """Run pass/fail checks on a bench-test AD2CP file and write an HTML report."""
@@ -4574,33 +4580,33 @@ def _adcp_lab_diagnostics(run_dir, log):
         raise RuntimeError('shear_processed.nc not found — run Process Shear first')
 
     log('Loading shear_processed.nc...')
-    ds = xr.open_dataset(shear_path)
-    log(f'  Dimensions: {dict(ds.sizes)}')
+    with _nc_lock:
+        with xr.open_dataset(shear_path) as ds:
+            log(f'  Dimensions: {dict(ds.sizes)}')
 
-    n_pings  = ds.sizes.get('time', 0)
-    time_raw = ds.time.values
-    try:
-        time_pd = pd.to_datetime(time_raw)
-    except Exception:
-        time_pd = pd.to_datetime(time_raw, unit='s', errors='coerce')
+            n_pings  = ds.sizes.get('time', 0)
+            time_raw = ds.time.values
+            try:
+                time_pd = pd.to_datetime(time_raw)
+            except Exception:
+                time_pd = pd.to_datetime(time_raw, unit='s', errors='coerce')
 
-    def _get(key):
-        v = ds.get(key)
-        return v.values.astype(float) if v is not None else None
+            def _get(key):
+                v = ds.get(key)
+                return v.values.astype(float) if v is not None else None
 
-    amp  = {i: _get(f'AmplitudeBeam{i}')   for i in range(1, 5)}
-    cor  = {i: _get(f'CorrelationBeam{i}')  for i in range(1, 5)}
-    heading  = _get('Heading')
-    pitch    = _get('Pitch')
-    roll     = _get('Roll')
-    pressure = _get('Pressure')
-    temp     = _get('WaterTemperature')
-    battery  = _get('Battery')
-    ensemble = ds['EnsembleCount'].values if 'EnsembleCount' in ds else None
-    cell_size = float(np.nanmean(ds['CellSize'].values))   if 'CellSize'     in ds else None
-    blanking  = float(np.nanmean(ds['Blanking'].values))   if 'Blanking'     in ds else None
-    n_cells   = int(np.nanmax(ds['NumberofCells'].values)) if 'NumberofCells' in ds else None
-    ds.close()
+            amp  = {i: _get(f'AmplitudeBeam{i}')   for i in range(1, 5)}
+            cor  = {i: _get(f'CorrelationBeam{i}')  for i in range(1, 5)}
+            heading  = _get('Heading')
+            pitch    = _get('Pitch')
+            roll     = _get('Roll')
+            pressure = _get('Pressure')
+            temp     = _get('WaterTemperature')
+            battery  = _get('Battery')
+            ensemble = ds['EnsembleCount'].values if 'EnsembleCount' in ds else None
+            cell_size = float(np.nanmean(ds['CellSize'].values))   if 'CellSize'     in ds else None
+            blanking  = float(np.nanmean(ds['Blanking'].values))   if 'Blanking'     in ds else None
+            n_cells   = int(np.nanmax(ds['NumberofCells'].values)) if 'NumberofCells' in ds else None
 
     checks = {}
 
@@ -4863,67 +4869,67 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, opts, log):
         if not os.path.exists(shear_path):
             raise RuntimeError('shear_processed.nc not found — run Process Shear first')
 
-        ds = xr.open_dataset(shear_path)
-        log(f'Loaded shear dataset: {dict(ds.sizes)}')
-        n_pings = ds.sizes.get('time', 0)
-        x_idx   = np.arange(n_pings)
-        colors  = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
+        with _nc_lock:
+            with xr.open_dataset(shear_path) as ds:
+                log(f'Loaded shear dataset: {dict(ds.sizes)}')
+                n_pings = ds.sizes.get('time', 0)
+                x_idx   = np.arange(n_pings)
+                colors  = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12']
 
-        # Plot 1: Beam amplitude & correlation per beam
-        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-        for i, col in enumerate(colors, start=1):
-            av = ds.get(f'AmplitudeBeam{i}')
-            cv = ds.get(f'CorrelationBeam{i}')
-            if av is not None:
-                vals = av.values.astype(float)
-                mn   = np.nanmean(vals, axis=1) if vals.ndim > 1 else vals
-                axes[0].plot(x_idx, mn, color=col, lw=0.8, alpha=0.8, label=f'Beam {i}')
-            if cv is not None:
-                vals = cv.values.astype(float)
-                mn   = np.nanmean(vals, axis=1) if vals.ndim > 1 else vals
-                axes[1].plot(x_idx, mn, color=col, lw=0.8, alpha=0.8, label=f'Beam {i}')
+                # Plot 1: Beam amplitude & correlation per beam
+                fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+                for i, col in enumerate(colors, start=1):
+                    av = ds.get(f'AmplitudeBeam{i}')
+                    cv = ds.get(f'CorrelationBeam{i}')
+                    if av is not None:
+                        vals = av.values.astype(float)
+                        mn   = np.nanmean(vals, axis=1) if vals.ndim > 1 else vals
+                        axes[0].plot(x_idx, mn, color=col, lw=0.8, alpha=0.8, label=f'Beam {i}')
+                    if cv is not None:
+                        vals = cv.values.astype(float)
+                        mn   = np.nanmean(vals, axis=1) if vals.ndim > 1 else vals
+                        axes[1].plot(x_idx, mn, color=col, lw=0.8, alpha=0.8, label=f'Beam {i}')
 
-        axes[0].set_title('Amplitude per Beam (counts)')
-        axes[0].set_xlabel('Ping index'); axes[0].set_ylabel('Amplitude'); axes[0].legend()
-        axes[1].set_title('Correlation per Beam')
-        axes[1].set_xlabel('Ping index'); axes[1].set_ylabel('Correlation (counts)')
-        axes[1].axhline(50, color='orange', ls='--', lw=1.5, label='Validity threshold')
-        axes[1].set_ylim(0, 105); axes[1].legend()
-        fig.suptitle('AD2CP Lab Test — Beam Diagnostics', fontsize=13)
-        plt.tight_layout()
-        p1 = _rf(run_dir, 'beam_diagnostics.png')
-        plt.savefig(p1, dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        log(f'Saved: {p1}')
+                axes[0].set_title('Amplitude per Beam (counts)')
+                axes[0].set_xlabel('Ping index'); axes[0].set_ylabel('Amplitude'); axes[0].legend()
+                axes[1].set_title('Correlation per Beam')
+                axes[1].set_xlabel('Ping index'); axes[1].set_ylabel('Correlation (counts)')
+                axes[1].axhline(50, color='orange', ls='--', lw=1.5, label='Validity threshold')
+                axes[1].set_ylim(0, 105); axes[1].legend()
+                fig.suptitle('AD2CP Lab Test — Beam Diagnostics', fontsize=13)
+                plt.tight_layout()
+                p1 = _rf(run_dir, 'beam_diagnostics.png')
+                plt.savefig(p1, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                log(f'Saved: {p1}')
 
-        # Plot 2: Internal sensors
-        sensor_pairs = [
-            ('Heading',          '°',    'Heading'),
-            ('Pitch',            '°',    'Pitch'),
-            ('Roll',             '°',    'Roll'),
-            ('Pressure',         'dbar', 'Pressure'),
-            ('WaterTemperature', '°C',   'Temperature'),
-            ('Battery',          'V',    'Battery'),
-        ]
-        avail = [(lbl, unit, ds[key].values.astype(float))
-                 for key, unit, lbl in sensor_pairs if key in ds]
-        if avail:
-            cols_s = 2; rows_s = (len(avail) + 1) // 2
-            fig, axes = plt.subplots(rows_s, cols_s, figsize=(16, 3.5 * rows_s))
-            ax_flat = np.array(axes).flatten()
-            for ax, (lbl, unit, arr) in zip(ax_flat, avail):
-                ax.plot(x_idx, arr, color='#3498db', lw=0.8, alpha=0.9)
-                ax.set_title(f'{lbl} ({unit})')
-                ax.set_xlabel('Ping index'); ax.set_ylabel(unit)
-            for ax in ax_flat[len(avail):]:
-                ax.set_visible(False)
-            fig.suptitle('AD2CP Lab Test — Internal Sensors', fontsize=13)
-            plt.tight_layout()
-            p2 = _rf(run_dir, 'sensor_timeseries.png')
-            plt.savefig(p2, dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            log(f'Saved: {p2}')
-        ds.close()
+                # Plot 2: Internal sensors
+                sensor_pairs = [
+                    ('Heading',          '°',    'Heading'),
+                    ('Pitch',            '°',    'Pitch'),
+                    ('Roll',             '°',    'Roll'),
+                    ('Pressure',         'dbar', 'Pressure'),
+                    ('WaterTemperature', '°C',   'Temperature'),
+                    ('Battery',          'V',    'Battery'),
+                ]
+                avail = [(lbl, unit, ds[key].values.astype(float))
+                         for key, unit, lbl in sensor_pairs if key in ds]
+                if avail:
+                    cols_s = 2; rows_s = (len(avail) + 1) // 2
+                    fig, axes = plt.subplots(rows_s, cols_s, figsize=(16, 3.5 * rows_s))
+                    ax_flat = np.array(axes).flatten()
+                    for ax, (lbl, unit, arr) in zip(ax_flat, avail):
+                        ax.plot(x_idx, arr, color='#3498db', lw=0.8, alpha=0.9)
+                        ax.set_title(f'{lbl} ({unit})')
+                        ax.set_xlabel('Ping index'); ax.set_ylabel(unit)
+                    for ax in ax_flat[len(avail):]:
+                        ax.set_visible(False)
+                    fig.suptitle('AD2CP Lab Test — Internal Sensors', fontsize=13)
+                    plt.tight_layout()
+                    p2 = _rf(run_dir, 'sensor_timeseries.png')
+                    plt.savefig(p2, dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+                    log(f'Saved: {p2}')
 
     else:
         bias_path = _rf(run_dir, 'currents_bias_corrected.nc')
@@ -4933,391 +4939,393 @@ def _adcp_generate_plots(base_dir, run_dir, is_test, opts, log):
             if not os.path.exists(p):
                 raise RuntimeError(f'Required file not found: {os.path.basename(p)}')
 
-        currents_bias = xr.open_dataset(bias_path)
-        log(f'Loaded bias-corrected currents: {dict(currents_bias.sizes)}')
+        with _nc_lock:
+            with xr.open_dataset(bias_path) as currents_bias:
+                log(f'Loaded bias-corrected currents: {dict(currents_bias.sizes)}')
 
-        vel_E = currents_bias['velocity_E_DAC_reference_sb_corrected']
-        vel_N = currents_bias['velocity_N_DAC_reference_sb_corrected']
+                vel_E = currents_bias['velocity_E_DAC_reference_sb_corrected']
+                vel_N = currents_bias['velocity_N_DAC_reference_sb_corrected']
 
-        time_clean = (pd.Series(currents_bias.time.values)
-                      .interpolate(method='linear').values)
-        log(f'NaT remaining after interpolation: {pd.isnull(time_clean).sum()}')
+                time_clean = (pd.Series(currents_bias.time.values)
+                              .interpolate(method='linear').values)
+                log(f'NaT remaining after interpolation: {pd.isnull(time_clean).sum()}')
 
-        depth = currents_bias.depth.values
+                depth = currents_bias.depth.values
 
-        # Depth axis limits — surface anchored at 0, max from data
-        d_min = 0.0
-        d_max = float(np.nanmax(depth))
+                # Depth axis limits — surface anchored at 0, max from data
+                d_min = 0.0
+                d_max = float(np.nanmax(depth))
 
-        # Plot 1: E/N velocity sections
-        fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
-        for ax, var, label in zip(axes, [vel_E, vel_N],
-                                  ['Eastward velocity (m/s)', 'Northward velocity (m/s)']):
-            p = ax.pcolormesh(time_clean, depth, var.values,
-                              cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
-            plt.colorbar(p, ax=ax, label=label, pad=0.01)
-            ax.set_ylabel('Depth (m)')
-        axes[1].set_xlabel('Date')
-        # Apply depth clipping and inversion ONCE on the shared axis
-        axes[0].set_ylim(d_max, d_min)
-        fig.suptitle('Bias-corrected absolute velocities', fontsize=13)
-        plt.tight_layout()
-        p1 = _rf(run_dir, 'velocity_sections.png')
-        plt.savefig(p1, dpi=150)
-        plt.close(fig)
-        log(f'Saved: {p1}')
-
-        # Plot 2: Speed
-        speed = np.sqrt(vel_E ** 2 + vel_N ** 2)
-        fig, ax = plt.subplots(figsize=(16, 4))
-        p = ax.pcolormesh(time_clean, depth, speed.values,
-                          cmap=cmo_speed, vmin=0, vmax=0.5, shading='auto')
-        plt.colorbar(p, ax=ax, label='Speed (m/s)', pad=0.01)
-        ax.set_ylabel('Depth (m)')
-        ax.set_xlabel('Date')
-        ax.set_ylim(d_max, d_min)
-        ax.set_title('Current speed')
-        plt.tight_layout()
-        p2 = _rf(run_dir, 'speed_section.png')
-        plt.savefig(p2, dpi=150)
-        plt.close(fig)
-        log(f'Saved: {p2}')
-
-        # Plot 3: Shear sections (Sh_E, Sh_N)
-        # shear_processed.nc uses (time, gridded_bin); depth_offset coord = range from glider
-        try:
-            shear_path = _rf(run_dir, 'shear_processed.nc')
-            ds_sh = xr.open_dataset(shear_path)
-            if 'Sh_E' in ds_sh and 'Sh_N' in ds_sh:
-                sh_time = pd.Series(ds_sh.time.values).interpolate(method='linear').values
-                if 'depth_offset' in ds_sh.coords:
-                    # depth_offset is negative (upward-looking range); use abs() for readable axis
-                    sh_y      = np.abs(ds_sh['depth_offset'].values)
-                    sh_ylabel = 'Range from glider (m)'
-                else:
-                    sh_y      = np.arange(ds_sh['Sh_E'].shape[1])
-                    sh_ylabel = 'Bin index'
-                sh_E_v = ds_sh['Sh_E'].values
-                sh_N_v = ds_sh['Sh_N'].values
-                # clim at 95th percentile so the colorscale isn't dominated by noise spikes
-                sh_mag_all = np.sqrt(sh_E_v**2 + sh_N_v**2)
-                clim = float(np.nanpercentile(sh_mag_all, 95))
-                clim = max(clim, 0.005)   # floor so empty data still has a sensible scale
+                # Plot 1: E/N velocity sections
                 fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
-                for ax, var, label in zip(axes,
-                                          [sh_E_v, sh_N_v],
-                                          ['Eastward shear dU/dz (s⁻¹)', 'Northward shear dV/dz (s⁻¹)']):
-                    p = ax.pcolormesh(sh_time, sh_y, var.T,
-                                      cmap=cmo_balance, vmin=-clim, vmax=clim, shading='auto')
+                for ax, var, label in zip(axes, [vel_E, vel_N],
+                                          ['Eastward velocity (m/s)', 'Northward velocity (m/s)']):
+                    p = ax.pcolormesh(time_clean, depth, var.values,
+                                      cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
                     plt.colorbar(p, ax=ax, label=label, pad=0.01)
-                    ax.set_ylabel(sh_ylabel)
-                    ax.invert_yaxis()
+                    ax.set_ylabel('Depth (m)')
                 axes[1].set_xlabel('Date')
-                fig.suptitle(f'Vertical shear  (color limits ±{clim:.4f} s⁻¹, 95th pct)', fontsize=13)
+                # Apply depth clipping and inversion ONCE on the shared axis
+                axes[0].set_ylim(d_max, d_min)
+                fig.suptitle('Bias-corrected absolute velocities', fontsize=13)
                 plt.tight_layout()
-                p_sh = _rf(run_dir, 'shear_sections.png')
-                plt.savefig(p_sh, dpi=150)
+                p1 = _rf(run_dir, 'velocity_sections.png')
+                plt.savefig(p1, dpi=150)
                 plt.close(fig)
-                log(f'Saved: {p_sh}')
-            else:
-                log('Shear variables Sh_E/Sh_N not found in shear_processed.nc — skipping')
-            ds_sh.close()
-        except Exception as exc:
-            log(f'Shear section plot skipped ({exc})')
+                log(f'Saved: {p1}')
 
-        # Plot 4: Backscatter / acoustic amplitude sections
-        # Amplitude is on (time, bin); use mean of D1-D4 depth arrays as approximate y-axis
-        try:
-            ds_amp   = xr.open_dataset(_rf(run_dir, 'shear_processed.nc'))
-            amp_vars = [f'AmplitudeBeam{b}' for b in range(1, 5)
-                        if f'AmplitudeBeam{b}' in ds_amp]
-            if amp_vars:
-                amp_time = pd.Series(ds_amp.time.values).interpolate(method='linear').values
-                # Use Amplitude Range (range from transducer) for y-axis
-                if 'Amplitude Range' in ds_amp:
-                    amp_y      = ds_amp['Amplitude Range'].values
-                    amp_ylabel = 'Range from transducer (m)'
-                else:
-                    amp_y      = np.arange(ds_amp[amp_vars[0]].shape[1])
-                    amp_ylabel = 'Bin index'
-                amp_mean = np.nanmean(
-                    np.stack([ds_amp[v].values for v in amp_vars], axis=0), axis=0
-                )
-                fig, ax = plt.subplots(figsize=(16, 5))
-                p = ax.pcolormesh(amp_time, amp_y, amp_mean.T,
-                                  cmap='inferno', shading='auto')
-                plt.colorbar(p, ax=ax, label='Mean acoustic amplitude (counts)', pad=0.01)
-                ax.set_ylabel(amp_ylabel)
-                ax.set_xlabel('Date')
-                ax.invert_yaxis()   # shallow at top, deep at bottom
-                ax.set_title(f'Acoustic backscatter (mean of {len(amp_vars)} beams)')
-                plt.tight_layout()
-                p_amp = _rf(run_dir, 'backscatter.png')
-                plt.savefig(p_amp, dpi=150)
-                plt.close(fig)
-                log(f'Saved: {p_amp}')
-            else:
-                log('AmplitudeBeam variables not found in shear_processed.nc — skipping')
-            ds_amp.close()
-        except Exception as exc:
-            log(f'Backscatter plot skipped ({exc})')
-
-        # Plot 5: Correlation and amplitude heatmaps on absolute depth axis
-        # Groups raw beam pings by profile_number, grids onto regular depth axis using D1-D4 mean depths
-        try:
-            ds_q        = xr.open_dataset(_rf(run_dir, 'shear_processed.nc'))
-            corr_vars_q = [f'CorrelationBeam{b}' for b in range(1, 5) if f'CorrelationBeam{b}' in ds_q]
-            amp_vars_q  = [f'AmplitudeBeam{b}'   for b in range(1, 5) if f'AmplitudeBeam{b}'   in ds_q]
-            d_vars_q    = [v for v in ['D1', 'D2', 'D3', 'D4'] if v in ds_q]
-
-            if corr_vars_q and d_vars_q and 'profile_number' in ds_q:
-                # Per-profile time axis
-                profile_nums          = ds_q.profile_number.values.astype(int)
-                prof_labels, prof_inv = np.unique(profile_nums, return_inverse=True)
-                n_prof                = len(prof_labels)
-                t_float = pd.Series(ds_q.time.values).interpolate(method='linear').values.astype('float64')
-                t_sum   = np.bincount(prof_inv, weights=t_float, minlength=n_prof)
-                t_cnt   = np.bincount(prof_inv, minlength=n_prof)
-                q_time  = (t_sum / np.maximum(t_cnt, 1)).astype('datetime64[ns]')
-
-                # Mean absolute depth across D1-D4 per (ping, bin)
-                D_arr = np.nanmean(np.stack([ds_q[v].values for v in d_vars_q], axis=0), axis=0)
-
-                # Depth grid using yaxis parameter as step size (default 10 m)
-                grid_step     = float(opts.get('yaxis', 10))
-                dg            = np.arange(d_min, d_max + grid_step, grid_step)
-                n_depth       = max(len(dg) - 1, 1)
-                depth_centers = (dg[:-1] + dg[1:]) / 2
-
-                # Precompute flat indices once — reused for both plots
-                n_bins     = ds_q.sizes['bin']
-                depth_flat = D_arr.ravel()
-                prof_flat  = np.repeat(prof_inv, n_bins)
-                depth_idx  = np.searchsorted(dg[1:], depth_flat).clip(0, n_depth - 1)
-                in_range   = np.isfinite(depth_flat) & (depth_flat >= d_min) & (depth_flat <= d_max)
-                lin_base   = prof_flat * n_depth + depth_idx
-
-                def _pdgrid(var_arr):
-                    var_flat = var_arr.ravel()
-                    valid    = in_range & np.isfinite(var_flat)
-                    lin      = lin_base[valid]
-                    vsum     = np.bincount(lin, weights=var_flat[valid].astype(float), minlength=n_prof * n_depth)
-                    vcnt     = np.bincount(lin, minlength=n_prof * n_depth)
-                    return np.where(vcnt > 0, vsum / np.maximum(vcnt, 1), np.nan).reshape(n_prof, n_depth)
-
-                # Correlation heatmap
-                corr_data = np.nanmean(np.stack([ds_q[v].values for v in corr_vars_q], axis=0), axis=0)
-                corr_grid = _pdgrid(corr_data)
-                qc_thresh = float(opts.get('qc_corr', 80))
-                fig, ax   = plt.subplots(figsize=(16, 5))
-                p = ax.pcolormesh(q_time, depth_centers, corr_grid.T,
-                                  cmap='RdYlGn', vmin=0, vmax=100, shading='auto')
-                plt.colorbar(p, ax=ax, label=f'Mean beam correlation (%, {len(corr_vars_q)} beams)', pad=0.01)
+                # Plot 2: Speed
+                speed = np.sqrt(vel_E ** 2 + vel_N ** 2)
+                fig, ax = plt.subplots(figsize=(16, 4))
+                p = ax.pcolormesh(time_clean, depth, speed.values,
+                                  cmap=cmo_speed, vmin=0, vmax=0.5, shading='auto')
+                plt.colorbar(p, ax=ax, label='Speed (m/s)', pad=0.01)
                 ax.set_ylabel('Depth (m)')
                 ax.set_xlabel('Date')
                 ax.set_ylim(d_max, d_min)
-                ax.set_title(f'Beam correlation  (QC threshold: {qc_thresh:.0f}%  —  green = above threshold)')
+                ax.set_title('Current speed')
                 plt.tight_layout()
-                p_corr = _rf(run_dir, 'correlation.png')
-                plt.savefig(p_corr, dpi=150)
+                p2 = _rf(run_dir, 'speed_section.png')
+                plt.savefig(p2, dpi=150)
                 plt.close(fig)
-                log(f'Saved: {p_corr}')
+                log(f'Saved: {p2}')
 
-                # Amplitude / SNR proxy heatmap
-                if amp_vars_q:
-                    amp_data = np.nanmean(np.stack([ds_q[v].values for v in amp_vars_q], axis=0), axis=0)
-                    amp_grid = _pdgrid(amp_data)
-                    fig, ax  = plt.subplots(figsize=(16, 5))
-                    p = ax.pcolormesh(q_time, depth_centers, amp_grid.T,
-                                      cmap='inferno', shading='auto')
-                    plt.colorbar(p, ax=ax,
-                                 label=f'Mean beam amplitude — SNR proxy (counts, {len(amp_vars_q)} beams)',
-                                 pad=0.01)
-                    ax.set_ylabel('Depth (m)')
-                    ax.set_xlabel('Date')
-                    ax.set_ylim(d_max, d_min)
-                    ax.set_title('Beam amplitude (SNR proxy)')
-                    plt.tight_layout()
-                    p_ba = _rf(run_dir, 'beam_amplitude.png')
-                    plt.savefig(p_ba, dpi=150)
-                    plt.close(fig)
-                    log(f'Saved: {p_ba}')
+                # Plot 3: Shear sections (Sh_E, Sh_N)
+                # shear_processed.nc uses (time, gridded_bin); depth_offset coord = range from glider
+                try:
+                    shear_path = _rf(run_dir, 'shear_processed.nc')
+                    with _nc_lock:
+                        with xr.open_dataset(shear_path) as ds_sh:
+                            if 'Sh_E' in ds_sh and 'Sh_N' in ds_sh:
+                                sh_time = pd.Series(ds_sh.time.values).interpolate(method='linear').values
+                                if 'depth_offset' in ds_sh.coords:
+                                    # depth_offset is negative (upward-looking range); use abs() for readable axis
+                                    sh_y      = np.abs(ds_sh['depth_offset'].values)
+                                    sh_ylabel = 'Range from glider (m)'
+                                else:
+                                    sh_y      = np.arange(ds_sh['Sh_E'].shape[1])
+                                    sh_ylabel = 'Bin index'
+                                sh_E_v = ds_sh['Sh_E'].values
+                                sh_N_v = ds_sh['Sh_N'].values
+                                # clim at 95th percentile so the colorscale isn't dominated by noise spikes
+                                sh_mag_all = np.sqrt(sh_E_v**2 + sh_N_v**2)
+                                clim = float(np.nanpercentile(sh_mag_all, 95))
+                                clim = max(clim, 0.005)   # floor so empty data still has a sensible scale
+                                fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True, sharey=True)
+                                for ax, var, label in zip(axes,
+                                                          [sh_E_v, sh_N_v],
+                                                          ['Eastward shear dU/dz (s⁻¹)', 'Northward shear dV/dz (s⁻¹)']):
+                                    p = ax.pcolormesh(sh_time, sh_y, var.T,
+                                                      cmap=cmo_balance, vmin=-clim, vmax=clim, shading='auto')
+                                    plt.colorbar(p, ax=ax, label=label, pad=0.01)
+                                    ax.set_ylabel(sh_ylabel)
+                                    ax.invert_yaxis()
+                                axes[1].set_xlabel('Date')
+                                fig.suptitle(f'Vertical shear  (color limits ±{clim:.4f} s⁻¹, 95th pct)', fontsize=13)
+                                plt.tight_layout()
+                                p_sh = _rf(run_dir, 'shear_sections.png')
+                                plt.savefig(p_sh, dpi=150)
+                                plt.close(fig)
+                                log(f'Saved: {p_sh}')
+                            else:
+                                log('Shear variables Sh_E/Sh_N not found in shear_processed.nc — skipping')
+                except Exception as exc:
+                    log(f'Shear section plot skipped ({exc})')
 
-                    # SNR heatmap — noise floor from 5th pct of last range bin (fully attenuated)
-                    noise_floor = float(np.nanmean(amp_data[:, -3:]))
-                    snr_grid    = None
-                    if noise_floor > 0:
-                        snr_data = 20.0 * np.log10(np.maximum(amp_data / noise_floor, 1e-9))
-                        snr_grid = _pdgrid(snr_data)
-                        fig, ax  = plt.subplots(figsize=(16, 5))
-                        p = ax.pcolormesh(q_time, depth_centers, snr_grid.T,
-                                          cmap='viridis', shading='auto')
-                        plt.colorbar(p, ax=ax,
-                                     label=f'SNR (dB, {len(amp_vars_q)} beams)', pad=0.01)
-                        ax.set_ylabel('Depth (m)')
-                        ax.set_xlabel('Date')
-                        ax.set_ylim(d_max, d_min)
-                        ax.set_title(
-                            f'Beam SNR  (noise floor: {noise_floor:.1f} counts '
-                            f'— mean of last 3 range bins)')
+                # Plot 4: Backscatter / acoustic amplitude sections
+                # Amplitude is on (time, bin); use mean of D1-D4 depth arrays as approximate y-axis
+                try:
+                    with _nc_lock:
+                        with xr.open_dataset(_rf(run_dir, 'shear_processed.nc')) as ds_amp:
+                            amp_vars = [f'AmplitudeBeam{b}' for b in range(1, 5)
+                                        if f'AmplitudeBeam{b}' in ds_amp]
+                            if amp_vars:
+                                amp_time = pd.Series(ds_amp.time.values).interpolate(method='linear').values
+                                # Use Amplitude Range (range from transducer) for y-axis
+                                if 'Amplitude Range' in ds_amp:
+                                    amp_y      = ds_amp['Amplitude Range'].values
+                                    amp_ylabel = 'Range from transducer (m)'
+                                else:
+                                    amp_y      = np.arange(ds_amp[amp_vars[0]].shape[1])
+                                    amp_ylabel = 'Bin index'
+                                amp_mean = np.nanmean(
+                                    np.stack([ds_amp[v].values for v in amp_vars], axis=0), axis=0
+                                )
+                                fig, ax = plt.subplots(figsize=(16, 5))
+                                p = ax.pcolormesh(amp_time, amp_y, amp_mean.T,
+                                                  cmap='inferno', shading='auto')
+                                plt.colorbar(p, ax=ax, label='Mean acoustic amplitude (counts)', pad=0.01)
+                                ax.set_ylabel(amp_ylabel)
+                                ax.set_xlabel('Date')
+                                ax.invert_yaxis()   # shallow at top, deep at bottom
+                                ax.set_title(f'Acoustic backscatter (mean of {len(amp_vars)} beams)')
+                                plt.tight_layout()
+                                p_amp = _rf(run_dir, 'backscatter.png')
+                                plt.savefig(p_amp, dpi=150)
+                                plt.close(fig)
+                                log(f'Saved: {p_amp}')
+                            else:
+                                log('AmplitudeBeam variables not found in shear_processed.nc — skipping')
+                except Exception as exc:
+                    log(f'Backscatter plot skipped ({exc})')
+
+                # Plot 5: Correlation and amplitude heatmaps on absolute depth axis
+                # Groups raw beam pings by profile_number, grids onto regular depth axis using D1-D4 mean depths
+                try:
+                    with _nc_lock:
+                        with xr.open_dataset(_rf(run_dir, 'shear_processed.nc')) as ds_q:
+                            corr_vars_q = [f'CorrelationBeam{b}' for b in range(1, 5) if f'CorrelationBeam{b}' in ds_q]
+                            amp_vars_q  = [f'AmplitudeBeam{b}'   for b in range(1, 5) if f'AmplitudeBeam{b}'   in ds_q]
+                            d_vars_q    = [v for v in ['D1', 'D2', 'D3', 'D4'] if v in ds_q]
+
+                            if corr_vars_q and d_vars_q and 'profile_number' in ds_q:
+                                # Per-profile time axis
+                                profile_nums          = ds_q.profile_number.values.astype(int)
+                                prof_labels, prof_inv = np.unique(profile_nums, return_inverse=True)
+                                n_prof                = len(prof_labels)
+                                t_float = pd.Series(ds_q.time.values).interpolate(method='linear').values.astype('float64')
+                                t_sum   = np.bincount(prof_inv, weights=t_float, minlength=n_prof)
+                                t_cnt   = np.bincount(prof_inv, minlength=n_prof)
+                                q_time  = (t_sum / np.maximum(t_cnt, 1)).astype('datetime64[ns]')
+
+                                # Mean absolute depth across D1-D4 per (ping, bin)
+                                D_arr = np.nanmean(np.stack([ds_q[v].values for v in d_vars_q], axis=0), axis=0)
+
+                                # Depth grid using yaxis parameter as step size (default 10 m).
+                                # opts['yaxis'] is explicitly None on the wire in "auto" mode (not an
+                                # absent key), so .get(..., 10) alone never falls back -- match the
+                                # `or` idiom already used for this same field elsewhere in this file.
+                                grid_step     = float(opts.get('yaxis') or 10)
+                                dg            = np.arange(d_min, d_max + grid_step, grid_step)
+                                n_depth       = max(len(dg) - 1, 1)
+                                depth_centers = (dg[:-1] + dg[1:]) / 2
+
+                                # Precompute flat indices once — reused for both plots
+                                n_bins     = ds_q.sizes['bin']
+                                depth_flat = D_arr.ravel()
+                                prof_flat  = np.repeat(prof_inv, n_bins)
+                                depth_idx  = np.searchsorted(dg[1:], depth_flat).clip(0, n_depth - 1)
+                                in_range   = np.isfinite(depth_flat) & (depth_flat >= d_min) & (depth_flat <= d_max)
+                                lin_base   = prof_flat * n_depth + depth_idx
+
+                                def _pdgrid(var_arr):
+                                    var_flat = var_arr.ravel()
+                                    valid    = in_range & np.isfinite(var_flat)
+                                    lin      = lin_base[valid]
+                                    vsum     = np.bincount(lin, weights=var_flat[valid].astype(float), minlength=n_prof * n_depth)
+                                    vcnt     = np.bincount(lin, minlength=n_prof * n_depth)
+                                    return np.where(vcnt > 0, vsum / np.maximum(vcnt, 1), np.nan).reshape(n_prof, n_depth)
+
+                                # Correlation heatmap
+                                corr_data = np.nanmean(np.stack([ds_q[v].values for v in corr_vars_q], axis=0), axis=0)
+                                corr_grid = _pdgrid(corr_data)
+                                qc_thresh = float(opts.get('qc_corr', 80))
+                                fig, ax   = plt.subplots(figsize=(16, 5))
+                                p = ax.pcolormesh(q_time, depth_centers, corr_grid.T,
+                                                  cmap='RdYlGn', vmin=0, vmax=100, shading='auto')
+                                plt.colorbar(p, ax=ax, label=f'Mean beam correlation (%, {len(corr_vars_q)} beams)', pad=0.01)
+                                ax.set_ylabel('Depth (m)')
+                                ax.set_xlabel('Date')
+                                ax.set_ylim(d_max, d_min)
+                                ax.set_title(f'Beam correlation  (QC threshold: {qc_thresh:.0f}%  —  green = above threshold)')
+                                plt.tight_layout()
+                                p_corr = _rf(run_dir, 'correlation.png')
+                                plt.savefig(p_corr, dpi=150)
+                                plt.close(fig)
+                                log(f'Saved: {p_corr}')
+
+                                # Amplitude / SNR proxy heatmap
+                                if amp_vars_q:
+                                    amp_data = np.nanmean(np.stack([ds_q[v].values for v in amp_vars_q], axis=0), axis=0)
+                                    amp_grid = _pdgrid(amp_data)
+                                    fig, ax  = plt.subplots(figsize=(16, 5))
+                                    p = ax.pcolormesh(q_time, depth_centers, amp_grid.T,
+                                                      cmap='inferno', shading='auto')
+                                    plt.colorbar(p, ax=ax,
+                                                 label=f'Mean beam amplitude — SNR proxy (counts, {len(amp_vars_q)} beams)',
+                                                 pad=0.01)
+                                    ax.set_ylabel('Depth (m)')
+                                    ax.set_xlabel('Date')
+                                    ax.set_ylim(d_max, d_min)
+                                    ax.set_title('Beam amplitude (SNR proxy)')
+                                    plt.tight_layout()
+                                    p_ba = _rf(run_dir, 'beam_amplitude.png')
+                                    plt.savefig(p_ba, dpi=150)
+                                    plt.close(fig)
+                                    log(f'Saved: {p_ba}')
+
+                                    # SNR heatmap — noise floor from 5th pct of last range bin (fully attenuated)
+                                    noise_floor = float(np.nanmean(amp_data[:, -3:]))
+                                    snr_grid    = None
+                                    if noise_floor > 0:
+                                        snr_data = 20.0 * np.log10(np.maximum(amp_data / noise_floor, 1e-9))
+                                        snr_grid = _pdgrid(snr_data)
+                                        fig, ax  = plt.subplots(figsize=(16, 5))
+                                        p = ax.pcolormesh(q_time, depth_centers, snr_grid.T,
+                                                          cmap='viridis', shading='auto')
+                                        plt.colorbar(p, ax=ax,
+                                                     label=f'SNR (dB, {len(amp_vars_q)} beams)', pad=0.01)
+                                        ax.set_ylabel('Depth (m)')
+                                        ax.set_xlabel('Date')
+                                        ax.set_ylim(d_max, d_min)
+                                        ax.set_title(
+                                            f'Beam SNR  (noise floor: {noise_floor:.1f} counts '
+                                            f'— mean of last 3 range bins)')
+                                        plt.tight_layout()
+                                        p_snr = _rf(run_dir, 'snr.png')
+                                        plt.savefig(p_snr, dpi=150)
+                                        plt.close(fig)
+                                        log(f'Saved: {p_snr}')
+
+                                    # Save depth-gridded beam quality data as NetCDF
+                                    try:
+                                        bq_coords = {
+                                            'time':  xr.DataArray(q_time, dims=['profile'],
+                                                         attrs={'long_name': 'Profile mean time'}),
+                                            'depth': xr.DataArray(depth_centers, dims=['depth'],
+                                                         attrs={'units': 'm', 'long_name': 'Depth bin centre',
+                                                                'positive': 'down'}),
+                                        }
+                                        bq_vars = {
+                                            'correlation': xr.DataArray(
+                                                corr_grid, dims=['profile', 'depth'],
+                                                attrs={'units': '%',
+                                                       'long_name': f'Mean beam correlation ({len(corr_vars_q)} beams)'}),
+                                            'amplitude': xr.DataArray(
+                                                amp_grid, dims=['profile', 'depth'],
+                                                attrs={'units': 'counts',
+                                                       'long_name': f'Mean beam amplitude ({len(amp_vars_q)} beams)'}),
+                                        }
+                                        if snr_grid is not None:
+                                            bq_vars['snr'] = xr.DataArray(
+                                                snr_grid, dims=['profile', 'depth'],
+                                                attrs={'units': 'dB',
+                                                       'long_name': f'Beam SNR ({len(amp_vars_q)} beams)',
+                                                       'noise_floor_counts': noise_floor,
+                                                       'noise_floor_method':
+                                                           'mean of last 3 range bins across all pings'})
+                                        ds_bq = xr.Dataset(bq_vars, coords=bq_coords,
+                                            attrs={'title': 'AD2CP beam quality metrics gridded to depth',
+                                                   'depth_grid_step_m': grid_step,
+                                                   'n_corr_beams': len(corr_vars_q),
+                                                   'n_amp_beams':  len(amp_vars_q)})
+                                        p_bq = _rf(run_dir, 'beam_quality.nc')
+                                        ds_bq.to_netcdf(p_bq)
+                                        ds_bq.close()
+                                        log(f'Saved: {p_bq}')
+                                    except Exception as exc:
+                                        log(f'beam_quality.nc save skipped ({exc})')
+                            else:
+                                log('Beam quality heatmaps: CorrelationBeam/D1-D4/profile_number not found — skipping')
+                except Exception as exc:
+                    log(f'Beam quality heatmaps skipped ({exc})')
+
+                # Plot 6: DAC time series
+                try:
+                    dac_data   = np.load(dac_path, allow_pickle=True)
+                    dac_E_ts   = dac_data['dac'][:, 0].astype(float)
+                    dac_N_ts   = dac_data['dac'][:, 1].astype(float)
+                    dac_spd_ts = np.sqrt(dac_E_ts ** 2 + dac_N_ts ** 2)
+                    dac_times  = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
+                    valid_ts   = np.isfinite(dac_E_ts) & np.isfinite(dac_N_ts)
+                    if valid_ts.sum() >= 2:
+                        fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+                        axes[0].plot(dac_times[valid_ts], dac_E_ts[valid_ts], '-o',
+                                     ms=3, lw=1.2, color='steelblue', label='U (east)')
+                        axes[0].plot(dac_times[valid_ts], dac_N_ts[valid_ts], '-o',
+                                     ms=3, lw=1.2, color='firebrick', label='V (north)')
+                        axes[0].axhline(0, color='k', lw=0.5, ls='--')
+                        axes[0].set_ylabel('DAC (m/s)')
+                        axes[0].legend(fontsize=9)
+                        axes[0].set_title('Depth-averaged current time series')
+                        axes[1].plot(dac_times[valid_ts], dac_spd_ts[valid_ts], '-o',
+                                     ms=3, lw=1.2, color='darkorchid', label='Speed')
+                        axes[1].set_ylabel('Speed (m/s)')
+                        axes[1].set_xlabel('Date')
+                        axes[1].legend(fontsize=9)
                         plt.tight_layout()
-                        p_snr = _rf(run_dir, 'snr.png')
-                        plt.savefig(p_snr, dpi=150)
+                        p_dts = _rf(run_dir, 'dac_timeseries.png')
+                        plt.savefig(p_dts, dpi=150)
                         plt.close(fig)
-                        log(f'Saved: {p_snr}')
+                        log(f'Saved: {p_dts}')
+                    else:
+                        log('Insufficient valid DAC vectors for time series — skipping')
+                except Exception as exc:
+                    log(f'DAC time series plot skipped ({exc})')
 
-                    # Save depth-gridded beam quality data as NetCDF
-                    try:
-                        bq_coords = {
-                            'time':  xr.DataArray(q_time, dims=['profile'],
-                                         attrs={'long_name': 'Profile mean time'}),
-                            'depth': xr.DataArray(depth_centers, dims=['depth'],
-                                         attrs={'units': 'm', 'long_name': 'Depth bin centre',
-                                                'positive': 'down'}),
-                        }
-                        bq_vars = {
-                            'correlation': xr.DataArray(
-                                corr_grid, dims=['profile', 'depth'],
-                                attrs={'units': '%',
-                                       'long_name': f'Mean beam correlation ({len(corr_vars_q)} beams)'}),
-                            'amplitude': xr.DataArray(
-                                amp_grid, dims=['profile', 'depth'],
-                                attrs={'units': 'counts',
-                                       'long_name': f'Mean beam amplitude ({len(amp_vars_q)} beams)'}),
-                        }
-                        if snr_grid is not None:
-                            bq_vars['snr'] = xr.DataArray(
-                                snr_grid, dims=['profile', 'depth'],
-                                attrs={'units': 'dB',
-                                       'long_name': f'Beam SNR ({len(amp_vars_q)} beams)',
-                                       'noise_floor_counts': noise_floor,
-                                       'noise_floor_method':
-                                           'mean of last 3 range bins across all pings'})
-                        ds_bq = xr.Dataset(bq_vars, coords=bq_coords,
-                            attrs={'title': 'AD2CP beam quality metrics gridded to depth',
-                                   'depth_grid_step_m': grid_step,
-                                   'n_corr_beams': len(corr_vars_q),
-                                   'n_amp_beams':  len(amp_vars_q)})
-                        p_bq = _rf(run_dir, 'beam_quality.nc')
-                        ds_bq.to_netcdf(p_bq)
-                        ds_bq.close()
-                        log(f'Saved: {p_bq}')
-                    except Exception as exc:
-                        log(f'beam_quality.nc save skipped ({exc})')
-            else:
-                log('Beam quality heatmaps: CorrelationBeam/D1-D4/profile_number not found — skipping')
-            ds_q.close()
-        except Exception as exc:
-            log(f'Beam quality heatmaps skipped ({exc})')
+                # Plot 6: DAC map
+                try:
+                    import cartopy.crs as ccrs
+                    import cartopy.feature as cfeature
+                    from matplotlib.colors import Normalize
+                    from matplotlib.cm import ScalarMappable
 
-        # Plot 6: DAC time series
-        try:
-            dac_data   = np.load(dac_path, allow_pickle=True)
-            dac_E_ts   = dac_data['dac'][:, 0].astype(float)
-            dac_N_ts   = dac_data['dac'][:, 1].astype(float)
-            dac_spd_ts = np.sqrt(dac_E_ts ** 2 + dac_N_ts ** 2)
-            dac_times  = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
-            valid_ts   = np.isfinite(dac_E_ts) & np.isfinite(dac_N_ts)
-            if valid_ts.sum() >= 2:
-                fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
-                axes[0].plot(dac_times[valid_ts], dac_E_ts[valid_ts], '-o',
-                             ms=3, lw=1.2, color='steelblue', label='U (east)')
-                axes[0].plot(dac_times[valid_ts], dac_N_ts[valid_ts], '-o',
-                             ms=3, lw=1.2, color='firebrick', label='V (north)')
-                axes[0].axhline(0, color='k', lw=0.5, ls='--')
-                axes[0].set_ylabel('DAC (m/s)')
-                axes[0].legend(fontsize=9)
-                axes[0].set_title('Depth-averaged current time series')
-                axes[1].plot(dac_times[valid_ts], dac_spd_ts[valid_ts], '-o',
-                             ms=3, lw=1.2, color='darkorchid', label='Speed')
-                axes[1].set_ylabel('Speed (m/s)')
-                axes[1].set_xlabel('Date')
-                axes[1].legend(fontsize=9)
-                plt.tight_layout()
-                p_dts = _rf(run_dir, 'dac_timeseries.png')
-                plt.savefig(p_dts, dpi=150)
-                plt.close(fig)
-                log(f'Saved: {p_dts}')
-            else:
-                log('Insufficient valid DAC vectors for time series — skipping')
-        except Exception as exc:
-            log(f'DAC time series plot skipped ({exc})')
+                    gps          = np.load(gps_path, allow_pickle=True)
+                    gps_predive  = gps['gps_predive']
+                    dac_data     = np.load(dac_path, allow_pickle=True)
+                    dac_E        = dac_data['dac'][:, 0].astype(float)
+                    dac_N        = dac_data['dac'][:, 1].astype(float)
 
-        # Plot 6: DAC map
-        try:
-            import cartopy.crs as ccrs
-            import cartopy.feature as cfeature
-            from matplotlib.colors import Normalize
-            from matplotlib.cm import ScalarMappable
+                    dive_times_pd = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
+                    pre_times_pd  = pd.to_datetime(gps_predive[:, 0].astype('datetime64[ns]'))
 
-            gps          = np.load(gps_path, allow_pickle=True)
-            gps_predive  = gps['gps_predive']
-            dac_data     = np.load(dac_path, allow_pickle=True)
-            dac_E        = dac_data['dac'][:, 0].astype(float)
-            dac_N        = dac_data['dac'][:, 1].astype(float)
+                    lons = np.full(len(dive_times_pd), np.nan)
+                    lats = np.full(len(dive_times_pd), np.nan)
+                    for i, dt in enumerate(dive_times_pd):
+                        idx     = int(np.argmin(np.abs(pre_times_pd - dt)))
+                        lons[i] = float(gps_predive[idx, 1])
+                        lats[i] = float(gps_predive[idx, 2])
 
-            dive_times_pd = pd.to_datetime(dac_data['dive_time'].astype('datetime64[ns]'))
-            pre_times_pd  = pd.to_datetime(gps_predive[:, 0].astype('datetime64[ns]'))
+                    valid  = np.isfinite(dac_E) & np.isfinite(dac_N) & np.isfinite(lons) & np.isfinite(lats)
+                    log(f'Valid DAC vectors: {valid.sum()} / {len(valid)}')
 
-            lons = np.full(len(dive_times_pd), np.nan)
-            lats = np.full(len(dive_times_pd), np.nan)
-            for i, dt in enumerate(dive_times_pd):
-                idx     = int(np.argmin(np.abs(pre_times_pd - dt)))
-                lons[i] = float(gps_predive[idx, 1])
-                lats[i] = float(gps_predive[idx, 2])
+                    if valid.sum() >= 2:
+                        N_sub    = max(1, len(np.where(valid)[0]) // 50)
+                        idx_sub  = np.where(valid)[0][::N_sub]
+                        lon_min  = lons[valid].min() - 0.5
+                        lon_max  = lons[valid].max() + 0.5
+                        lat_min  = lats[valid].min() - 0.5
+                        lat_max  = lats[valid].max() + 0.5
+                        dac_norm = Normalize(vmin=0, vmax=0.3)
 
-            valid  = np.isfinite(dac_E) & np.isfinite(dac_N) & np.isfinite(lons) & np.isfinite(lats)
-            log(f'Valid DAC vectors: {valid.sum()} / {len(valid)}')
+                        fig, ax = plt.subplots(figsize=(10, 12),
+                                               subplot_kw={'projection': ccrs.PlateCarree()})
+                        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
+                        ax.add_feature(cfeature.OCEAN.with_scale('10m'),     color='lightsteelblue', alpha=0.4)
+                        ax.add_feature(cfeature.LAND.with_scale('10m'),      color='wheat', zorder=2)
+                        ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=0.6, zorder=3)
+                        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='grey', alpha=0.6, linestyle='--')
+                        gl.top_labels   = False
+                        gl.right_labels = False
+                        ax.plot(lons[valid], lats[valid], 'k-', lw=0.8, alpha=0.4,
+                                transform=ccrs.PlateCarree(), zorder=4)
 
-            if valid.sum() >= 2:
-                N_sub    = max(1, len(np.where(valid)[0]) // 50)
-                idx_sub  = np.where(valid)[0][::N_sub]
-                lon_min  = lons[valid].min() - 0.5
-                lon_max  = lons[valid].max() + 0.5
-                lat_min  = lats[valid].min() - 0.5
-                lat_max  = lats[valid].max() + 0.5
-                dac_norm = Normalize(vmin=0, vmax=0.3)
+                        sub_v = (np.isfinite(dac_E[idx_sub]) & np.isfinite(dac_N[idx_sub]) &
+                                 np.isfinite(lons[idx_sub]) & np.isfinite(lats[idx_sub]))
+                        q = ax.quiver(
+                            lons[idx_sub][sub_v], lats[idx_sub][sub_v],
+                            dac_E[idx_sub][sub_v], dac_N[idx_sub][sub_v],
+                            dac_norm(np.sqrt(dac_E[idx_sub][sub_v] ** 2 + dac_N[idx_sub][sub_v] ** 2)),
+                            cmap=cmo_speed, scale=4, width=0.003,
+                            transform=ccrs.PlateCarree(), zorder=5,
+                        )
+                        sm = ScalarMappable(cmap=cmo_speed, norm=dac_norm)
+                        sm.set_array([])
+                        plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02,
+                                     shrink=0.6, label='DAC speed (m/s)')
+                        ax.quiverkey(q, 0.87, 0.97, 0.1, '0.1 m/s',
+                                     labelpos='E', fontproperties={'size': 9})
+                        ax.set_title('Depth-averaged currents (DAC)', fontsize=12)
+                        plt.tight_layout()
+                        p3 = _rf(run_dir, 'dac_map_cartopy.png')
+                        plt.savefig(p3, dpi=200, bbox_inches='tight')
+                        plt.close(fig)
+                        log(f'Saved: {p3}')
+                    else:
+                        log('Insufficient valid DAC vectors for map plot — skipping')
 
-                fig, ax = plt.subplots(figsize=(10, 12),
-                                       subplot_kw={'projection': ccrs.PlateCarree()})
-                ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
-                ax.add_feature(cfeature.OCEAN.with_scale('10m'),     color='lightsteelblue', alpha=0.4)
-                ax.add_feature(cfeature.LAND.with_scale('10m'),      color='wheat', zorder=2)
-                ax.add_feature(cfeature.COASTLINE.with_scale('10m'), linewidth=0.6, zorder=3)
-                gl = ax.gridlines(draw_labels=True, linewidth=0.4, color='grey', alpha=0.6, linestyle='--')
-                gl.top_labels   = False
-                gl.right_labels = False
-                ax.plot(lons[valid], lats[valid], 'k-', lw=0.8, alpha=0.4,
-                        transform=ccrs.PlateCarree(), zorder=4)
-
-                sub_v = (np.isfinite(dac_E[idx_sub]) & np.isfinite(dac_N[idx_sub]) &
-                         np.isfinite(lons[idx_sub]) & np.isfinite(lats[idx_sub]))
-                q = ax.quiver(
-                    lons[idx_sub][sub_v], lats[idx_sub][sub_v],
-                    dac_E[idx_sub][sub_v], dac_N[idx_sub][sub_v],
-                    dac_norm(np.sqrt(dac_E[idx_sub][sub_v] ** 2 + dac_N[idx_sub][sub_v] ** 2)),
-                    cmap=cmo_speed, scale=4, width=0.003,
-                    transform=ccrs.PlateCarree(), zorder=5,
-                )
-                sm = ScalarMappable(cmap=cmo_speed, norm=dac_norm)
-                sm.set_array([])
-                plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02,
-                             shrink=0.6, label='DAC speed (m/s)')
-                ax.quiverkey(q, 0.87, 0.97, 0.1, '0.1 m/s',
-                             labelpos='E', fontproperties={'size': 9})
-                ax.set_title('Depth-averaged currents (DAC)', fontsize=12)
-                plt.tight_layout()
-                p3 = _rf(run_dir, 'dac_map_cartopy.png')
-                plt.savefig(p3, dpi=200, bbox_inches='tight')
-                plt.close(fig)
-                log(f'Saved: {p3}')
-            else:
-                log('Insufficient valid DAC vectors for map plot — skipping')
-
-        except Exception as exc:
-            log(f'DAC map skipped ({exc})')
-
-        currents_bias.close()
+                except Exception as exc:
+                    log(f'DAC map skipped ({exc})')
 
 
 def _adcp_tidal_filter(run_dir, opts, log):
@@ -5343,110 +5351,110 @@ def _adcp_tidal_filter(run_dir, opts, log):
         cmo_amp     = 'hot_r'
 
     log('Loading bias-corrected currents...')
-    currents = xr.open_dataset(bias_path)
-    vel_E = currents['velocity_E_DAC_reference_sb_corrected'].values.copy()
-    vel_N = currents['velocity_N_DAC_reference_sb_corrected'].values.copy()
-    depth = currents.depth.values
-    times = pd.to_datetime(currents.time.values)
+    with _nc_lock:
+        with xr.open_dataset(bias_path) as currents:
+            vel_E = currents['velocity_E_DAC_reference_sb_corrected'].values.copy()
+            vel_N = currents['velocity_N_DAC_reference_sb_corrected'].values.copy()
+            depth = currents.depth.values
+            times = pd.to_datetime(currents.time.values)
 
-    # Depth axis limits — surface anchored at 0, max from data
-    d_max = float(np.nanmax(depth))
+            # Depth axis limits — surface anchored at 0, max from data
+            d_max = float(np.nanmax(depth))
 
-    # currents_bias_corrected.nc layout: (depth, profile_index)
-    # depth axis = axis 0 (vel_E.shape[0]), profile/time axis = axis 1 (vel_E.shape[1])
-    n_dep  = vel_E.shape[0]   # depth levels  (e.g. 501)
-    n_prof = vel_E.shape[1]   # profiles/time (e.g. 355) — same length as time coord
-    log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
-    log(f'  depth coord length: {len(depth)}, time coord length: {len(times)}')
+            # currents_bias_corrected.nc layout: (depth, profile_index)
+            # depth axis = axis 0 (vel_E.shape[0]), profile/time axis = axis 1 (vel_E.shape[1])
+            n_dep  = vel_E.shape[0]   # depth levels  (e.g. 501)
+            n_prof = vel_E.shape[1]   # profiles/time (e.g. 355) — same length as time coord
+            log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
+            log(f'  depth coord length: {len(depth)}, time coord length: {len(times)}')
 
-    # Estimate time spacing from actual profile times
-    t_float  = times.astype(np.int64) / 1e9 / 3600   # hours since epoch
-    dt_hours = float(np.nanmedian(np.diff(t_float)))
-    log(f'  Median profile spacing: {dt_hours:.2f} h')
+            # Estimate time spacing from actual profile times
+            t_float  = times.astype(np.int64) / 1e9 / 3600   # hours since epoch
+            dt_hours = float(np.nanmedian(np.diff(t_float)))
+            log(f'  Median profile spacing: {dt_hours:.2f} h')
 
-    CUTOFF_HOURS = 40.0
-    nyq  = 1.0 / (2.0 * dt_hours)
-    Wn   = (1.0 / CUTOFF_HOURS) / nyq
+            CUTOFF_HOURS = 40.0
+            nyq  = 1.0 / (2.0 * dt_hours)
+            Wn   = (1.0 / CUTOFF_HOURS) / nyq
 
-    if Wn >= 1.0:
-        log(f'  Profile spacing too coarse for {CUTOFF_HOURS}-h filter — sub-tidal == full signal')
-        u_sub = vel_E.copy()
-        v_sub = vel_N.copy()
-    else:
-        order    = 4
-        log(f'  Butterworth order={order}, cutoff={CUTOFF_HOURS} h, Wn={Wn:.4f}')
-        b, a     = signal.butter(order, Wn, btype='low')
-        u_sub    = np.full_like(vel_E, np.nan)
-        v_sub    = np.full_like(vel_N, np.nan)
-        min_samp = max(15, int(CUTOFF_HOURS / dt_hours) * 3)
-        idx_all  = np.arange(n_prof)   # profile indices (length n_prof)
+            if Wn >= 1.0:
+                log(f'  Profile spacing too coarse for {CUTOFF_HOURS}-h filter — sub-tidal == full signal')
+                u_sub = vel_E.copy()
+                v_sub = vel_N.copy()
+            else:
+                order    = 4
+                log(f'  Butterworth order={order}, cutoff={CUTOFF_HOURS} h, Wn={Wn:.4f}')
+                b, a     = signal.butter(order, Wn, btype='low')
+                u_sub    = np.full_like(vel_E, np.nan)
+                v_sub    = np.full_like(vel_N, np.nan)
+                min_samp = max(15, int(CUTOFF_HOURS / dt_hours) * 3)
+                idx_all  = np.arange(n_prof)   # profile indices (length n_prof)
 
-        # Filter along the profile/time axis (axis 1) for each depth level
-        for di in range(n_dep):
-            uc = vel_E[di, :]   # time series at depth di, shape (n_prof,)
-            vc = vel_N[di, :]
-            ok = np.isfinite(uc) & np.isfinite(vc)
-            if ok.sum() < min_samp:
-                continue
-            idx_ok = idx_all[ok]
-            uf = np.interp(idx_all, idx_ok, uc[ok])
-            vf = np.interp(idx_all, idx_ok, vc[ok])
-            try:
-                uf = signal.filtfilt(b, a, uf)
-                vf = signal.filtfilt(b, a, vf)
-            except ValueError:
-                continue
-            u_sub[di, :] = np.where(ok, uf, np.nan)
-            v_sub[di, :] = np.where(ok, vf, np.nan)
+                # Filter along the profile/time axis (axis 1) for each depth level
+                for di in range(n_dep):
+                    uc = vel_E[di, :]   # time series at depth di, shape (n_prof,)
+                    vc = vel_N[di, :]
+                    ok = np.isfinite(uc) & np.isfinite(vc)
+                    if ok.sum() < min_samp:
+                        continue
+                    idx_ok = idx_all[ok]
+                    uf = np.interp(idx_all, idx_ok, uc[ok])
+                    vf = np.interp(idx_all, idx_ok, vc[ok])
+                    try:
+                        uf = signal.filtfilt(b, a, uf)
+                        vf = signal.filtfilt(b, a, vf)
+                    except ValueError:
+                        continue
+                    u_sub[di, :] = np.where(ok, uf, np.nan)
+                    v_sub[di, :] = np.where(ok, vf, np.nan)
 
-        valid_dep = int(np.any(np.isfinite(u_sub), axis=1).sum())
-        log(f'  Valid depth levels after filtering: {valid_dep}/{n_dep}')
+                valid_dep = int(np.any(np.isfinite(u_sub), axis=1).sum())
+                log(f'  Valid depth levels after filtering: {valid_dep}/{n_dep}')
 
-    u_tidal = vel_E - u_sub
-    v_tidal = vel_N - v_sub
+            u_tidal = vel_E - u_sub
+            v_tidal = vel_N - v_sub
 
-    # Save NetCDF — same layout as input: (depth, profile_index)
-    time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
-    ds_out = xr.Dataset({
-        'velocity_E_subtidal': (['depth', 'profile_index'], u_sub),
-        'velocity_N_subtidal': (['depth', 'profile_index'], v_sub),
-        'velocity_E_tidal':    (['depth', 'profile_index'], u_tidal),
-        'velocity_N_tidal':    (['depth', 'profile_index'], v_tidal),
-    }, coords={'time': (['profile_index'], time_clean), 'depth': depth})
-    ds_out.attrs['filter_cutoff_hours'] = CUTOFF_HOURS
-    ds_out.attrs['filter_order']        = 4
-    out_nc = _rf(run_dir, 'currents_subtidal.nc')
-    ds_out.to_netcdf(out_nc)
-    log(f'Saved: {out_nc}')
+            # Save NetCDF — same layout as input: (depth, profile_index)
+            time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
+            ds_out = xr.Dataset({
+                'velocity_E_subtidal': (['depth', 'profile_index'], u_sub),
+                'velocity_N_subtidal': (['depth', 'profile_index'], v_sub),
+                'velocity_E_tidal':    (['depth', 'profile_index'], u_tidal),
+                'velocity_N_tidal':    (['depth', 'profile_index'], v_tidal),
+            }, coords={'time': (['profile_index'], time_clean), 'depth': depth})
+            ds_out.attrs['filter_cutoff_hours'] = CUTOFF_HOURS
+            ds_out.attrs['filter_order']        = 4
+            out_nc = _rf(run_dir, 'currents_subtidal.nc')
+            ds_out.to_netcdf(out_nc)
+            log(f'Saved: {out_nc}')
 
-    # Plot: sub-tidal sections + tidal residual speed
-    # pcolormesh(x=time, y=depth, C) expects C.shape=(n_dep, n_prof) — matches array layout
-    fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True, sharey=True)
-    for ax, data, label in zip(
-        axes[:2],
-        [u_sub, v_sub],
-        ['Sub-tidal E velocity (m/s)', 'Sub-tidal N velocity (m/s)'],
-    ):
-        p = ax.pcolormesh(time_clean, depth, data,
-                          cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
-        plt.colorbar(p, ax=ax, label=label, pad=0.01)
-        ax.set_ylabel('Depth (m)')
+            # Plot: sub-tidal sections + tidal residual speed
+            # pcolormesh(x=time, y=depth, C) expects C.shape=(n_dep, n_prof) — matches array layout
+            fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True, sharey=True)
+            for ax, data, label in zip(
+                axes[:2],
+                [u_sub, v_sub],
+                ['Sub-tidal E velocity (m/s)', 'Sub-tidal N velocity (m/s)'],
+            ):
+                p = ax.pcolormesh(time_clean, depth, data,
+                                  cmap=cmo_balance, vmin=-0.5, vmax=0.5, shading='auto')
+                plt.colorbar(p, ax=ax, label=label, pad=0.01)
+                ax.set_ylabel('Depth (m)')
 
-    tidal_spd = np.sqrt(u_tidal**2 + v_tidal**2)
-    p = axes[2].pcolormesh(time_clean, depth, tidal_spd,
-                           cmap=cmo_amp, vmin=0, vmax=0.2, shading='auto')
-    plt.colorbar(p, ax=axes[2], label='Tidal signal speed (m/s)', pad=0.01)
-    axes[2].set_ylabel('Depth (m)')
-    axes[2].set_xlabel('Date')
-    # Depth orientation — surface at 0, max from data
-    axes[0].set_ylim(d_max, 0)
-    fig.suptitle(f'Tidal filtering ({CUTOFF_HOURS}-h low-pass Butterworth)', fontsize=13)
-    plt.tight_layout()
-    out_png = _rf(run_dir, 'tidal_filter.png')
-    plt.savefig(out_png, dpi=150)
-    plt.close(fig)
-    log(f'Saved: {out_png}')
-    currents.close()
+            tidal_spd = np.sqrt(u_tidal**2 + v_tidal**2)
+            p = axes[2].pcolormesh(time_clean, depth, tidal_spd,
+                                   cmap=cmo_amp, vmin=0, vmax=0.2, shading='auto')
+            plt.colorbar(p, ax=axes[2], label='Tidal signal speed (m/s)', pad=0.01)
+            axes[2].set_ylabel('Depth (m)')
+            axes[2].set_xlabel('Date')
+            # Depth orientation — surface at 0, max from data
+            axes[0].set_ylim(d_max, 0)
+            fig.suptitle(f'Tidal filtering ({CUTOFF_HOURS}-h low-pass Butterworth)', fontsize=13)
+            plt.tight_layout()
+            out_png = _rf(run_dir, 'tidal_filter.png')
+            plt.savefig(out_png, dpi=150)
+            plt.close(fig)
+            log(f'Saved: {out_png}')
 
 
 def _adcp_diagnostics(base_dir, run_dir, opts, log):
@@ -5471,235 +5479,235 @@ def _adcp_diagnostics(base_dir, run_dir, opts, log):
         cmo_amp = 'hot_r'
 
     log('Loading bias-corrected currents...')
-    currents   = xr.open_dataset(bias_path)
-    vel_E      = currents['velocity_E_DAC_reference_sb_corrected'].values
-    vel_N      = currents['velocity_N_DAC_reference_sb_corrected'].values
-    depth      = currents.depth.values
-    time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
+    with _nc_lock:
+        with xr.open_dataset(bias_path) as currents:
+            vel_E      = currents['velocity_E_DAC_reference_sb_corrected'].values
+            vel_N      = currents['velocity_N_DAC_reference_sb_corrected'].values
+            depth      = currents.depth.values
+            time_clean = pd.Series(currents.time.values).interpolate(method='linear').values
 
-    # Depth axis limits — surface anchored at 0, max from data
-    d_max = float(np.nanmax(depth))
+            # Depth axis limits — surface anchored at 0, max from data
+            d_max = float(np.nanmax(depth))
 
-    # Layout: (depth=axis0, profile_index=axis1) — same as currents_bias_corrected.nc
-    n_dep  = vel_E.shape[0]
-    n_prof = vel_E.shape[1]
-    log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
+            # Layout: (depth=axis0, profile_index=axis1) — same as currents_bias_corrected.nc
+            n_dep  = vel_E.shape[0]
+            n_prof = vel_E.shape[1]
+            log(f'  Shape: {n_dep} depth levels × {n_prof} profiles')
 
-    # depth axis weights for integration (axis 0)
-    dz = np.abs(np.gradient(depth))   # shape (n_dep,)
+            # depth axis weights for integration (axis 0)
+            dz = np.abs(np.gradient(depth))   # shape (n_dep,)
 
-    # ── EKE ──────────────────────────────────────────────────────────────────────
-    log('Computing EKE...')
-    try:
-        # Time-mean current at each depth (mean over profile axis=1)
-        u_bar   = np.nanmean(vel_E, axis=1, keepdims=True)   # (n_dep, 1)
-        v_bar   = np.nanmean(vel_N, axis=1, keepdims=True)
-        EKE     = 0.5 * ((vel_E - u_bar)**2 + (vel_N - v_bar)**2)  # (n_dep, n_prof)
-        # Depth-integrate: sum over axis 0, weighted by dz
-        eke_int = np.nansum(EKE * dz[:, np.newaxis], axis=0)  # (n_prof,)
+            # ── EKE ──────────────────────────────────────────────────────────────────────
+            log('Computing EKE...')
+            try:
+                # Time-mean current at each depth (mean over profile axis=1)
+                u_bar   = np.nanmean(vel_E, axis=1, keepdims=True)   # (n_dep, 1)
+                v_bar   = np.nanmean(vel_N, axis=1, keepdims=True)
+                EKE     = 0.5 * ((vel_E - u_bar)**2 + (vel_N - v_bar)**2)  # (n_dep, n_prof)
+                # Depth-integrate: sum over axis 0, weighted by dz
+                eke_int = np.nansum(EKE * dz[:, np.newaxis], axis=0)  # (n_prof,)
 
-        fig, axes = plt.subplots(2, 1, figsize=(16, 8),
-                                 gridspec_kw={'height_ratios': [3, 1]})
-        # pcolormesh(x=time, y=depth, C) — C layout is (n_dep, n_prof) ✓
-        p = axes[0].pcolormesh(time_clean, depth, EKE,
-                               cmap=cmo_amp, vmin=0, vmax=0.05, shading='auto')
-        plt.colorbar(p, ax=axes[0], label='EKE (m²/s²)', pad=0.01)
-        axes[0].set_ylabel('Depth (m)')
-        axes[0].set_ylim(d_max, 0)
-        axes[0].set_title('Eddy Kinetic Energy')
-        axes[1].fill_between(time_clean, eke_int, color='firebrick', alpha=0.7)
-        axes[1].set_ylabel('Depth-int. EKE (m³/s²)')
-        axes[1].set_xlabel('Date')
-        plt.tight_layout()
-        p_eke = _rf(run_dir, 'eke.png')
-        plt.savefig(p_eke, dpi=150)
-        plt.close(fig)
-        log(f'Saved: {p_eke}')
-    except Exception as exc:
-        log(f'EKE skipped ({exc})')
+                fig, axes = plt.subplots(2, 1, figsize=(16, 8),
+                                         gridspec_kw={'height_ratios': [3, 1]})
+                # pcolormesh(x=time, y=depth, C) — C layout is (n_dep, n_prof) ✓
+                p = axes[0].pcolormesh(time_clean, depth, EKE,
+                                       cmap=cmo_amp, vmin=0, vmax=0.05, shading='auto')
+                plt.colorbar(p, ax=axes[0], label='EKE (m²/s²)', pad=0.01)
+                axes[0].set_ylabel('Depth (m)')
+                axes[0].set_ylim(d_max, 0)
+                axes[0].set_title('Eddy Kinetic Energy')
+                axes[1].fill_between(time_clean, eke_int, color='firebrick', alpha=0.7)
+                axes[1].set_ylabel('Depth-int. EKE (m³/s²)')
+                axes[1].set_xlabel('Date')
+                plt.tight_layout()
+                p_eke = _rf(run_dir, 'eke.png')
+                plt.savefig(p_eke, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_eke}')
+            except Exception as exc:
+                log(f'EKE skipped ({exc})')
 
-    # ── Transport ─────────────────────────────────────────────────────────────────
-    log('Computing depth-integrated transport...')
-    try:
-        # Integrate over depth axis (axis 0), weighted by dz
-        T_E   = np.nansum(vel_E * dz[:, np.newaxis], axis=0)  # (n_prof,)
-        T_N   = np.nansum(vel_N * dz[:, np.newaxis], axis=0)
-        T_mag = np.sqrt(T_E**2 + T_N**2)
+            # ── Transport ─────────────────────────────────────────────────────────────────
+            log('Computing depth-integrated transport...')
+            try:
+                # Integrate over depth axis (axis 0), weighted by dz
+                T_E   = np.nansum(vel_E * dz[:, np.newaxis], axis=0)  # (n_prof,)
+                T_N   = np.nansum(vel_N * dz[:, np.newaxis], axis=0)
+                T_mag = np.sqrt(T_E**2 + T_N**2)
 
-        fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
-        axes[0].plot(time_clean, T_E, '-o', ms=2, lw=1.2,
-                     color='steelblue', label='E component')
-        axes[0].plot(time_clean, T_N, '-o', ms=2, lw=1.2,
-                     color='firebrick', label='N component')
-        axes[0].axhline(0, color='k', lw=0.5, ls='--')
-        axes[0].set_ylabel('Transport (m²/s)')
-        axes[0].legend(fontsize=9)
-        axes[0].set_title('Depth-integrated transport')
-        axes[1].fill_between(time_clean, T_mag, color='darkorchid', alpha=0.7)
-        axes[1].set_ylabel('Transport magnitude (m²/s)')
-        axes[1].set_xlabel('Date')
-        plt.tight_layout()
-        p_tr = _rf(run_dir, 'transport.png')
-        plt.savefig(p_tr, dpi=150)
-        plt.close(fig)
-        log(f'Saved: {p_tr}')
-    except Exception as exc:
-        log(f'Transport skipped ({exc})')
+                fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+                axes[0].plot(time_clean, T_E, '-o', ms=2, lw=1.2,
+                             color='steelblue', label='E component')
+                axes[0].plot(time_clean, T_N, '-o', ms=2, lw=1.2,
+                             color='firebrick', label='N component')
+                axes[0].axhline(0, color='k', lw=0.5, ls='--')
+                axes[0].set_ylabel('Transport (m²/s)')
+                axes[0].legend(fontsize=9)
+                axes[0].set_title('Depth-integrated transport')
+                axes[1].fill_between(time_clean, T_mag, color='darkorchid', alpha=0.7)
+                axes[1].set_ylabel('Transport magnitude (m²/s)')
+                axes[1].set_xlabel('Date')
+                plt.tight_layout()
+                p_tr = _rf(run_dir, 'transport.png')
+                plt.savefig(p_tr, dpi=150)
+                plt.close(fig)
+                log(f'Saved: {p_tr}')
+            except Exception as exc:
+                log(f'Transport skipped ({exc})')
 
-    currents.close()
 
     # ── Richardson number ─────────────────────────────────────────────────────────
     log('Computing Richardson number (Ri = N² / shear²)...')
     try:
         import gsw
-        ds_sh = xr.open_dataset(shear_path)
+        with _nc_lock:
+            with xr.open_dataset(shear_path) as ds_sh:
 
-        need = ['glider_temperature', 'glider_salinity', 'Pressure',
-                'Depth', 'Latitude', 'Sh_E', 'Sh_N', 'bin_depth']
-        missing = [v for v in need if v not in ds_sh and v not in ds_sh.coords]
-        if missing:
-            log(f'  Missing variables {missing} in shear_processed.nc — skipping Ri')
-        else:
-            T_raw    = ds_sh['glider_temperature'].values
-            S_raw    = ds_sh['glider_salinity'].values
-            p_raw    = ds_sh['Pressure'].values
-            lat_raw  = ds_sh['Latitude'].values
-            lon_raw  = ds_sh['Longitude'].values
-            prof_raw = np.round(ds_sh['profile_number'].values).astype(float)
-            Sh_E     = ds_sh['Sh_E'].values        # (time, gridded_bin)
-            Sh_N     = ds_sh['Sh_N'].values
-            bin_d    = ds_sh['bin_depth'].values   # (time, gridded_bin) — actual depths
+                need = ['glider_temperature', 'glider_salinity', 'Pressure',
+                        'Depth', 'Latitude', 'Sh_E', 'Sh_N', 'bin_depth']
+                missing = [v for v in need if v not in ds_sh and v not in ds_sh.coords]
+                if missing:
+                    log(f'  Missing variables {missing} in shear_processed.nc — skipping Ri')
+                else:
+                    T_raw    = ds_sh['glider_temperature'].values
+                    S_raw    = ds_sh['glider_salinity'].values
+                    p_raw    = ds_sh['Pressure'].values
+                    lat_raw  = ds_sh['Latitude'].values
+                    lon_raw  = ds_sh['Longitude'].values
+                    prof_raw = np.round(ds_sh['profile_number'].values).astype(float)
+                    Sh_E     = ds_sh['Sh_E'].values        # (time, gridded_bin)
+                    Sh_N     = ds_sh['Sh_N'].values
+                    bin_d    = ds_sh['bin_depth'].values   # (time, gridded_bin) — actual depths
 
-            dmin = 0.0
-            dmax = d_max  # from np.nanmax(depth) — surface anchored, full data range
-            dg   = np.arange(dmin, dmax + 1.0, 5.0)  # 5 m depth grid
+                    dmin = 0.0
+                    dmax = d_max  # from np.nanmax(depth) — surface anchored, full data range
+                    dg   = np.arange(dmin, dmax + 1.0, 5.0)  # 5 m depth grid
 
-            unique_profs = np.unique(prof_raw[np.isfinite(prof_raw)])
-            log(f'  {len(unique_profs)} profiles, depth grid {dmin}–{dmax} m (5 m bins)')
+                    unique_profs = np.unique(prof_raw[np.isfinite(prof_raw)])
+                    log(f'  {len(unique_profs)} profiles, depth grid {dmin}–{dmax} m (5 m bins)')
 
-            ri_arr   = np.full((len(unique_profs), len(dg)), np.nan)
-            time_arr = np.empty(len(unique_profs), dtype='datetime64[ns]')
-            time_arr[:] = np.datetime64('NaT')
+                    ri_arr   = np.full((len(unique_profs), len(dg)), np.nan)
+                    time_arr = np.empty(len(unique_profs), dtype='datetime64[ns]')
+                    time_arr[:] = np.datetime64('NaT')
 
-            for pi, prof in enumerate(unique_profs):
-                t_mask = prof_raw == prof
-                if t_mask.sum() < 5:
-                    continue
+                    for pi, prof in enumerate(unique_profs):
+                        t_mask = prof_raw == prof
+                        if t_mask.sum() < 5:
+                            continue
 
-                # Representative time for this profile
-                try:
-                    time_arr[pi] = np.datetime64(
-                        int(np.nanmean(ds_sh.time.values[t_mask].astype('int64'))), 'ns')
-                except Exception:
-                    pass
+                        # Representative time for this profile
+                        try:
+                            time_arr[pi] = np.datetime64(
+                                int(np.nanmean(ds_sh.time.values[t_mask].astype('int64'))), 'ns')
+                        except Exception:
+                            pass
 
-                # CTD profile: one (T, S, p) point per ADCP ping during this profile
-                ok_ctd = t_mask & np.isfinite(T_raw) & np.isfinite(S_raw) & np.isfinite(p_raw)
-                if ok_ctd.sum() < 10:
-                    continue
+                        # CTD profile: one (T, S, p) point per ADCP ping during this profile
+                        ok_ctd = t_mask & np.isfinite(T_raw) & np.isfinite(S_raw) & np.isfinite(p_raw)
+                        if ok_ctd.sum() < 10:
+                            continue
 
-                T_p   = T_raw[ok_ctd]
-                S_p   = S_raw[ok_ctd]
-                p_p   = p_raw[ok_ctd]
-                lat_m = float(np.nanmean(lat_raw[ok_ctd]))
-                lon_m = float(np.nanmean(lon_raw[ok_ctd]))
+                        T_p   = T_raw[ok_ctd]
+                        S_p   = S_raw[ok_ctd]
+                        p_p   = p_raw[ok_ctd]
+                        lat_m = float(np.nanmean(lat_raw[ok_ctd]))
+                        lon_m = float(np.nanmean(lon_raw[ok_ctd]))
 
-                # Sort strictly by pressure and remove duplicates
-                sidx  = np.argsort(p_p)
-                T_p, S_p, p_p = T_p[sidx], S_p[sidx], p_p[sidx]
-                _, uniq = np.unique(p_p, return_index=True)
-                T_p, S_p, p_p = T_p[uniq], S_p[uniq], p_p[uniq]
-                if len(p_p) < 4:
-                    continue
+                        # Sort strictly by pressure and remove duplicates
+                        sidx  = np.argsort(p_p)
+                        T_p, S_p, p_p = T_p[sidx], S_p[sidx], p_p[sidx]
+                        _, uniq = np.unique(p_p, return_index=True)
+                        T_p, S_p, p_p = T_p[uniq], S_p[uniq], p_p[uniq]
+                        if len(p_p) < 4:
+                            continue
 
-                # N² from gsw
-                try:
-                    SA        = gsw.SA_from_SP(S_p, p_p, lon_m, lat_m)
-                    CT        = gsw.CT_from_t(SA, T_p, p_p)
-                    N2, p_mid = gsw.Nsquared(SA, CT, p_p, lat_m)
-                    d_mid     = -gsw.z_from_p(p_mid, lat_m)   # positive-down
-                    ok_n2     = np.isfinite(N2) & np.isfinite(d_mid) & (d_mid > 0)
-                    if ok_n2.sum() < 3:
-                        continue
-                    N2_grid = np.interp(dg, d_mid[ok_n2], N2[ok_n2],
-                                        left=np.nan, right=np.nan)
-                except Exception:
-                    continue
+                        # N² from gsw
+                        try:
+                            SA        = gsw.SA_from_SP(S_p, p_p, lon_m, lat_m)
+                            CT        = gsw.CT_from_t(SA, T_p, p_p)
+                            N2, p_mid = gsw.Nsquared(SA, CT, p_p, lat_m)
+                            d_mid     = -gsw.z_from_p(p_mid, lat_m)   # positive-down
+                            ok_n2     = np.isfinite(N2) & np.isfinite(d_mid) & (d_mid > 0)
+                            if ok_n2.sum() < 3:
+                                continue
+                            N2_grid = np.interp(dg, d_mid[ok_n2], N2[ok_n2],
+                                                left=np.nan, right=np.nan)
+                        except Exception:
+                            continue
 
-                # Shear² binned to depth grid (bin_depth gives true depths)
-                sh2  = (Sh_E[t_mask].ravel()**2 + Sh_N[t_mask].ravel()**2)
-                bd   = bin_d[t_mask].ravel()
-                ok_s = np.isfinite(sh2) & np.isfinite(bd) & (bd > 0)
-                if ok_s.sum() < 5:
-                    continue
-                sh2_grid = np.array([
-                    np.nanmean(sh2[ok_s & (bd >= d - 2.5) & (bd < d + 2.5)])
-                    for d in dg
-                ])
-
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    ri = np.where(sh2_grid > 0, N2_grid / sh2_grid, np.nan)
-                ri[ri < 0]  = np.nan   # convective instability
-                ri[ri > 50] = 50.0     # cap display range
-                ri_arr[pi]  = ri
-
-            ok_p = np.any(np.isfinite(ri_arr), axis=1)
-            log(f'  Profiles with valid Ri: {ok_p.sum()}/{len(unique_profs)}')
-
-            if ok_p.sum() >= 2:
-                t_plot  = pd.Series(pd.to_datetime(time_arr[ok_p])).interpolate(method='linear').values
-                ri_plot = ri_arr[ok_p]
-
-                # Smooth Ri for display — raw per-profile values are too noisy to interpret
-                try:
-                    from scipy.ndimage import uniform_filter, median_filter
-                    ri_T = ri_plot.T   # (depth, time)
-                    # Replace NaN with neutral stable value before filtering
-                    ri_fill = np.where(np.isfinite(ri_T), ri_T, 1.0)
-                    # Median filter to kill outlier spikes, then uniform for spatial coherence
-                    # size=[depth_bins, time_bins]: 4 bins = 20 m, 15 profiles ≈ 2.5 h
-                    ri_med    = median_filter(ri_fill, size=[4, 15])
-                    ri_smooth = uniform_filter(ri_med,  size=[4, 15])
-                    # Restore NaN mask where original had all-NaN
-                    nan_mask  = ~np.isfinite(ri_T)
-                    ri_disp   = np.where(nan_mask, np.nan, ri_smooth)
-                except Exception:
-                    ri_disp = ri_plot.T
-
-                fig, ax = plt.subplots(figsize=(16, 6))
-                pcm = ax.pcolormesh(t_plot, dg, ri_disp,
-                                    cmap='RdYlBu_r', vmin=0, vmax=1, shading='auto')
-                cb = plt.colorbar(pcm, ax=ax, label='Ri', pad=0.01)
-                cb.ax.axhline(0.25, color='white', linewidth=2, linestyle='--')
-
-                # Ri = 0.25 contour on smoothed data
-                try:
-                    import matplotlib.patheffects as pe
-                    cs = ax.contour(t_plot, dg, ri_smooth, levels=[0.25],
-                                    colors='white', linewidths=2.5, linestyles='--')
-                    for coll in cs.collections:
-                        coll.set_path_effects([
-                            pe.Stroke(linewidth=5, foreground='black', alpha=0.7),
-                            pe.Normal(),
+                        # Shear² binned to depth grid (bin_depth gives true depths)
+                        sh2  = (Sh_E[t_mask].ravel()**2 + Sh_N[t_mask].ravel()**2)
+                        bd   = bin_d[t_mask].ravel()
+                        ok_s = np.isfinite(sh2) & np.isfinite(bd) & (bd > 0)
+                        if ok_s.sum() < 5:
+                            continue
+                        sh2_grid = np.array([
+                            np.nanmean(sh2[ok_s & (bd >= d - 2.5) & (bd < d + 2.5)])
+                            for d in dg
                         ])
-                    ax.clabel(cs, fmt={0.25: 'Ri=0.25'}, fontsize=9,
-                              colors='white', inline=True)
-                except Exception:
-                    pass
-                ax.set_ylabel('Depth (m)')
-                ax.set_xlabel('Date')
-                ax.invert_yaxis()
-                ax.set_ylim([dg.max(), dg.min()])
-                ax.set_title('Richardson number  —  white dashed: Ri = 0.25 shear instability threshold')
-                plt.tight_layout()
-                p_ri = _rf(run_dir, 'richardson_number.png')
-                plt.savefig(p_ri, dpi=150)
-                plt.close(fig)
-                log(f'Saved: {p_ri}')
-            else:
-                log('  Not enough valid profiles for Ri plot')
 
-        ds_sh.close()
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            ri = np.where(sh2_grid > 0, N2_grid / sh2_grid, np.nan)
+                        ri[ri < 0]  = np.nan   # convective instability
+                        ri[ri > 50] = 50.0     # cap display range
+                        ri_arr[pi]  = ri
+
+                    ok_p = np.any(np.isfinite(ri_arr), axis=1)
+                    log(f'  Profiles with valid Ri: {ok_p.sum()}/{len(unique_profs)}')
+
+                    if ok_p.sum() >= 2:
+                        t_plot  = pd.Series(pd.to_datetime(time_arr[ok_p])).interpolate(method='linear').values
+                        ri_plot = ri_arr[ok_p]
+
+                        # Smooth Ri for display — raw per-profile values are too noisy to interpret
+                        try:
+                            from scipy.ndimage import uniform_filter, median_filter
+                            ri_T = ri_plot.T   # (depth, time)
+                            # Replace NaN with neutral stable value before filtering
+                            ri_fill = np.where(np.isfinite(ri_T), ri_T, 1.0)
+                            # Median filter to kill outlier spikes, then uniform for spatial coherence
+                            # size=[depth_bins, time_bins]: 4 bins = 20 m, 15 profiles ≈ 2.5 h
+                            ri_med    = median_filter(ri_fill, size=[4, 15])
+                            ri_smooth = uniform_filter(ri_med,  size=[4, 15])
+                            # Restore NaN mask where original had all-NaN
+                            nan_mask  = ~np.isfinite(ri_T)
+                            ri_disp   = np.where(nan_mask, np.nan, ri_smooth)
+                        except Exception:
+                            ri_disp = ri_plot.T
+
+                        fig, ax = plt.subplots(figsize=(16, 6))
+                        pcm = ax.pcolormesh(t_plot, dg, ri_disp,
+                                            cmap='RdYlBu_r', vmin=0, vmax=1, shading='auto')
+                        cb = plt.colorbar(pcm, ax=ax, label='Ri', pad=0.01)
+                        cb.ax.axhline(0.25, color='white', linewidth=2, linestyle='--')
+
+                        # Ri = 0.25 contour on smoothed data
+                        try:
+                            import matplotlib.patheffects as pe
+                            cs = ax.contour(t_plot, dg, ri_smooth, levels=[0.25],
+                                            colors='white', linewidths=2.5, linestyles='--')
+                            for coll in cs.collections:
+                                coll.set_path_effects([
+                                    pe.Stroke(linewidth=5, foreground='black', alpha=0.7),
+                                    pe.Normal(),
+                                ])
+                            ax.clabel(cs, fmt={0.25: 'Ri=0.25'}, fontsize=9,
+                                      colors='white', inline=True)
+                        except Exception:
+                            pass
+                        ax.set_ylabel('Depth (m)')
+                        ax.set_xlabel('Date')
+                        ax.invert_yaxis()
+                        ax.set_ylim([dg.max(), dg.min()])
+                        ax.set_title('Richardson number  —  white dashed: Ri = 0.25 shear instability threshold')
+                        plt.tight_layout()
+                        p_ri = _rf(run_dir, 'richardson_number.png')
+                        plt.savefig(p_ri, dpi=150)
+                        plt.close(fig)
+                        log(f'Saved: {p_ri}')
+                    else:
+                        log('  Not enough valid profiles for Ri plot')
+
     except Exception as exc:
         log(f'Richardson number skipped ({exc})')
 
@@ -5888,75 +5896,75 @@ def adcp_shear_stats():
 
     try:
         import xarray as xr
-        ds = xr.open_dataset(path)
-        stats = {}
-        for v in ['Sh_E', 'Sh_N']:
-            if v in ds:
-                valid = int(ds[v].notnull().sum())
-                total = int(ds[v].size)
-                stats[v] = {'valid': valid, 'total': total,
-                             'pct': round(100 * valid / total, 1) if total else 0.0}
-        ds.close()
+        with _nc_lock:
+            with xr.open_dataset(path) as ds:
+                stats = {}
+                for v in ['Sh_E', 'Sh_N']:
+                    if v in ds:
+                        valid = int(ds[v].notnull().sum())
+                        total = int(ds[v].size)
+                        stats[v] = {'valid': valid, 'total': total,
+                                     'pct': round(100 * valid / total, 1) if total else 0.0}
 
-        if not stats:
-            return jsonify({'error': 'no shear variables found'}), 422
+                if not stats:
+                    return jsonify({'error': 'no shear variables found'}), 422
 
-        # Number of half-profiles (dive legs) in the shear dataset
-        n_legs = int(ds.sizes.get('time', ds.sizes.get('profile', 0)))
+                # Number of half-profiles (dive legs) in the shear dataset
+                n_legs = int(ds.sizes.get('time', ds.sizes.get('profile', 0)))
 
-        avg_pct = sum(s['pct'] for s in stats.values()) / len(stats)
+                avg_pct = sum(s['pct'] for s in stats.values()) / len(stats)
 
-        cols1 = n_legs
-        cols2 = n_legs // 2
-        cols3 = n_legs // 3
+                cols1 = n_legs
+                cols2 = n_legs // 2
+                cols3 = n_legs // 3
 
-        action = (f'To apply: select "3 — Distance" from the X-axis dropdown in Options above, '
-                  f'then re-run Process Shear. The shared stages (Load NC, GPS Pairing, Write Glider NC) '
-                  f'do not need to re-run — only Process Shear, Compute Currents, and Bias Correction.')
+                action = (f'To apply: select "3 — Distance" from the X-axis dropdown in Options above, '
+                          f'then re-run Process Shear. The shared stages (Load NC, GPS Pairing, Write Glider NC) '
+                          f'do not need to re-run — only Process Shear, Compute Currents, and Bias Correction.')
 
-        if avg_pct < 15:
-            rec_xaxis  = 3
-            rec_reason = (
-                f'Only {avg_pct:.1f}% of acoustic pings produced valid shear — typical of oligotrophic water '
-                f'with few biological scatterers. At this ping rate, individual dive legs carry sparse data '
-                f'and many depth bins within a single leg will be empty or noisy. '
-                f'Setting xaxis=3 groups 3 consecutive half-profiles into each output column '
-                f'({n_legs} dive legs → ~{cols3} output columns), pooling roughly 3× as many pings per depth bin. '
-                f'This dramatically improves depth coverage and reduces velocity noise, at the cost of coarser '
-                f'temporal and spatial resolution — each output column represents approximately 3 dive legs '
-                f'worth of glider track. Even at very low ping rates, xaxis=3 typically achieves >99% depth '
-                f'coverage from the surface to 500 m by aggregating enough valid returns across the averaged legs.'
-            )
-            rec_action = action.replace('"3 — Distance"', '"3 — Distance (every 3 legs, smoother)"')
-        elif avg_pct < 35:
-            rec_xaxis  = 2
-            rec_reason = (
-                f'Valid ping rate of {avg_pct:.1f}% is moderate. Individual dive legs have enough data to be '
-                f'useful, but pairing each downcast with its following upcast (xaxis=2) reduces noise by '
-                f'averaging two legs together while preserving most of the temporal structure '
-                f'({n_legs} dive legs → ~{cols2} output columns). A complete dive pair covers both a descent '
-                f'and ascent, so the averaged shear profile samples the water column twice, helping to cancel '
-                f'out transient glider-induced errors. If temporal resolution is a priority, xaxis=1 is also '
-                f'viable ({cols1} output columns) but expect noisier profiles, particularly in the deepest bins '
-                f'where acoustic returns are weakest.'
-            )
-            rec_action = action.replace('"3 — Distance"', '"2 — Profile"')
-        else:
-            rec_xaxis  = 1
-            rec_reason = (
-                f'Valid ping rate of {avg_pct:.1f}% is high — each individual dive leg produces well-populated '
-                f'shear profiles across most of the depth range. xaxis=1 keeps every half-profile as its own '
-                f'output column ({cols1} total), giving maximum temporal and spatial resolution. With this ping '
-                f'rate, per-leg profiles will be reliable and consistent. You may still see slightly noisier '
-                f'results in the deepest bins due to acoustic attenuation with range, but this is unlikely to '
-                f'require additional averaging. xaxis=2 or 3 remain valid choices if you prefer smoother output '
-                f'or are averaging over a larger spatial footprint for scientific reasons.'
-            )
-            rec_action = action.replace('"3 — Distance"', '"1 — Time"')
+                if avg_pct < 15:
+                    rec_xaxis  = 3
+                    rec_reason = (
+                        f'Only {avg_pct:.1f}% of acoustic pings produced valid shear — typical of oligotrophic water '
+                        f'with few biological scatterers. At this ping rate, individual dive legs carry sparse data '
+                        f'and many depth bins within a single leg will be empty or noisy. '
+                        f'Setting xaxis=3 groups 3 consecutive half-profiles into each output column '
+                        f'({n_legs} dive legs → ~{cols3} output columns), pooling roughly 3× as many pings per depth bin. '
+                        f'This dramatically improves depth coverage and reduces velocity noise, at the cost of coarser '
+                        f'temporal and spatial resolution — each output column represents approximately 3 dive legs '
+                        f'worth of glider track. Even at very low ping rates, xaxis=3 typically achieves >99% depth '
+                        f'coverage from the surface to 500 m by aggregating enough valid returns across the averaged legs.'
+                    )
+                    rec_action = action.replace('"3 — Distance"', '"3 — Distance (every 3 legs, smoother)"')
+                elif avg_pct < 35:
+                    rec_xaxis  = 2
+                    rec_reason = (
+                        f'Valid ping rate of {avg_pct:.1f}% is moderate. Individual dive legs have enough data to be '
+                        f'useful, but pairing each downcast with its following upcast (xaxis=2) reduces noise by '
+                        f'averaging two legs together while preserving most of the temporal structure '
+                        f'({n_legs} dive legs → ~{cols2} output columns). A complete dive pair covers both a descent '
+                        f'and ascent, so the averaged shear profile samples the water column twice, helping to cancel '
+                        f'out transient glider-induced errors. If temporal resolution is a priority, xaxis=1 is also '
+                        f'viable ({cols1} output columns) but expect noisier profiles, particularly in the deepest bins '
+                        f'where acoustic returns are weakest.'
+                    )
+                    rec_action = action.replace('"3 — Distance"', '"2 — Profile"')
+                else:
+                    rec_xaxis  = 1
+                    rec_reason = (
+                        f'Valid ping rate of {avg_pct:.1f}% is high — each individual dive leg produces well-populated '
+                        f'shear profiles across most of the depth range. xaxis=1 keeps every half-profile as its own '
+                        f'output column ({cols1} total), giving maximum temporal and spatial resolution. With this ping '
+                        f'rate, per-leg profiles will be reliable and consistent. You may still see slightly noisier '
+                        f'results in the deepest bins due to acoustic attenuation with range, but this is unlikely to '
+                        f'require additional averaging. xaxis=2 or 3 remain valid choices if you prefer smoother output '
+                        f'or are averaging over a larger spatial footprint for scientific reasons.'
+                    )
+                    rec_action = action.replace('"3 — Distance"', '"1 — Time"')
 
-        return jsonify({'stats': stats, 'avg_pct': round(avg_pct, 1), 'n_legs': n_legs,
-                        'rec_xaxis': rec_xaxis, 'rec_reason': rec_reason,
-                        'rec_action': rec_action, 'source_run': source_run})
+                return jsonify({'stats': stats, 'avg_pct': round(avg_pct, 1), 'n_legs': n_legs,
+                                'rec_xaxis': rec_xaxis, 'rec_reason': rec_reason,
+                                'rec_action': rec_action, 'source_run': source_run})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
