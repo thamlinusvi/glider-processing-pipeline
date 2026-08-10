@@ -59,17 +59,7 @@ input at the start of every Stage 8 run — but it's a live landmine for the scr
 standalone/manual-CLI usage, and for any future refactor of that wipe step.
 **Fix:** exclude `_qartod_summary_flag`-suffixed variables from the aggregation input filter.
 
-⚠️ **2. `move_nc_files.py` discards its final-move subprocess's exit code, so a partial/failed
-move looks like success.** `rugliderqc/scripts/move_nc_files.py:72`:
-`subprocess.call("mv " + ... + "*.nc" + " " + data_path, shell=True)` — return value unused.
-`status` stays `0` regardless of a permission error, full disk, or locked file, and the log
-message ("Moved {N} netcdf files") uses the pre-move Python `glob()` count, not what actually
-moved. Any file left stranded in `qc_queue` after a partial failure gets silently deleted by
-the *next* Stage 8 run's queue-wipe (`stages.py:250`), forcing an invisible full reprocess with
-no error anywhere in the chain. **Fix:** check the subprocess return code (or better, use
-`shutil.move` per file and catch exceptions individually) and set `status=1` on any failure.
-
-⚠️ **3. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
+⚠️ **2. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
 for USVI, silently.** Two independent gaps compound: (a) `usvi_configs.yml`'s tightened
 regional `pH` gross-range bounds (`qc/config/global_regional/usvi_configs.yml:94-101`) never
 fire, because `glider_qartod_qc` runs *before* `add_derived_variables` creates the `pH`
@@ -81,13 +71,21 @@ defines exactly one region, `nyb` (lon `[-75,-71]`, lat `[37.5,41.5]` — Mid-At
 nowhere near USVI (lon ≈ -65, lat ≈ 18). `calculate_ta()` (`add_derived_variables.py:176-219`)
 falls through with empty results on no region match, with **no log line explaining why** — so
 `total_alkalinity` never gets added, and `calculate_omega` (which needs it) can never run
-either. This sits directly downstream of the already-fixed-pending pH-crash bug below: once
-that's fixed and a USVI pH sensor deployment enables `add_derived_variables`, TA and Aragonite
-Saturation State will just silently never appear in the output, no error anywhere.
-**Fix:** add a USVI region block to `TA-salinity-regressions.yml`, and add explicit logging to
-`calculate_ta()`'s no-region-matched fallthrough.
+either. **Fix:** add a USVI region block to `TA-salinity-regressions.yml`, and add explicit
+logging to `calculate_ta()`'s no-region-matched fallthrough.
 
-⚠️ **4. `mab_configs.yml` has no `sci_water_pressure` stream at all**
+**Partially fixed (2026-08-10):** `add_derived_variables.py`'s `calculate_ph()`/`calculate_omega()`
+both hardcoded `dataset.pressure`/`apply_qc(dataset, 'pressure')`, unguarded and never patched
+for RBR's `sci_water_pressure` (see "Other rugliderqc QC-script issues" below) — `calculate_ph()`
+would crash Stage 8 outright with an uncaught `AttributeError` on any RBR/UVI pH deployment, and
+`calculate_omega()` would silently always return `[]` for one, via its own `KeyError` catch,
+since it never finds a variable literally named `pressure`. Both now detect
+`('pressure', 'sci_water_pressure')` and convert bar→dbar when needed, verified against real
+calibration-shaped test data (numerically identical output to the dbar case, ~1e-11 max
+difference). This removes one of the chain's contributing causes — (a) and (b) above are still
+open.
+
+⚠️ **3. `mab_configs.yml` has no `sci_water_pressure` stream at all**
 (`qc/config/global_regional/mab_configs.yml`, all 3 priority context blocks) — unlike
 `global_configs.yml` and `usvi_configs.yml`, which both correctly include it, properly
 ÷10-scaled. If an RBR/UVI-CTD glider ever transits into the MAB region (lon `-78..-66`, lat
@@ -133,16 +131,6 @@ way the items above were checked.
   path** — only the error branches (`OSError`/`IndexError`) call `.close()`. Given the
   documented HDF5-segfault-risk-with->1-reader concern elsewhere in this repo, accumulating
   unclosed handles across a long QC run is a minor pre-existing risk.
-- **`add_derived_variables.py` hardcodes `dataset.pressure` unguarded** (~line 96, comment even
-  says *"the units in the files are incorrect (bar)"*) — this script was **not** included in the
-  `('pressure','sci_water_pressure')` detection patch that `glider_qartod_qc.py`/
-  `ctd_hysteresis_test.py`/`time_shift.py` got. `calculate_ph()` is called unguarded whenever
-  `sbe41n_ph_ref_voltage_shifted` is present (an actively configured calculation,
-  `qc/config/sciencevar_processing.yml:12-13`, not hypothetical) and only catches `TypeError`,
-  not `AttributeError`/`KeyError`. **On any RBR/UVI deployment with a pH sensor, this will crash
-  Stage 8's `add_derived_variables` step with an uncaught `AttributeError`**, breaking the
-  `&&`-chained Docker command. Worth fixing or at least testing before a pH sensor is deployed
-  on a glider that uses this pipeline.
 - **The derived-variable dependency cascade (DO→mg/L, pH voltage→pH, pH→TA, TA→Omega) is
   implicit and unenforced.** `add_derived_variables.py`'s single loop
   (`for variable_name, vardict in proc_vars.items():`, line 329) only works because
@@ -264,16 +252,6 @@ way the items above were checked.
 - **`main.js` spawns Python via a hardcoded `'python'`**, not `python3` or a venv path
   (~line 18); also sets `webSecurity: false` on the BrowserWindow to allow `file://` iframes
   and localhost fetches.
-- **`pipeline_state.json` has no locking anywhere and is written non-atomically.**
-  `app/pipeline/state.py`'s `set_stage_status` does load→mutate→`save_state`, and `save_state`
-  writes with plain `open(path, 'w')` — no lock, no temp-file+rename. `CLAUDE.md` documents
-  stages running "partly in parallel" (e.g. 1a/1b, 2b/2c) under Flask's `threaded=True`, each
-  stage's SSE request its own thread independently calling `set_stage_status`. Two concurrent
-  calls for the same deployment (different stage keys) can both `load_state()` before either
-  `save_state()`, silently clobbering one stage's status update. Separately, `load_state()` does
-  a bare `json.load(f)` with no exception handling — a file left truncated by a crash mid-write
-  (force-close, `docker kill` via abort, power loss) raises an uncaught `JSONDecodeError` on
-  every subsequent read for that deployment, bricking its status view until manually repaired.
 - **No server-side stage-prerequisite gating.** `STAGE_INFO` (`stages.py:338-447`) defines
   `source_fn`/`output_fn` per stage, but nothing consumes them to gate execution — `run_stage()`
   only checks the stage exists, isn't `manual`, and isn't already running. A direct API call (or
@@ -297,13 +275,6 @@ way the items above were checked.
   these error branches repeatedly accumulates open HDF5 handles, compounding the segfault risk
   over time. (By contrast, `_nc_read_surf`/`_nc_read_traj` — the functions that *do* use the
   lock — are comparatively careful about closing before early returns.)
-- **`_procs` dict iterated without holding `_lock`, in `rename_deployment` and
-  `delete_deployment`.** `server.py:1475,1542`: `running = [k for k in _procs if k[0] == dep and
-  _procs[k].poll() is None]` — every other consumer of `_procs` wraps access in `with _lock:`
-  (and `CLAUDE.md` documents `_procs` as `_lock`-protected). Concurrent mutation from a stage
-  starting/finishing in another thread makes this a textbook `RuntimeError: dictionary changed
-  size during iteration` race — would surface as an intermittent 500 on rename/delete if a stage
-  happens to start or finish mid-request.
 - **Docker containers are likely orphaned when the Electron app quits mid-stage.**
   `main.js`'s `window-all-closed` handler calls `pythonProcess.kill()` and nothing else.
   `server.py`'s own `abort_stage` (~524-541) contains a comment that's direct evidence this is a

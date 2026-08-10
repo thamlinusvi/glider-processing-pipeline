@@ -93,7 +93,15 @@ def calculate_ph(dataset, varname, log):
         log.error('Cannot calculate pH without calibration information')
     else:
         cc = literal_eval(cc)
-        pressure = dataset.pressure  # pressure in dbar (the units in the files are incorrect (bar))
+        # support both 'pressure' (standard, dbar) and 'sci_water_pressure' (gncutils/RBR default, bar)
+        pressure_var = next((v for v in ('pressure', 'sci_water_pressure') if v in dataset.data_vars), None)
+        if pressure_var is None:
+            log.error('No pressure variable found in dataset (checked "pressure", "sci_water_pressure"). '
+                      'Cannot calculate pH.')
+            return
+        pressure = dataset[pressure_var]  # dbar
+        if pressure_var == 'sci_water_pressure':
+            pressure = pressure * 10  # sci_water_pressure is in bar; convert to dbar
         temp = apply_qc(dataset, 'temperature')
         sal = apply_qc(dataset, 'salinity')
 
@@ -133,9 +141,19 @@ def calculate_ph(dataset, varname, log):
 
 def calculate_omega(dataset, varname, log):
     try:
+        # support both 'pressure' (standard, dbar) and 'sci_water_pressure' (gncutils/RBR default, bar)
+        pressure_var = next((v for v in ('pressure', 'sci_water_pressure') if v in dataset.data_vars), None)
+        if pressure_var is None:
+            log.error('No pressure variable found in dataset (checked "pressure", "sci_water_pressure"). '
+                      'Cannot calculate omega.')
+            return []
+        pressure_qc = apply_qc(dataset, pressure_var)  # dbar
+        if pressure_var == 'sci_water_pressure':
+            pressure_qc = pressure_qc * 10  # sci_water_pressure is in bar; convert to dbar
+
         data_dict = dict(
             salinity=apply_qc(dataset, 'salinity').values,
-            pressure=apply_qc(dataset, 'pressure').values,
+            pressure=pressure_qc.values,
             temperature=apply_qc(dataset, 'temperature').values,
             ph=apply_qc(dataset, 'pH').values,
             ta=dataset.total_alkalinity.values

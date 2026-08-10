@@ -178,9 +178,45 @@ def identify_nans(dataset, varname, pressure_da=None):
 
 ### 5. `rugliderqc/scripts/add_derived_variables.py`
 
-**Type:** Minor — Python compatibility only
+**Type:** Substantive — RBR CTD support + Python compatibility
 
 `dt.datetime.now(dt.UTC)` → `dt.datetime.now(dt.timezone.utc)`
+
+**What changed (2026-08-10):** unlike `glider_qartod_qc.py`/`ctd_hysteresis_test.py`/
+`time_shift.py`, this script was never included in the `('pressure', 'sci_water_pressure')`
+detection patch. `calculate_ph()` accessed `dataset.pressure` (attribute-style) with no
+exception handling at all — an uncaught `AttributeError` on any RBR/UVI deployment with a pH
+sensor, breaking the `&&`-chained Stage 8 Docker command. `calculate_omega()` called
+`apply_qc(dataset, 'pressure')` (dict-style) inside a `try/except KeyError` — didn't crash, but
+silently always failed for RBR gliders, since a variable literally named `pressure` never
+exists on one.
+
+```python
+# ORIGINAL
+pressure = dataset.pressure  # pressure in dbar (the units in the files are incorrect (bar))
+...
+data_dict = dict(
+    ...
+    pressure=apply_qc(dataset, 'pressure').values,
+    ...
+)
+```
+
+```python
+# PIPELINE
+pressure_var = next((v for v in ('pressure', 'sci_water_pressure') if v in dataset.data_vars), None)
+if pressure_var is None:
+    log.error('No pressure variable found in dataset (checked "pressure", "sci_water_pressure"). '
+              'Cannot calculate pH.')  # / 'Cannot calculate omega.' in calculate_omega()
+    return  # (or `return []` in calculate_omega())
+pressure = dataset[pressure_var]  # dbar
+if pressure_var == 'sci_water_pressure':
+    pressure = pressure * 10  # sci_water_pressure is in bar; convert to dbar
+```
+
+Verified against realistic-calibration synthetic data: `sci_water_pressure` (bar) now produces
+pH/omega output numerically identical (~1e-11 max difference) to the equivalent `pressure`
+(dbar) input, and neither function raises on a dataset with no pressure variable at all.
 
 ---
 
@@ -443,12 +479,58 @@ ds.to_netcdf(f)   # only reached for files that have science variables
 
 ---
 
+### 10. `rugliderqc/scripts/move_nc_files.py`
+
+**Type:** Bug fix — discarded exit code masked partial/failed moves as success
+
+**Root cause:**
+The final move out of `qc_queue` used a shell `mv` via `subprocess.call(...)`, with the return
+value discarded. A permission error, full disk, or locked file left `status` at `0` regardless,
+and the log message reported the pre-move `glob()` count as if all of it had moved, not what
+actually did. Any file stranded in `qc_queue` after a partial failure was silently deleted by
+the *next* Stage 8 run's queue-wipe, forcing an invisible full reprocess with no error anywhere
+in the chain.
+
+```python
+# ORIGINAL
+subprocess.call("mv " + os.path.join(data_path, 'qc_queue', '*.nc') + " " + data_path, shell=True)
+logging.info('Moved {:} netcdf files to: {:s}'.format(len(ncfiles), data_path))
+```
+
+```python
+# PIPELINE
+moved = 0
+failed = []
+for f in ncfiles:
+    try:
+        shutil.move(f, data_path)
+        moved += 1
+    except OSError as e:
+        failed.append(os.path.basename(f))
+        logging.error('Error moving {:s}: {:}'.format(f, e))
+
+logging.info('Moved {:} of {:} netcdf files to: {:s}'.format(moved, len(ncfiles), data_path))
+if failed:
+    logging.error('Failed to move {:} file(s), left in qc_queue: {:}'.format(
+        len(failed), ', '.join(failed)))
+    status = 1
+```
+
+Verified with a real locked-file simulation on both platforms: on Linux (the actual Docker
+production target), a same-filesystem `os.rename()` failure is atomic — confirmed zero
+partial/duplicate files land in the destination on failure. On Windows specifically,
+`shutil.move`'s fallback path (`copy_function` + `os.unlink`, triggered whenever `os.rename`
+raises `OSError` for any reason, not just cross-device moves) can leave a duplicate if the copy
+succeeds but the delete is blocked by a lock — a real `shutil.move` characteristic, but not one
+that applies to this script's actual runtime environment.
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |
 |---|---|
 | `interpolate_depth.py` | Unchanged |
-| `move_nc_files.py` | Unchanged |
 | `manual_qcflag.py` | Unchanged |
 | `data_gap_check.py` | Unchanged |
 | `ioos_qc_mods/qartod.py` | Unchanged (same patch as Rutgers original) |
@@ -644,9 +726,10 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `scripts/ctd_hysteresis_test.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/time_shift.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/summarize_qartod_flags.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
-| `scripts/add_derived_variables.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
+| `scripts/add_derived_variables.py` | RBR support + Py3.9 compat | `pressure` hardcoded (crashed calculate_ph, silently broke calculate_omega for RBR); `dt.UTC` not in Py3.9 |
 | `scripts/check_duplicate_timestamps.py` | Bug fix | Latent crash when renamed `.duplicate` file re-opened as "current" in next iteration; set `status=1` and broke pipeline chain |
 | `scripts/check_science_variables.py` | Bug fix | `ds.to_netcdf(f)` ran unconditionally, recreating the `.nc` file that was just renamed to `.nosci`; all 24 nosci profiles propagated through every downstream script |
+| `scripts/move_nc_files.py` | Bug fix | Shell `mv`'s exit code was discarded; a partial/failed move looked like success and the log count didn't reflect what actually moved |
 | `config/global_regional/global_configs.yml` | RBR support + date range fix | Added `sci_water_pressure`; window ended 2021 |
 | `config/global_regional/usvi_configs.yml` | RBR support + added density QC | Added `sci_water_pressure` and `density` streams |
 | `config/gross_flatline/rbr_legato3_ctd_gross_flatline.yml` | RBR support | Added `sci_water_pressure` flat_line_test |

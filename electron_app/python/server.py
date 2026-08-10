@@ -1518,7 +1518,8 @@ def rename_deployment(dep):
         return jsonify({'error': 'Name contains invalid characters'}), 400
 
     # Block rename while a stage is running for this deployment
-    running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
+    with _lock:
+        running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
     if running:
         return jsonify({'error': 'A stage is currently running — stop it before renaming'}), 409
 
@@ -1588,7 +1589,8 @@ def delete_deployment(dep):
     if not _valid_deployment_name(dep):
         return jsonify({'error': 'Invalid deployment name'}), 400
 
-    running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
+    with _lock:
+        running = [k for k in _procs if k[0] == dep and _procs[k].poll() is None]
     if running:
         return jsonify({'error': 'A stage is currently running — stop it before deleting'}), 409
 
