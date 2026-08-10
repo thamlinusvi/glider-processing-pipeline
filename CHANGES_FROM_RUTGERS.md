@@ -59,6 +59,26 @@ else:
 **Also changed:** `dt.datetime.now(dt.UTC)` → `dt.datetime.now(dt.timezone.utc)`
 for Python 3.9 compatibility (`dt.UTC` was added in Python 3.11).
 
+**Follow-up fix (2026-08-10):** the RBR-support patch above fixed the crash but left a unit
+mismatch behind — `pressure_rating` (the threshold) is computed in dbar via `gsw.p_from_z`, but
+for `sensor == 'sci_water_pressure'` the comparison was still running against raw bar-unit
+sensor values (RBR Legato³ pressure is bar, not dbar), making the threshold ~10x too loose. A
+real pressure-sensor malfunction could never be flagged SUSPECT/FAIL on any RBR/UVI deployment.
+`sensor == 'pressure'` (Seabird, already dbar) was and remains unaffected.
+
+```python
+# ORIGINAL (RBR-support patch above, unit bug not yet fixed)
+flag_vals = qartod.gross_range_test(inp=ds[sensor].values, **cinfo)
+```
+
+```python
+# PIPELINE
+# sci_water_pressure (RBR) is in bar; pressure_rating above is in dbar (1 bar = 10 dbar).
+# Convert to dbar before comparison so both sides of the test share units.
+pressure_values = ds[sensor].values * 10 if sensor == 'sci_water_pressure' else ds[sensor].values
+flag_vals = qartod.gross_range_test(inp=pressure_values, **cinfo)
+```
+
 ---
 
 ### 2. `rugliderqc/scripts/ctd_hysteresis_test.py`
@@ -620,7 +640,7 @@ Without these lines the Docker build fails at the `conda env create` step.
 
 | File | Change type | Reason |
 |---|---|---|
-| `scripts/glider_qartod_qc.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
+| `scripts/glider_qartod_qc.py` | RBR support + Py3.9 compat + unit fix | `pressure` hardcoded; `dt.UTC` not in Py3.9; gross-range threshold compared bar values against a dbar span |
 | `scripts/ctd_hysteresis_test.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/time_shift.py` | RBR support + Py3.9 compat | `pressure` hardcoded; `dt.UTC` not in Py3.9 |
 | `scripts/summarize_qartod_flags.py` | Py3.9 compat | `dt.UTC` not in Py3.9 |
