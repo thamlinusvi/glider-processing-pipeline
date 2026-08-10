@@ -29,11 +29,22 @@ contexts:
                 qartod:
                     pressure_test:
                         suspect_threshold: 0
-                    spike_test: 
+                    spike_test:
                         suspect_threshold: 0.2
                         fail_threshold: 0.45
-                    rate_of_change_test: 
+                    rate_of_change_test:
                         threshold: 0.45
+            # sci_water_pressure: raw RBR pressure in bar (gncutils naming).
+            # Thresholds are the pressure stream values above, scaled ÷10 for bar units.
+            sci_water_pressure:
+                qartod:
+                    pressure_test:
+                        suspect_threshold: 0
+                    spike_test:
+                        suspect_threshold: 0.02
+                        fail_threshold: 0.045
+                    rate_of_change_test:
+                        threshold: 0.045
             salinity:
                 qartod:
                     climatology_test:
@@ -84,11 +95,22 @@ contexts:
                 qartod:
                     pressure_test:
                         suspect_threshold: 0
-                    spike_test: 
+                    spike_test:
                         suspect_threshold: 0.2
                         fail_threshold: 0.45
-                    rate_of_change_test: 
+                    rate_of_change_test:
                         threshold: 0.45
+            # sci_water_pressure: raw RBR pressure in bar (gncutils naming).
+            # Thresholds are the pressure stream values above, scaled ÷10 for bar units.
+            sci_water_pressure:
+                qartod:
+                    pressure_test:
+                        suspect_threshold: 0
+                    spike_test:
+                        suspect_threshold: 0.02
+                        fail_threshold: 0.045
+                    rate_of_change_test:
+                        threshold: 0.045
             salinity:
                 qartod:
                     climatology_test:
@@ -139,11 +161,22 @@ contexts:
                 qartod:
                     pressure_test:
                         suspect_threshold: 0
-                    spike_test: 
+                    spike_test:
                         suspect_threshold: 0.2
                         fail_threshold: 0.45
-                    rate_of_change_test: 
+                    rate_of_change_test:
                         threshold: 0.45
+            # sci_water_pressure: raw RBR pressure in bar (gncutils naming).
+            # Thresholds are the pressure stream values above, scaled ÷10 for bar units.
+            sci_water_pressure:
+                qartod:
+                    pressure_test:
+                        suspect_threshold: 0
+                    spike_test:
+                        suspect_threshold: 0.02
+                        fail_threshold: 0.045
+                    rate_of_change_test:
+                        threshold: 0.045
             salinity:
                 qartod:
                     climatology_test:

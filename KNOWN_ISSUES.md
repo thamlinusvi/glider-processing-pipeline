@@ -44,7 +44,7 @@ by the Electron side — this is a display-layer compatibility fix only; PyQt5's
 
 ## Active bugs affecting real QC output
 
-⚠️ **1. The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
+⚠️ **The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
 for USVI, silently.** Two independent gaps compound: (a) `usvi_configs.yml`'s tightened
 regional `pH` gross-range bounds (`qc/config/global_regional/usvi_configs.yml:94-101`) never
 fire, because `glider_qartod_qc` runs *before* `add_derived_variables` creates the `pH`
@@ -69,15 +69,6 @@ since it never finds a variable literally named `pressure`. Both now detect
 calibration-shaped test data (numerically identical output to the dbar case, ~1e-11 max
 difference). This removes one of the chain's contributing causes — (a) and (b) above are still
 open.
-
-⚠️ **2. `mab_configs.yml` has no `sci_water_pressure` stream at all**
-(`qc/config/global_regional/mab_configs.yml`, all 3 priority context blocks) — unlike
-`global_configs.yml` and `usvi_configs.yml`, which both correctly include it, properly
-÷10-scaled. If an RBR/UVI-CTD glider ever transits into the MAB region (lon `-78..-66`, lat
-`35..45`), its `sci_water_pressure` stream gets zero regional spike/rate-of-change/pressure QC
-there — entirely absent (not mis-scaled), silently skipped via the same
-`if sensor not in ds.data_vars` pattern applied in reverse (the config key itself is missing).
-**Fix:** add a `sci_water_pressure` block mirroring `global_configs.yml`'s to all 3 contexts.
 
 **Note:** `CHANGES_FROM_RUTGERS.md` claims `global_configs.yml`'s time window was extended from
 `2021-12-31` to `2030-12-31`, but the live file (`qc/config/global_regional/global_configs.yml:6`,
