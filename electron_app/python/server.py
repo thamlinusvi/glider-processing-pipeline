@@ -1163,7 +1163,7 @@ def save_metadata(dep):
         return jsonify({'error': 'Only .json files allowed'}), 403
 
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, 'w') as fp:
+    with open(full_path, 'w', encoding='utf-8') as fp:
         fp.write(content)
 
     return jsonify({'ok': True})

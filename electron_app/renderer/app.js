@@ -2327,7 +2327,7 @@ function switchTab (e) {
 }
 
 /* ── Metadata page ───────────────────────────────────────────────────────────*/
-async function renderMetadata () {
+async function renderMetadata (selectRel) {
   const dep  = state.deployment
   const page = document.getElementById('page-metadata')
   page.innerHTML = ''
@@ -2462,7 +2462,11 @@ async function renderMetadata () {
   // Add-file bar at the bottom of the file list
   fileList.appendChild(_metaAddBar(dep))
 
-  if (firstEntry) selectMetaFile(firstEntry[0], firstEntry[1], fileList, content, dep)
+  // Re-select whichever file the caller asked for (e.g. the one just saved/imported/
+  // copied), falling back to the first entry -- keeps the view from jumping away from
+  // what the user was just working on after a refresh that re-fetches from the server.
+  const toSelect = (selectRel && entries.find(([rel]) => rel === selectRel)) || firstEntry
+  if (toSelect) selectMetaFile(toSelect[0], toSelect[1], fileList, content, dep)
 }
 
 /* Replace a metadata file with one chosen from disk ─────────────────────────*/
@@ -2504,10 +2508,13 @@ function _metaImportFileReplace (dep, rel, fileList, content) {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ path: rel, content: JSON.stringify(parsed, null, 2) }),
       })
-      // Refresh content pane with new data
-      selectMetaFile(rel, parsed, fileList, content, dep)
-      // Flash the row green
-      const row = fileList.querySelector(`.meta-file-item.active`)
+      // Full refresh from the server (re-selecting this file) -- a local-only update
+      // here left the file list's stale closure-captured snapshot out of sync, so
+      // switching to another file and back would silently show the pre-import content.
+      await renderMetadata(rel)
+      // Flash the row green (re-query -- renderMetadata() rebuilds the file list, so
+      // the original `fileList`/`row` references above are now stale)
+      const row = document.getElementById('page-metadata').querySelector('.meta-file-item.active')
       if (row) {
         row.classList.add('meta-file-copied')
         setTimeout(() => row.classList.remove('meta-file-copied'), 1500)
@@ -2848,10 +2855,13 @@ async function _metaCopyFromPrev (dep, glider, rel, fileList, content) {
       body: JSON.stringify({ path: rel, content: text }),
     })
 
-    // Refresh the view with the new content
-    selectMetaFile(rel, srcJson, fileList, content, dep)
-    // Flash the active item
-    const activeItem = fileList.querySelector(`.meta-file-item.active`)
+    // Full refresh from the server (re-selecting this file) -- a local-only update
+    // here left the file list's stale closure-captured snapshot out of sync, so
+    // switching to another file and back would silently show the pre-copy content.
+    await renderMetadata(rel)
+    // Flash the active item (re-query -- renderMetadata() rebuilds the file list, so
+    // the original `fileList` reference above is now stale)
+    const activeItem = document.getElementById('page-metadata').querySelector('.meta-file-item.active')
     if (activeItem) {
       activeItem.classList.add('meta-file-copied')
       setTimeout(() => activeItem.classList.remove('meta-file-copied'), 1500)
@@ -3272,12 +3282,12 @@ function renderMetaEdit (rel, originalText, content, dep) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: rel, content: raw }),
       })
-      statusMsg.textContent = 'Saved.'
-      statusMsg.style.color = '#27ae60'
-      saveBtn.disabled = false
-      saveBtn.textContent = 'Save'
-      // Refresh view with updated data
-      renderMetaView(rel, JSON.parse(raw), content, dep)
+      // Full refresh from the server (re-selecting this same file) instead of a
+      // local-only view update -- the file list's click handlers close over the
+      // metadata snapshot loaded when the page opened, so a local-only update left
+      // that snapshot stale: switching to another file and back would silently show
+      // the pre-edit content again even though the save itself succeeded correctly.
+      await renderMetadata(rel)
     } catch (e) {
       statusMsg.textContent = e.message
       statusMsg.style.color = '#e74c3c'
