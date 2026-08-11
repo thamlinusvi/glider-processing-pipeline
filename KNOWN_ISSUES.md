@@ -44,20 +44,39 @@ by the Electron side — this is a display-layer compatibility fix only; PyQt5's
 
 ## Active bugs affecting real QC output
 
-⚠️ **The pH → Total Alkalinity → Aragonite Saturation State derived-variable chain is dead
-for USVI, silently.** Two independent gaps compound: (a) `usvi_configs.yml`'s tightened
-regional `pH` gross-range bounds (`qc/config/global_regional/usvi_configs.yml:94-101`) never
-fire, because `glider_qartod_qc` runs *before* `add_derived_variables` creates the `pH`
-variable (Stage 8 order per `CLAUDE.md`), and `glider_qartod_qc.py:311` skips any config stream
-not yet present in `ds.data_vars` — so `pH` is never there when this check runs, and the only
-QC ever applied to it is the much looser `generic_pH_gross_flatline.yml` (fail_span `[0,14]`,
-effectively the whole valid pH scale). (b) `qc/config/derived_variables/TA-salinity-regressions.yml`
+⚠️ **`TA-salinity-regressions.yml` has no USVI region, so Total Alkalinity/Aragonite
+Saturation State never compute for USVI, silently.** `qc/config/derived_variables/TA-salinity-regressions.yml`
 defines exactly one region, `nyb` (lon `[-75,-71]`, lat `[37.5,41.5]` — Mid-Atlantic Bight),
 nowhere near USVI (lon ≈ -65, lat ≈ 18). `calculate_ta()` (`add_derived_variables.py:176-219`)
 falls through with empty results on no region match, with **no log line explaining why** — so
 `total_alkalinity` never gets added, and `calculate_omega` (which needs it) can never run
 either. **Fix:** add a USVI region block to `TA-salinity-regressions.yml`, and add explicit
-logging to `calculate_ta()`'s no-region-matched fallthrough.
+logging to `calculate_ta()`'s no-region-matched fallthrough. The USVI region's own
+temperature/salinity coefficients can't be derived from code — they need real in-situ
+TA/salinity water-sample data, the same way the existing `nyb` block came from a published
+Mid-Atlantic Bight study (Wright-Fairbanks et al 2020) — this is a science input, not a code fix.
+
+**Fixed (2026-08-11):** pH itself now gets its regional QC. `usvi_configs.yml`'s tightened pH
+gross-range/spike bounds never fired because `glider_qartod_qc` runs before `add_derived_variables`
+creates the `pH` variable, so the streams loop's `if sensor not in ds.data_vars: continue`
+always skipped it — pH only ever got the much looser generic `[0,14]` gross-range check. Fixed
+by adding `rugliderqc/scripts/derived_variable_regional_qc.py` to Stage 8's chain (after
+`add_derived_variables`, before `summarize_qartod_flags`), which reuses `glider_qartod_qc.py`'s
+regional-streams logic (extracted into `run_regional_stream_tests()`, verified byte-identical
+to the original on real data across 170 QC variables) scoped to just `pH`. Cheap by design
+since no current fleet deployment has a pH sensor: samples `file[0]` + the last 10 files before
+doing any real work (~63s worst case per real-data timing, vs. checking every file), with a
+`ph_regional_qc_check_all_files: true` `qctests.yml` escape hatch for the rare case pH gets
+turned on mid-mission outside the sampled files. Verified end-to-end against synthetic pH data
+(regional bounds match an independent manual calculation exactly; `summarize_qartod_flags`
+correctly aggregates the new flags with zero changes needed) and against real pH-less
+deployment data through the full Stage 8 chain (no regression). One implementation snag worth
+noting: `usvi_configs.yml`'s pH block uses `gross_range_test`, which isn't one of the four test
+types `run_regional_stream_tests()` handles — calling it with `sensors=['pH']` in isolation
+crashed (`UnboundLocalError`) rather than silently falling through, which is what led to
+discovering the bug entry directly below. `gross_range_test` is implemented directly in the new
+script instead of the shared function, to avoid changing `glider_qartod_qc.py`'s own
+already-verified behavior.
 
 **Partially fixed (2026-08-10):** `add_derived_variables.py`'s `calculate_ph()`/`calculate_omega()`
 both hardcoded `dataset.pressure`/`apply_qc(dataset, 'pressure')`, unguarded and never patched
@@ -67,8 +86,67 @@ would crash Stage 8 outright with an uncaught `AttributeError` on any RBR/UVI pH
 since it never finds a variable literally named `pressure`. Both now detect
 `('pressure', 'sci_water_pressure')` and convert bar→dbar when needed, verified against real
 calibration-shaped test data (numerically identical output to the dbar case, ~1e-11 max
-difference). This removes one of the chain's contributing causes — (a) and (b) above are still
-open.
+difference).
+
+**Fixed (2026-08-11): `glider_qartod_qc.py`'s regional streams loop no longer corrupts a
+neighboring sensor's QC-variable metadata.** The streams loop (`run_regional_stream_tests()`)
+only implements `pressure_test`/`climatology_test`/`spike_test`/`rate_of_change_test`, but
+`usvi_configs.yml`'s `oxygen_concentration`/`oxygen_saturation` blocks use `gross_range_test`/
+`flat_line_test`, and `pH`'s block uses `gross_range_test` — none matched by the `if/elif`
+chain. Since `qc_varname`/`flag_vals` were only assigned inside a matched branch, an unmatched
+test type fell straight through to the "create QC variable" step using stale values left over
+from whatever test ran immediately before it in dict-iteration order — for USVI, that's
+`density`'s `rate_of_change_test` (the sensor immediately preceding oxygen in
+`usvi_configs.yml`'s `streams` order). Reproduced directly against real data, twice
+independently (both the isolated extracted function and the real script via its actual `main()`
+path): the bug overwrote `density_qartod_rate_of_change_test`'s **attrs** (not its flag values —
+those stayed density's own, correct numbers throughout) with metadata describing
+`oxygen_saturation`'s `flat_line_test` instead. Checked all three regional config files
+(`global_configs.yml`, `mab_configs.yml`, `usvi_configs.yml`) via `ioos_qc.config.Config`
+directly — confirmed this pattern is isolated to exactly 3 sensors, all in `usvi_configs.yml`:
+`oxygen_concentration`, `oxygen_saturation`, and `pH` (the last already handled separately in
+`derived_variable_regional_qc.py`, and unreachable in this primary pass since `pH` doesn't
+exist as a variable when `glider_qartod_qc` runs).
+
+**Note on an earlier claim in this entry (corrected):** an earlier version of this note guessed
+the bug was "dormant only by timing" — that real stored files predated `usvi_configs.yml` gaining
+oxygen entries. Checked properly and that explanation didn't hold up (the config commit
+predated the real deployment's actual processing timestamp) — the real reason the historical
+file looked clean couldn't be pinned down (file mtimes on this system may not reliably reflect
+actual historical Docker-run times). What's certain, verified by direct repeated execution of
+the real script: this fires on every current run, not just hypothetically.
+
+**Fix applied (Option A — stop the corruption, don't change any QC output):** unmatched test
+types now hit an explicit `else: continue` branch with a `WARNING` log line
+(`glider_qartod_qc.py`, inside `run_regional_stream_tests()`), instead of falling through.
+Verified against real data: `density_qartod_rate_of_change_test` now keeps correct attrs after
+a run that includes oxygen; all 6 unaffected sensors (temperature, conductivity, salinity,
+pressure, sci_water_pressure, density) produce byte-identical output (values *and* attrs) to
+before this fix — of 34 real `_qartod_*` variables compared, exactly 1 differs
+(`density_qartod_rate_of_change_test`'s attrs, now correct), 0 have different values anywhere.
+Also verified the pH regional-QC fix above is unaffected, and the full Stage 8 chain still runs
+cleanly end-to-end.
+
+**Where the applied vs. never-applied oxygen bounds actually live**, for anyone tracing this
+later:
+- **Actually active today:** `qc/config/gross_flatline/optode_4831_gross_flatline.yml` — matched
+  via `instrument_optode`'s `maker`/`model` attrs through `define_gross_flatline_config()`
+  (this fleet's real sensor: Aanderaa Oxygen Optode 4831).
+  `oxygen_concentration`: `suspect_span:[0,500]`/`fail_span:[0,1000]` (gross range),
+  `tolerance:0.1`/`suspect:120`/`fail:300` (flat line). `oxygen_saturation`:
+  `suspect_span:[0,150]`/`fail_span:[0,300]` (gross range). Not UVI-authored — absent from
+  `CHANGES_FROM_RUTGERS.md`'s otherwise-exhaustive deviation list, and `optode_3830`/`optode_3835`/
+  `optode_5013W`/`optode_5014W` share identical values with a `# specs copied from optode 3835`
+  comment — this looks like vendored, accumulated-upstream, per-sensor-model config, not
+  something built for this project.
+- **Configured but never applied (Option B, still open, deliberately not done here):**
+  `qc/config/global_regional/usvi_configs.yml`'s `oxygen_concentration`/`oxygen_saturation`/`pH`
+  blocks. USVI's `oxygen_concentration` gross-range bounds specifically are
+  `suspect_span:[100,300]`/`fail_span:[0,500]` — tighter than the generic instrument-level ones
+  above. Actually implementing these would **overwrite** the instrument-level results (same
+  variable names) with these tighter, region-specific bounds — a real change to oxygen's actual
+  QC flag outcomes across the fleet, not just a bug fix. Deliberately deferred as its own
+  decision, not bundled into this fix.
 
 **Note:** `CHANGES_FROM_RUTGERS.md` claims `global_configs.yml`'s time window was extended from
 `2021-12-31` to `2030-12-31`, but the live file (`qc/config/global_regional/global_configs.yml:6`,

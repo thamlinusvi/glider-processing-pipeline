@@ -262,6 +262,7 @@ def qc_command(base_dir, deployment):
         _qc('time_shift',                 'time_shift',                 '-m delayed -d profile '),
         _qc('data_gap_check',             'data_gap_check',             ''),
         _qc('add_derived_variables',      'add_derived_variables',      '-m delayed -d profile '),
+        _qc('derived_variable_regional_qc', 'derived_variable_regional_qc', '-m delayed -d profile '),
         _qc('summarize_qartod_flags',     'summarize_qartod_flags',     '-m delayed -d profile '),
         _qc('move_nc_files',              'move_nc_files',              '-m delayed -d profile '),
         f'echo "=== QC complete — $(ls {nc_out}/*.nc 2>/dev/null | wc -l) files in delayed/ ==="',

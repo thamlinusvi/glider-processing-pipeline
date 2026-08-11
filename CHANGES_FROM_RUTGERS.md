@@ -550,6 +550,152 @@ that applies to this script's actual runtime environment.
 
 ---
 
+### 11. `rugliderqc/scripts/glider_qartod_qc.py` (additional change beyond RBR/unit-fix changes)
+
+**Type:** Refactor — extracted the regional streams-test loop into a reusable function
+
+**Root cause / motivation:**
+`glider_qartod_qc` runs before `add_derived_variables` in Stage 8 (it needs to run first so
+`add_derived_variables`'s `apply_qc()` can mask bad CTD/voltage values using the individual
+`_qartod_*` test flags this script produces). That means any regional QC config for a variable
+that only exists *after* `add_derived_variables` runs — `pH`, via `usvi_configs.yml`'s `pH`
+stream block — never gets applied by this script's own pass, since it skips any sensor not yet
+present in the dataset. Rather than reorder the pipeline (which would break the CTD-masking
+dependency) or duplicate ~150 lines of test logic into a new script, the existing inline loop
+(`for sensor, config_info in c['streams'].items(): ...`) was extracted into a standalone
+function, `run_regional_stream_tests(ds, c, times, logging, sensors=None)`, so a new script
+(§12 below) can reuse it scoped to just `pH` after that variable exists.
+
+```python
+# ORIGINAL — inline in main()
+times = cf.convert_epoch_ts(ds['time'])
+for sensor, config_info in c['streams'].items():
+    if sensor not in ds.data_vars:
+        continue
+    # ... ~140 lines of climatology/spike/rate_of_change/pressure test logic ...
+```
+
+```python
+# PIPELINE — extracted to module level, call site becomes:
+times = cf.convert_epoch_ts(ds['time'])
+run_regional_stream_tests(ds, c, times, logging)
+```
+
+Mechanical extraction only — no logic changed. Verified byte-identical to the original: ran
+both versions inside Docker against 5 real profile files from `uvi_02-20260429T1420`, diffed
+all 170 resulting `_qartod_*` variables (values and attrs), zero differences.
+
+**Found in the process, not fixed here:** `usvi_configs.yml`'s `oxygen_concentration`/
+`oxygen_saturation` blocks use `gross_range_test`/`flat_line_test`, neither of which this loop's
+`if/elif` chain has ever handled — an unmatched test type falls through using stale `qc_varname`/
+`flag_vals` left over from whichever test ran immediately before it, silently overwriting a
+neighboring sensor's QC variable with wrong metadata. Pre-existing in the original script,
+confirmed still live against current config — see `KNOWN_ISSUES.md`.
+
+---
+
+### 12. `rugliderqc/scripts/derived_variable_regional_qc.py` (new script, no Rutgers equivalent)
+
+**Type:** New script — gives `pH` the regional QC pass it never got (see §11 above for why)
+
+Added to Stage 8's chain (`app/pipeline/stages.py`'s `qc_command()`) directly after
+`add_derived_variables` and before `summarize_qartod_flags`:
+
+```python
+# PIPELINE — app/pipeline/stages.py, qc_command()
+_qc('add_derived_variables',        'add_derived_variables',        '-m delayed -d profile '),
+_qc('derived_variable_regional_qc', 'derived_variable_regional_qc', '-m delayed -d profile '),
+_qc('summarize_qartod_flags',       'summarize_qartod_flags',       '-m delayed -d profile '),
+```
+
+Imports `build_global_regional_config()` and `run_regional_stream_tests()` from
+`glider_qartod_qc.py` rather than duplicating them. Since no current fleet deployment has a pH
+sensor, it's designed to be a near-free no-op on every real run today: it samples `file[0]` +
+the last 10 files for `pH` before doing any real work (a full per-file check across all 840
+files of a real deployment measured at ~63s — the sampled check is sub-second), with a new
+`ph_regional_qc_check_all_files: true` `qctests.yml` key as an escape hatch for the rare case a
+pH sensor gets turned on mid-mission outside the sampled files. `usvi_configs.yml`'s `pH` block
+uses `gross_range_test`, which `run_regional_stream_tests()` doesn't implement (see §11) — calling
+it with a single isolated sensor and no prior sensor to coincidentally borrow a stale value from
+crashes outright (`UnboundLocalError`) rather than silently falling through, so `gross_range_test`
+is implemented directly in this script instead of touching the shared function.
+
+Verified end-to-end inside Docker (real, rebuilt image, real bind-mount paths matching how
+`_qc()` actually invokes scripts): synthetic-pH-injected profile produces
+`pH_qartod_gross_range_test`/`pH_qartod_spike_test` matching an independent manual
+`qartod.gross_range_test()`/`qartod.spike_test()` calculation exactly; `summarize_qartod_flags`
+picks up both and produces `pH_qartod_summary_flag` with zero changes needed to that script; a
+real pH-less deployment's other 34 pre-existing `_qartod_*` variables are untouched by the
+pH-only run; the full Stage 8 chain (10 scripts, including this one) runs cleanly end-to-end
+against real fresh (pre-QC) data.
+
+---
+
+### 13. `rugliderqc/scripts/glider_qartod_qc.py` (additional fix beyond §11)
+
+**Type:** Bug fix — unmatched regional test types silently corrupted a different sensor's QC metadata
+
+**Root cause:**
+`run_regional_stream_tests()` (added in §11) only implements `pressure_test`/`climatology_test`/
+`spike_test`/`rate_of_change_test`. `usvi_configs.yml`'s `oxygen_concentration`/
+`oxygen_saturation` blocks use `gross_range_test`/`flat_line_test` — unmatched by the `if/elif`
+chain. `qc_varname`/`flag_vals` are only assigned inside a matched branch, so an unmatched test
+type fell through to the variable-creation step using stale values left over from whichever
+test ran immediately before it — for USVI's sensor order, `density`'s `rate_of_change_test`.
+Reproduced against real data: the bug silently overwrote `density_qartod_rate_of_change_test`'s
+*attrs* (not its flag values, which stayed density's own correct numbers) with metadata
+describing `oxygen_saturation`'s `flat_line_test` instead.
+
+```python
+# ORIGINAL (also how §11's extraction first looked)
+elif test == 'rate_of_change_test':
+    qc_varname = f'{sensor}_qartod_rate_of_change_test'
+    ...
+
+# Define pressure/climatology/spike/rate of change QC variable attributes
+attrs = cf.set_qartod_attrs(test, sensor, cinfo)
+if not hasattr(ds[sensor], 'ancillary_variables'):
+    ds[sensor].attrs['ancillary_variables'] = qc_varname
+...
+```
+
+```python
+# PIPELINE
+elif test == 'rate_of_change_test':
+    qc_varname = f'{sensor}_qartod_rate_of_change_test'
+    ...
+
+else:
+    # gross_range_test/flat_line_test aren't implemented by this loop. Falling through
+    # without this branch reused qc_varname/flag_vals from the last matched test and
+    # silently overwrote that unrelated variable's attrs -- see KNOWN_ISSUES.md.
+    logging.warning(
+        '{:s}: regional test type "{:s}" is configured but not implemented by this '
+        'loop -- skipping. This sensor still gets QC from its own per-instrument gross/'
+        'flatline config if one exists.'.format(sensor, test))
+    continue
+
+# Define pressure/climatology/spike/rate of change QC variable attributes
+attrs = cf.set_qartod_attrs(test, sensor, cinfo)
+...
+```
+
+Deliberately scoped as a pure bug fix (Option A), not an implementation of the missing test
+types (Option B) — oxygen already gets working QC from a separate, unrelated per-instrument
+config (`qc/config/gross_flatline/optode_4831_gross_flatline.yml` for this fleet's sensor), and
+implementing the region-specific bounds for real would overwrite those instrument-level results
+with different numbers under the same variable names — a real change to oxygen's QC outcomes,
+kept as a distinct future decision rather than bundled into this fix. See `KNOWN_ISSUES.md` for
+the region-specific bounds that remain configured but unapplied.
+
+Verified against real data: of 34 real `_qartod_*` variables in a test file, 33 are
+byte-identical (values and attrs) to before this fix; the one exception
+(`density_qartod_rate_of_change_test`) has identical values with only its attrs now corrected.
+Confirmed 4 `WARNING` log lines appear per file (2 sensors × 2 unmatched test types). Re-verified
+the pH regional-QC fix (§12) and the full Stage 8 chain are both unaffected.
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |
@@ -754,6 +900,9 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `scripts/check_duplicate_timestamps.py` | Bug fix | Latent crash when renamed `.duplicate` file re-opened as "current" in next iteration; set `status=1` and broke pipeline chain |
 | `scripts/check_science_variables.py` | Bug fix | `ds.to_netcdf(f)` ran unconditionally, recreating the `.nc` file that was just renamed to `.nosci`; all 24 nosci profiles propagated through every downstream script |
 | `scripts/move_nc_files.py` | Bug fix | Shell `mv`'s exit code was discarded; a partial/failed move looked like success and the log count didn't reflect what actually moved |
+| `scripts/glider_qartod_qc.py` (again) | Refactor | Extracted regional streams-test loop into `run_regional_stream_tests()` so a new script could reuse it for `pH`; verified byte-identical |
+| `scripts/derived_variable_regional_qc.py` | New script | `pH` never got regional QC since it doesn't exist until after `glider_qartod_qc` runs; near-free no-op today, no deployment has pH yet |
+| `scripts/glider_qartod_qc.py` (again) | Bug fix | Unmatched regional test types (oxygen's `gross_range_test`/`flat_line_test`) silently corrupted `density`'s QC-variable metadata; now skipped with a warning instead |
 | `config/global_regional/global_configs.yml` | RBR support + date range fix | Added `sci_water_pressure`; window ended 2021 |
 | `config/global_regional/usvi_configs.yml` | RBR support + added density QC | Added `sci_water_pressure` and `density` streams |
 | `config/gross_flatline/rbr_legato3_ctd_gross_flatline.yml` | RBR support | Added `sci_water_pressure` flat_line_test |
