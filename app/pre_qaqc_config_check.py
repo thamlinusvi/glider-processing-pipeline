@@ -88,6 +88,28 @@ def get_oxygen_vars(nc_path):
     return sorted(found)
 
 
+def find_oxygen_vars(nc_dir, first_nc_path):
+    """Scan profile NC files for oxygen data variables.
+
+    The optode can be duty-cycled and absent from any single profile, so
+    checking only `first_nc_path` (as find_profile_nc()'s caller uses for
+    instrument metadata) can miss real oxygen data that's present in most
+    other profiles of the deployment. Check that file first (cheap, already
+    open in the common case), then fall back to scanning the rest.
+    """
+    found = get_oxygen_vars(first_nc_path)
+    if found:
+        return found
+    ncfiles = sorted(glob.glob(os.path.join(nc_dir, '*.nc')))
+    for f in ncfiles:
+        if f == first_nc_path:
+            continue
+        found = get_oxygen_vars(f)
+        if found:
+            return found
+    return []
+
+
 # ── YAML builders ─────────────────────────────────────────────────────────────
 
 def build_time_shift_yml(sensors, oxygen_vars):
@@ -503,7 +525,8 @@ def main(args):
 
     instruments = read_instruments(nc_path)
     sensors     = detect_sensors(instruments)
-    oxygen_vars = get_oxygen_vars(nc_path) if sensors['oxygen'] else []
+    nc_dir      = os.path.join(base_dir, 'gncutils_slocum_nc_output', deployment, 'profile')
+    oxygen_vars = find_oxygen_vars(nc_dir, nc_path) if sensors['oxygen'] else []
 
     # ── Print sensor summary ──────────────────────────────────────────────────
     print('', flush=True)
@@ -528,7 +551,6 @@ def main(args):
               flush=True)
 
     # ── Regional boundary coverage check ─────────────────────────────────────
-    nc_dir = os.path.dirname(nc_path)
     region_coverage = analyze_region_coverage(nc_dir, base_dir)
 
     # ── Build config file contents ────────────────────────────────────────────

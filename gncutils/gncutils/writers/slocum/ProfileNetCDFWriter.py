@@ -157,6 +157,12 @@ class ProfileNetCDFWriter(BaseProfileNetCDFWriter):
 
                 if nc_file:
                     try:
+                        # See dba_obj_to_profile_nc's identical unlink-before-move
+                        # for why: Docker Desktop's Windows bind mount rejects a
+                        # non-root container user's rename()-based overwrite of a
+                        # pre-existing (root-owned per the mount) file with EPERM.
+                        if os.path.isfile(out_nc_file):
+                            os.remove(out_nc_file)
                         shutil.move(tmp_nc, out_nc_file)
                         os.chmod(out_nc_file, 0o755)
                     except IOError as e:
@@ -328,6 +334,15 @@ class ProfileNetCDFWriter(BaseProfileNetCDFWriter):
 
             if nc_file:
                 try:
+                    # Docker Desktop's Windows bind mount reports pre-existing
+                    # files as root-owned regardless of who wrote them, and
+                    # rejects a non-root container user's rename()-based
+                    # overwrite with EPERM even though the mode bits show
+                    # 0o777. Unlinking first (governed by directory write
+                    # permission, not file ownership) then moving onto the
+                    # now-empty path avoids the overwrite-via-rename entirely.
+                    if os.path.isfile(out_nc_file):
+                        os.remove(out_nc_file)
                     shutil.move(tmp_nc, out_nc_file)
                     os.chmod(out_nc_file, 0o755)
                 except IOError as e:

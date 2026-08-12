@@ -42,6 +42,45 @@ PyQt5 UI doesn't crash (`KeyError`) when displaying a deployment whose preflight
 by the Electron side — this is a display-layer compatibility fix only; PyQt5's own
 `_on_finished` status-setting logic is unchanged, per the unresolved item above.
 
+## Docker/Windows: overwriting existing pipeline output always failed EPERM
+
+**Fixed (2026-08-11): re-running Stage 2a/4/5 against an already-processed deployment failed
+`EPERM` on every single output file, silently producing zero (or garbage) NC output.**
+`gncutils/gncutils/writers/slocum/ProfileNetCDFWriter.py` and `TrajectoryNetCDFWriter.py` both
+write to a temp file, then `shutil.move(tmp_nc, out_nc_file)` to publish it — and every real
+Stage 2a/4/5 invocation always passes `--clobber` (`app/pipeline/stages.py:115,129,153,177`), so
+this overwrite-via-rename runs on every re-run against a deployment that's already been
+processed once. Root cause, confirmed by direct reproduction against the real bind-mounted
+output directory: this pipeline's Docker containers run as **non-root user `glider`**
+(`Dockerfile:36-37`), and Docker Desktop's Windows bind mount reports every *pre-existing* file
+as **owned by root (uid 0)** regardless of which container actually wrote it — a `rename()`-based
+overwrite of a root-owned file by the non-root `glider` process is rejected with
+`[Errno 1] Operation not permitted`, even though the mode bits report `0o777` (world-writable) and
+`os.access(path, os.W_OK)` reports `True`. A **fresh** run (no file yet at the target path)
+is unaffected — rename-to-create doesn't hit this check — so the bug only shows up on re-runs,
+and hits every single file in the run, not just some. Confirmed via real-data reproduction: a
+`shutil.move()` overwriting an existing real profile NC file failed every time with this exact
+error; `os.remove()` on that same root-owned file succeeded immediately after (unlink is governed
+by the containing directory's write permission, not the file's owner), and a subsequent move onto
+the now-empty path succeeded cleanly. **Fix:** both writers now `os.remove(out_nc_file)` if it
+exists immediately before `shutil.move()`, in both of `ProfileNetCDFWriter.py`'s two write paths
+(`dbas_to_profile_nc`/`dba_obj_to_profile_nc`) and `TrajectoryNetCDFWriter.py`'s. Also fixed a
+related latent bug found in the same `TrajectoryNetCDFWriter.py` except-block while there: its
+error log line used `'{:s}: {:s}'.format(tmp_nc, e)` — formatting an exception object with an
+explicit `s` presentation type raises `TypeError` (confirmed directly: exceptions don't implement
+`__format__`), so *logging* the original error would itself have crashed instead of the intended
+graceful `continue`; changed to `'{:s}: {:}'.format(...)`. Verified end-to-end against real data:
+re-ran the actual Stage 2a Docker command against `uvi_01-20241026T1158` (669 profiles, fully
+clobbering pre-existing output) — zero `EPERM` errors across the whole run (previously: every
+single file failed). One important side effect for anyone reading this later: diagnosing this
+required directly overwriting real files in this repo's `gncutils_slocum_nc_output/` to confirm
+the root cause — one profile NC file was briefly left as placeholder test content mid-investigation,
+then fully regenerated via the real Stage 2a command as part of verifying the fix; confirmed
+restored (40 variables including `salinity`, matching its pre-corruption shape).
+`gncutils/scripts/dba_to_ngdac_profile_nc.py` and `writers/navoceano/ProfileNetCDFWriter.py` have
+the identical unfixed pattern but aren't invoked anywhere in this pipeline's stage commands
+(confirmed via grep of `app/pipeline/stages.py`) — left as-is, not worth touching unused code.
+
 ## Active bugs affecting real QC output
 
 ⚠️ **`TA-salinity-regressions.yml` has no USVI region, so Total Alkalinity/Aragonite
@@ -55,6 +94,29 @@ logging to `calculate_ta()`'s no-region-matched fallthrough. The USVI region's o
 temperature/salinity coefficients can't be derived from code — they need real in-situ
 TA/salinity water-sample data, the same way the existing `nyb` block came from a published
 Mid-Atlantic Bight study (Wright-Fairbanks et al 2020) — this is a science input, not a code fix.
+
+**Fixed (2026-08-11): preflight's oxygen-variable detection sampled only the first profile NC
+file, silently dropping oxygen time-lag QC config for duty-cycled optodes.**
+`pre_qaqc_config_check.py`'s analysis mode used `find_profile_nc()`'s single file
+(`sorted(glob.glob(...))[0]`, chronologically earliest) for both instrument-metadata detection
+(fine — identical across profiles) and oxygen data-variable detection via `get_oxygen_vars()`
+(not fine — data-variable *presence* is per-profile, not deployment-wide). Reproduced against
+real data: `uvi_01-20241026T1158`'s first profile (`..._133012Z_dbd.nc`) has CTD-derived vars
+(`salinity`/`density`/`potential_temperature`) but zero oxygen vars, even though the Aanderaa
+optode is clearly sampling normally — 628 of the deployment's 669 profiles (94%) do have
+`oxygen_concentration`/`oxygen_saturation`. `sensors['oxygen']` (from instrument metadata) still
+correctly detected the optode, but `oxygen_vars` came back empty, and `oxygen_vars` is what
+`build_time_shift_yml()` loops over to generate `time_shift.yml`'s per-variable entries — so a
+deployment with plenty of real oxygen data would get a `time_shift.yml` with **no oxygen
+time-lag-shift entries at all**, silently skipping that QC step in Stage 8, while printing a
+misleading `WARNING: Oxygen instrument detected but no oxygen variables found in NC file.`
+`qctests.yml` was unaffected (depends only on `sensors`, not `oxygen_vars`).
+**Fix:** new `find_oxygen_vars(nc_dir, first_nc_path)` checks `first_nc_path` first (cheap, the
+common case), then falls back to scanning the rest of the deployment's profile files in
+timestamp order until one has oxygen vars, or all are exhausted (genuine no-data case).
+Verified against real data: re-running preflight on `uvi_01-20241026T1158` now correctly reports
+`oxygen_concentration`/`oxygen_saturation` found, no warning, and `time_shift.yml`'s generated
+content includes both variables' 30-sample default-shift entries.
 
 **Fixed (2026-08-11):** pH itself now gets its regional QC. `usvi_configs.yml`'s tightened pH
 gross-range/spike bounds never fired because `glider_qartod_qc` runs before `add_derived_variables`

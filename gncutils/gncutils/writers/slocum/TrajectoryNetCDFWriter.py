@@ -143,9 +143,18 @@ class TrajectoryNetCDFWriter(BaseTrajectoryNetCDFWriter):
             # Add the output NetCDF file name to the list of those to be moved to args.output_dir
             if nc_file:
                 try:
+                    # Docker Desktop's Windows bind mount reports pre-existing
+                    # files as root-owned regardless of who wrote them, and
+                    # rejects a non-root container user's rename()-based
+                    # overwrite with EPERM even though the mode bits show
+                    # 0o777. Unlinking first (governed by directory write
+                    # permission, not file ownership) then moving onto the
+                    # now-empty path avoids the overwrite-via-rename entirely.
+                    if os.path.isfile(out_nc_file):
+                        os.remove(out_nc_file)
                     shutil.move(tmp_nc, out_nc_file)
                 except IOError as e:
-                    self._logger.error('Error moving temp NetCDF file {:s}: {:s}'.format(tmp_nc, e))
+                    self._logger.error('Error moving temp NetCDF file {:s}: {:}'.format(tmp_nc, e))
                     continue
 
             output_nc_files.append(out_nc_file)
