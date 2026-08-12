@@ -62,7 +62,7 @@ done
 # Remove option from $@
 shift $((OPTIND-1));
 
-. logging.sh;
+. "${workpath}/../logging.sh";
 [ "$?" -ne 0 ] && exit 1;
 
 if [ "$#" -eq 0 ]

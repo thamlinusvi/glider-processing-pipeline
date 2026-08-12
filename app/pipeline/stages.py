@@ -38,15 +38,26 @@ def dbd_to_dat_command(base_dir, deployment):
     Convert paired DBD + EBD Slocum binary files to merged ASCII DAT files.
     Output always goes to dat_files/<dep>/merged_data/.
     Run this stage when science (EBD) files are present.
+
+    Any "dinkum compressed" files (.dcd/.ecd/.mcd/.ncd/.scd/.tcd/.ncg/.mcg -- the
+    real-time/acoustic-modem transmission format) are decompressed in place first, via
+    slocum/bin2ascii/decompress_dbds.sh, so processDbds.sh (which only recognizes
+    dbd/ebd/mbd/nbd/sbd/tbd) actually has something to convert. Safe to re-run: the
+    decompress step skips a target that already exists, and never touches the
+    compressed originals.
     """
     src    = f'/home/glider/incoming_data/{deployment}'
     dest   = f'/home/glider/dat_files/{deployment}/merged_data'
     exes   = '/home/glider/slocum/linux-bin'
     cac    = '/home/glider/master_cac'
     script = '/home/glider/slocum/bin2ascii/processDbds.sh'
+    decomp = '/home/glider/slocum/bin2ascii/decompress_dbds.sh'
 
     inner = ' && '.join([
-        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab',
+        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab {exes}/compexp',
+        f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.ecd" -o -iname "*.mcd" -o '
+        f'-iname "*.ncd" -o -iname "*.scd" -o -iname "*.tcd" -o -iname "*.ncg" -o -iname "*.mcg" \\) '
+        f'-print0 | xargs -0r bash {decomp} -e {exes}',
         f'mkdir -p {dest}',
         f'cp -r {cac} /tmp/slocum_cac',
         f'bash {script} -c /tmp/slocum_cac -e {exes} {src} {dest}',
@@ -62,17 +73,27 @@ def dbd_to_dat_flight_command(base_dir, deployment):
     Output always goes to dat_files/<dep>/flight_data/.
     Only DBD files are passed to the script — EBD files are ignored so
     this stage can run alongside Stage 1a on the same deployment.
+
+    Flight-side "dinkum compressed" files (.dcd/.mcd/.scd) are decompressed in place
+    first, via slocum/bin2ascii/decompress_dbds.sh, so the .dbd copy step below (and
+    processDbds.sh, which only recognizes dbd/mbd/sbd) actually has something to
+    convert. Science-side compressed extensions (.ecd/.ncd/.tcd) are deliberately not
+    touched here, matching this stage's own EBD-ignored scoping.
     """
     src    = f'/home/glider/incoming_data/{deployment}'
     dest   = f'/home/glider/dat_files/{deployment}/flight_data'
     exes   = '/home/glider/slocum/linux-bin'
     cac    = '/home/glider/master_cac'
     script = '/home/glider/slocum/bin2ascii/processDbds.sh'
+    decomp = '/home/glider/slocum/bin2ascii/decompress_dbds.sh'
     tmp    = f'/tmp/dbd_flight_{deployment}'
 
     # Copy only .dbd files into a temp dir so the script never sees EBD files
     inner = ' && '.join([
         f'mkdir -p {tmp}',
+        f'chmod +x {exes}/compexp',
+        f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.mcd" -o -iname "*.scd" \\) '
+        f'-print0 | xargs -0r bash {decomp} -e {exes}',
         f'find {src} -maxdepth 1 -iname "*.dbd" -exec cp {{}} {tmp}/ \\;',
         f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab',
         f'mkdir -p {dest}',
