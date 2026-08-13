@@ -462,6 +462,26 @@ single-pass behavior — no regression.
   given current server-side validation, but worth normalizing if this app's threat model ever
   changes (e.g. multi-user or synced/shared deployment folders).
 
+- **A running stage's live timer doesn't survive a page rebuild, and can never resume once
+  lost.** `buildStageCard()` (~757-771) only handles the timer display in two cases: an
+  already-finished stage (`started_at` *and* `finished_at` both set) gets a static final
+  duration computed once (~763-766); a currently-running stage (`started_at` set,
+  `finished_at` not) has no matching branch at all, so `timingEl` is just left blank. The only
+  place a *live*, ticking timer ever gets created is inside `doRun()`'s `setInterval` (~1035),
+  which only runs at the exact moment the "Run Stage" button is clicked — it's plain in-memory
+  JS state, never reconstructed from `pipeline_state.json`'s `started_at`. Confirmed on a real
+  long-running Stage 8 (QARTOD QC) job: after the Pipeline page got rebuilt (navigating away and
+  back is enough — anything that re-runs `buildStageCard()`), the card correctly still showed
+  `RUNNING` (that comes from on-disk status) but the countdown just sat blank/frozen for the
+  rest of the ~2.5-hour run, even though the underlying Docker container was genuinely still
+  making progress the whole time (confirmed via `docker stats`/`docker logs`). Purely cosmetic —
+  doesn't affect the actual job, and the badge's `RUNNING` state is still correct — but
+  confusing enough to look like a crash. **Fix:** give `buildStageCard()` a third case: when a
+  stage is running (`started_at` set, no `finished_at`), start a `setInterval` seeded from
+  `Date.now() - new Date(stateEntry.started_at)` instead of leaving `timingEl` blank, so the
+  timer resumes correctly across any page rebuild instead of only surviving within the single
+  browser session that clicked Run.
+
 ## Root utility script issues
 
 - **`qc_report.py` has no exception handling around NC file opens — one bad file kills the
