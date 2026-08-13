@@ -44,20 +44,11 @@ This file is held to a high bar — treat it as a living document, not a one-tim
   (failures surface lazily, the first time a feature that needs them is used, not at startup).
 - **Frontend:** `electron_app/renderer/app.js` (~6000 lines, vanilla JS, no framework) +
   `index.html` + `styles.css` (~3600 lines).
-- **Launch:** `start_app.bat` → `cd electron_app && npm start` (Electron app only).
-- **A second, separate desktop UI exists, is NOT launched by `start_app.bat`, and is
-  behind/stale relative to the Electron app:** `app/main.py` + `app/ui/*.py` (`main_window.py`,
-  `dashboard.py`, `pipeline_page.py`, `metadata_editor.py`, `dat_browser.py`, `report_viewer.py`)
-  is a standalone PyQt5 app that also drives `app/pipeline/stages.py`/`state.py` directly, via
-  its own `QThread`-based runner (`app/workers/pipeline_worker.py`). File mtimes show it was
-  last touched early June, while `stages.py`/`state.py`/`server.py` kept moving through
-  August — it hasn't tracked ~2 months of pipeline evolution. Confirmed gaps: no AD2CP tab, no
-  cloud-upload panel, and no handling of the `=== PREFLIGHT_JSON ===` marker (Stage 3's output
-  just dumps as plain log text with no confirm/apply panel like the Electron app has). It's not
-  dead code — treat edits to `app/pipeline/stages.py`/`state.py` as affecting **both**
-  frontends — but don't assume feature parity, and don't use it as a reference for "how does the
-  app currently behave" without checking the Electron app too. (It also has its own bugs —
-  see `KNOWN_ISSUES.md`.)
+- **Launch:** `start_app.bat` → `cd electron_app && npm start` (Electron app only, the only
+  frontend in this repo — a second, separate PyQt5 desktop UI existed at `app/main.py`/`app/ui/`/
+  `app/workers/` but was removed 2026-08-13, confirmed unused, ~2 months stale relative to
+  Electron, and never launched by `start_app.bat`; see git history / commit message for that
+  removal if you need the full reasoning).
 - **Docker required for most of the pipeline:** the `glider-processing` image (name only,
   `app/pipeline/stages.py` ~line 14) is not built automatically anywhere in this repo — build
   it manually (`docker build -t glider-processing .` from repo root) before running stages.
@@ -73,7 +64,6 @@ This file is held to a high bar — treat it as a living document, not a one-tim
   server.py, when changing what a stage does.
 - `app/pipeline/state.py` — stage status persistence (`pipeline_state.json` per deployment;
   `not_run`/`running`/`done`/`failed`) and the fixed 9-stage list (~line 9).
-- `app/main.py`, `app/ui/`, `app/workers/` — the standalone PyQt5 UI (see above).
 - `app/pre_qaqc_config_check.py` — drives the Stage 3 "preflight" sensor-detection step.
 - `qc_report.py`, `plot_qc_data.py`, `fix_trajectoryprofile_metadata.py`,
   `build_sensor_defs.py` (repo root) — called by specific stages (see Main pipeline below)
