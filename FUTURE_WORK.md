@@ -68,3 +68,25 @@ a different CTD's pressure that's already in dbar.
 
 See `KNOWN_ISSUES.md` → "Not yet in this repo — flagged proactively for planned pipeline
 integration" for the full walkthrough and the Python reproduction.
+
+## 4. `data_gap_check.py` — needs a UVI-operated real-time ERDDAP feed
+
+**Needs:** a real-time data feed for active UVI deployments, hosted somewhere this script can
+query — e.g. a UVI-operated ERDDAP server. None exists today.
+
+**What's pending:** `data_gap_check.py` isn't a QC test — it sets no flags and touches no NetCDF
+files. It's an operational monitoring script meant to warn pilots that an *actively deployed*
+glider has gone quiet (no new data for N hours) or dropped a chunk of recent data, by querying a
+live ERDDAP feed. It's currently hardcoded to Rutgers' own ERDDAP
+(`http://slocum-data.marine.rutgers.edu/erddap/tabledap/{deployment}-profile-sci-rt`), which UVI
+gliders were never registered on, so the lookup always fails and the script does nothing.
+
+**Why this isn't just a URL swap:** even pointed at a real UVI feed, this script's purpose (is
+data still trickling in from a glider that's currently underwater) doesn't fit where it's wired
+in today — Stage 8's delayed-mode chain runs on data from an *already-recovered* glider, after
+the mission is over. There's no "live lag" left to check by then. If a UVI ERDDAP server ever
+exists, this probably belongs as a separate real-time monitoring job run during an active
+mission, not inside the delayed-mode Stage 8 chain as it's currently positioned.
+
+See `KNOWN_ISSUES.md` → "Other rugliderqc QC-script issues" for the code-level detail. No code
+changes made — left as-is per Travis, since it isn't actionable without the ERDDAP feed.
