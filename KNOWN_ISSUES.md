@@ -42,6 +42,34 @@ PyQt5 UI doesn't crash (`KeyError`) when displaying a deployment whose preflight
 by the Electron side — this is a display-layer compatibility fix only; PyQt5's own
 `_on_finished` status-setting logic is unchanged, per the unresolved item above.
 
+## Stage 8: re-running QC on an already-processed deployment failed to move any output files
+
+**Fixed (2026-08-12): `move_nc_files.py` (the final step of Stage 8) failed to move any file
+out of `qc_queue/` when re-running QC on a deployment that had already been through Stage 8
+once.** Confirmed on real data (`uvi_01-20241026T1158`, 625 files): after editing
+`usvi_configs.yml`'s conductivity bounds and re-running QC, the log showed
+`Moved 0 of 625 netcdf files`, one `Error moving ... Destination path '...' already exists`
+per file. Root cause: `move_nc_files.py:68` calls `shutil.move(f, data_path)` with `data_path`
+as the destination *directory* — Python's `shutil.move()` deliberately refuses to overwrite in
+that form when a same-named file already exists there, raising exactly this error, rather than
+falling back to `os.rename`'s native overwrite behavior (which only applies when the destination
+is a full file path, not a directory). Since Stage 8 always starts a fresh run by writing into
+`qc_queue/` regardless of what's already in the final output directory, any second run against
+the same deployment hit this on every single file — no clobber/overwrite handling existed at all.
+Same underlying bug *class* as the Docker/Windows EPERM entry below (re-running against an
+already-populated destination), different mechanism (a deliberate Python stdlib safety check,
+not an OS permission error) and a different script. Nothing was lost — the freshly-computed files
+sat safely in `qc_queue/` (nested under `delayed/`, i.e. `delayed/qc_queue/`) until manually moved
+into place. **Fix:** remove the existing destination file (if any) before `shutil.move()`, mirroring
+the same pattern used for the EPERM fix below. Verified two ways: (1) an isolated reproduction —
+old content in the destination, new content in the queue, confirms the fixed logic overwrites
+cleanly with no exception; (2) real data — after manually moving the stuck `qc_queue/` output into
+`delayed/`, `conductivity_qartod_climatology_test`'s FAIL rate dropped from 52.1% (in the 15-85m
+band that hits the old `[3,6]` bound) to 0.00% deployment-wide, confirming the new bounds are
+correctly reflected in the moved output. **Caveat: this fix hasn't been exercised through an actual
+Docker run yet** — `rugliderqc/` is baked into the `glider-processing` image at build time (unlike
+`gncutils`, which is bind-mounted live), so it won't take effect until the image is rebuilt.
+
 ## Docker/Windows: overwriting existing pipeline output always failed EPERM
 
 **Fixed (2026-08-11): re-running Stage 2a/4/5 against an already-processed deployment failed
@@ -521,3 +549,45 @@ way the items above were checked.
   (`app.js`) clears the whole DOM, fires two parallel API fetches, rebuilds all stage
   cards, and reconnects SSE from scratch. Fix would be to show a cached last-known snapshot
   immediately and patch in fresh data — not yet implemented, explicitly deferred.
+
+## Not yet in this repo — flagged proactively for planned pipeline integration
+
+⚠️ **External MATLAB oxygen-lag-correction script (not currently part of this codebase, but
+Travis is planning to port similar logic into the pipeline) silently corrupts the oxygen
+correction for every up-cast profile.** Reviewed a standalone script (glider profile
+CTD/oxygen post-processing: loads NC profiles, interpolates CTD + oxygen to common time
+grids, optimum-lag-corrects the oxygen phase signal between paired down/up casts via
+`AA_compute.m`, grids onto a pressure axis). The down/up pairing loop:
+```matlab
+for np = 1 : nI - 1
+    df = np;   uf = np + 1;
+    ...
+    I69A(df).OXCor(d1:d2)  = oxdups(seg_d1:seg_d2);
+    I69A(uf).OXCor(uout1:uout2) = oxdups(seg_u1:seg_u2);
+end
+```
+pairs *every* consecutive profile index — (1,2), (2,3), (3,4), (4,5), … — not just the true
+down+up pairs of a single dive cycle (1,2), (3,4), (5,6), … Since profiles alternate
+down-cast/up-cast, half of these pairings — (2,3), (4,5), … — span the end of one dive's climb
+and the start of the *next* dive's descent, which aren't part of the same physical cycle and
+have no meaningful time-lag relationship. Because each profile is written to twice (once as
+`uf` in iteration `np=k-1`, once as `df` in iteration `np=k`), and iterations run in order, the
+later write always wins: traced the overwrite pattern explicitly — every **down-cast (odd)**
+profile keeps its correct value (its `df`-role write always runs last), but every **up-cast
+(even)** profile's final saved `OXCor` comes from the bogus pairing with the *following* dive's
+down-cast, overwriting the correct value computed moments earlier from its true partner. This
+isn't inert metadata — `OXCor` is the actual corrected oxygen concentration that gets gridded
+into the final saved output (`OCm1`), so roughly half of all profiles (every up-cast) would
+carry oxygen values computed at the wrong lag.
+**Fix (for whenever this gets ported in):** step the pairing loop by 2 (`for np = 1:2:nI-1`)
+so each profile is only ever paired once, with its own true down/up partner — assuming
+down/up-cast alternation is confirmed to hold for the real profile-numbering scheme being used
+(that assumption itself wasn't verified against real data, since this script isn't in this
+repo yet).
+Also flagged, lower severity: `U(j).MOtime` is set from `U(j).time` (the CTD/science computer
+clock) with a commented-out line right above it showing the original intent —
+`U(j).Otime` (the optode's own `oxy4_timestamp`) — meaning the oxygen samples are currently
+time-aligned using the wrong clock; and the `* 10` pressure conversions
+(`pressure = [...] * 10`) assume the source pressure is `sci_water_pressure` in **bar** (this
+pipeline's RBR Legato³ CTD convention — see `CHANGES_FROM_RUTGERS.md`'s bar↔dbar discussion),
+which would be silently wrong if ever fed a Seabird-CTD deployment's `pressure` (already dbar).

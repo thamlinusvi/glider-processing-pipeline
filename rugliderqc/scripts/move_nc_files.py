@@ -65,6 +65,16 @@ def main(args):
             failed = []
             for f in ncfiles:
                 try:
+                    # Re-running QC on an already-processed deployment means a
+                    # same-named file can already exist in data_path from the
+                    # prior run -- shutil.move() refuses to overwrite in that
+                    # case (raises "Destination path ... already exists") since
+                    # data_path is a directory, not a full destination path.
+                    # Remove any existing destination first so re-runs replace
+                    # stale output instead of failing on every file.
+                    existing = os.path.join(data_path, os.path.basename(f))
+                    if os.path.exists(existing):
+                        os.remove(existing)
                     shutil.move(f, data_path)
                     moved += 1
                 except OSError as e:
