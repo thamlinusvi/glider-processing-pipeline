@@ -766,6 +766,85 @@ document the evidence trail if this needs re-evaluating.
 
 ---
 
+### 15. `rugliderqc/scripts/add_derived_variables.py` (additional fix — implicit dependency
+ordering)
+
+**Type:** Bug fix — silent failure risk if the derived-variable config is ever reordered
+
+**Root cause:**
+The single pass over `proc_vars.items()` (from `qc/config/sciencevar_processing.yml`) is not just
+an iteration order — it's an implicit dependency chain, confirmed against the real config file:
+
+```
+1. oxygen_concentration_shifted   -> oxygen_concentration_shifted_mgL   (DO -> mg/L, independent)
+2. sbe41n_ph_ref_voltage_shifted  -> pH                                 (needs a raw sensor var)
+3. pH                             -> total_alkalinity                   (needs entry 2's OUTPUT)
+4. total_alkalinity               -> aragonite_saturation_state         (needs entry 3's OUTPUT)
+```
+
+Entries 3 and 4 need a variable that only exists because an *earlier* entry in the same loop pass
+computed it and wrote it into `ds` a few lines below (`ds[vardict['nc_var_name']] = da`). This
+only produced correct output because the YAML happens to list all four entries in exact
+dependency order. Each precursor lookup was a bare `except KeyError: continue`, so reordering the
+YAML, or inserting a new derived variable above `pH`'s entry, would have silently broken the
+whole pH/TA/Omega chain with zero log output to explain why.
+
+**What changed:** replaced the single pass with a retry loop that keeps re-attempting only the
+still-unresolved entries across multiple passes, stopping when a full pass makes no further
+progress. Deliberately *not* just adding a log line to the existing `except KeyError`: that
+branch fires just as often for the correct, common case (a deployment with no pH sensor, so
+`sbe41n_ph_ref_voltage_shifted` never exists) as it would for the real bug (a precursor that
+exists but hasn't been computed *yet*) — logging every occurrence would drown the real signal in
+noise. A multi-pass retry is correct for either case without needing to tell them apart: if a
+full pass adds nothing new, every remaining entry's precursor is genuinely absent, not just
+not-computed-yet.
+
+```python
+# ORIGINAL
+for variable_name, vardict in proc_vars.items():
+    # check if the variable required for additional processing is in the file
+    try:
+        ds[variable_name]
+    except KeyError:
+        continue
+    # ... calculate, add to ds, run QC ...
+```
+
+```python
+# PIPELINE
+remaining_vars = dict(proc_vars)
+made_progress = True
+while remaining_vars and made_progress:
+    made_progress = False
+    still_remaining = {}
+    for variable_name, vardict in remaining_vars.items():
+        try:
+            ds[variable_name]
+        except KeyError:
+            still_remaining[variable_name] = vardict
+            continue
+        made_progress = True
+        # ... calculate, add to ds, run QC (unchanged) ...
+    remaining_vars = still_remaining
+```
+
+**Verified three ways** with an isolated reproduction of the exact algorithm (`ioos_qc` isn't
+available on the host Python environment, so the real script can't be run directly outside
+Docker):
+1. A deliberately reordered `proc_vars` (TA and Omega entries placed *before* the pH entry, the
+   worst case this fix targets) resolves all four variables correctly across multiple passes —
+   proves the fix genuinely fixes the ordering dependency, not just theoretically.
+2. A genuinely missing precursor (no pH sensor — `sbe41n_ph_ref_voltage_shifted` absent from
+   `ds`) terminates cleanly after exactly one pass, correctly leaving the entire downstream
+   pH/TA/Omega chain unresolved — no infinite loop, no fabricated output.
+3. The current, already-correctly-ordered real config produces an identical resolution order to
+   the original single-pass behavior — confirmed no regression for the working case.
+
+**To revert:** replace the `while`/retry block with the original single
+`for variable_name, vardict in proc_vars.items():` pass shown above.
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |

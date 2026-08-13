@@ -344,70 +344,89 @@ def main(args):
 
                 original_vars = list(ds.data_vars)
 
-                for variable_name, vardict in proc_vars.items():
-                    # check if the variable required for additional processing is in the file
-                    try:
-                        ds[variable_name]
-                    except KeyError:
-                        continue
-
-                    # evaluate the function specified in the config file
-                    try:
-                        data_calculated = eval(vardict['calculation'])(ds, variable_name, logging)
-                    except TypeError:
-                        # calculating TA (need the config file)
-                        # Returns TA and the equations used to calculate TA (for metadata)
-                        data_calculated, attr_coeffs = eval(vardict['calculation'])(ds, variable_name, logging, qc_config_derived)
-
-                    if isinstance(data_calculated, np.ndarray):
-                        # grab the attributes from the source variable (if use_sourcevar_attrs=True in the config file)
-                        # update with any additional attributes from the config file
-                        if vardict['use_sourcevar_attrs']:
-                            attrs = ds[variable_name].attrs.copy()
-                        else:
-                            attrs = dict()
-                        attrs.update(vardict['attrs'])
-
-                        # for TA, add the equation coefficients to attributes
+                # proc_vars.items() isn't just an iteration order -- it's an implicit dependency
+                # chain (DO->mg/L, pH voltage->pH, pH->TA, TA->Omega), since a later entry's
+                # precursor variable may be an earlier entry's *output*, only added to ds a few
+                # lines below. A single pass only ever produces the right result because
+                # sciencevar_processing.yml happens to list entries in dependency order; reordering
+                # it or inserting a new derived variable above an existing one would silently break
+                # the chain (see KNOWN_ISSUES.md / CHANGES_FROM_RUTGERS.md). Retry unresolved
+                # entries in additional passes instead, so this works for any config ordering: a
+                # pass that adds nothing new means every remaining entry's precursor is genuinely
+                # missing (e.g. no pH sensor on this deployment), not just "not computed yet".
+                remaining_vars = dict(proc_vars)
+                made_progress = True
+                while remaining_vars and made_progress:
+                    made_progress = False
+                    still_remaining = {}
+                    for variable_name, vardict in remaining_vars.items():
+                        # check if the variable required for additional processing is in the file
                         try:
-                            attrs['comment'] = attrs['comment'].replace('-insert_coefficients-', str(attr_coeffs))
-                            del attr_coeffs
-                        except NameError:
-                            print(f'no calculation coefficients to add to this variable attrs: {vardict["nc_var_name"]}')
-
-                        da = xr.DataArray(data_calculated, coords=ds[variable_name].coords, dims=ds[variable_name].dims,
-                                          name=vardict['nc_var_name'], attrs=attrs)
-
-                        # use the encoding from the original data variable
-                        cf.set_encoding(da, original_encoding=ds[variable_name].encoding)
-
-                        ds[vardict['nc_var_name']] = da
-
-                        file_modified += 1
-
-                        # run QC if specified in the sciencevar_processing.yml config file
-                        try:
-                            qc_config_file_list = vardict['runqc']
-                            for qcf in qc_config_file_list:
-                                # QC configuration filename
-                                qc_config_file = os.path.join(qc_config_derived, qcf)
-
-                                if not os.path.isfile(qc_config_file):
-                                    logging.error('Invalid QC config file: {:s}.'.format(qc_config_file))
-                                    status = 1
-                                    continue
-
-                                if 'gross_flatline' in qcf:
-                                    # run IOOS QC gross range/flatline tests according to the specs in the config file
-                                    # this adds the QC variables to the dataset
-                                    cf.run_ioos_qc_gross_flatline(ds, qc_config_file)
-                                elif 'spike' in qcf:
-                                    # run IOOS QC spike test according to the specs in the config file
-                                    # this adds the QC variables to the dataset
-                                    cf.run_ioos_qc_spike(ds, qc_config_file)
-
+                            ds[variable_name]
                         except KeyError:
+                            still_remaining[variable_name] = vardict
                             continue
+                        made_progress = True
+
+                        # evaluate the function specified in the config file
+                        try:
+                            data_calculated = eval(vardict['calculation'])(ds, variable_name, logging)
+                        except TypeError:
+                            # calculating TA (need the config file)
+                            # Returns TA and the equations used to calculate TA (for metadata)
+                            data_calculated, attr_coeffs = eval(vardict['calculation'])(ds, variable_name, logging, qc_config_derived)
+
+                        if isinstance(data_calculated, np.ndarray):
+                            # grab the attributes from the source variable (if use_sourcevar_attrs=True in the config file)
+                            # update with any additional attributes from the config file
+                            if vardict['use_sourcevar_attrs']:
+                                attrs = ds[variable_name].attrs.copy()
+                            else:
+                                attrs = dict()
+                            attrs.update(vardict['attrs'])
+
+                            # for TA, add the equation coefficients to attributes
+                            try:
+                                attrs['comment'] = attrs['comment'].replace('-insert_coefficients-', str(attr_coeffs))
+                                del attr_coeffs
+                            except NameError:
+                                print(f'no calculation coefficients to add to this variable attrs: {vardict["nc_var_name"]}')
+
+                            da = xr.DataArray(data_calculated, coords=ds[variable_name].coords, dims=ds[variable_name].dims,
+                                              name=vardict['nc_var_name'], attrs=attrs)
+
+                            # use the encoding from the original data variable
+                            cf.set_encoding(da, original_encoding=ds[variable_name].encoding)
+
+                            ds[vardict['nc_var_name']] = da
+
+                            file_modified += 1
+
+                            # run QC if specified in the sciencevar_processing.yml config file
+                            try:
+                                qc_config_file_list = vardict['runqc']
+                                for qcf in qc_config_file_list:
+                                    # QC configuration filename
+                                    qc_config_file = os.path.join(qc_config_derived, qcf)
+
+                                    if not os.path.isfile(qc_config_file):
+                                        logging.error('Invalid QC config file: {:s}.'.format(qc_config_file))
+                                        status = 1
+                                        continue
+
+                                    if 'gross_flatline' in qcf:
+                                        # run IOOS QC gross range/flatline tests according to the specs in the config file
+                                        # this adds the QC variables to the dataset
+                                        cf.run_ioos_qc_gross_flatline(ds, qc_config_file)
+                                    elif 'spike' in qcf:
+                                        # run IOOS QC spike test according to the specs in the config file
+                                        # this adds the QC variables to the dataset
+                                        cf.run_ioos_qc_spike(ds, qc_config_file)
+
+                            except KeyError:
+                                continue
+
+                    remaining_vars = still_remaining
 
                 new_vars = list(set(list(ds.data_vars)) - set(original_vars))
                 if len(new_vars) > 0:

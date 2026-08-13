@@ -311,13 +311,31 @@ verification writeup are in `CHANGES_FROM_RUTGERS.md` §14.
   path** — only the error branches (`OSError`/`IndexError`) call `.close()`. Given the
   documented HDF5-segfault-risk-with->1-reader concern elsewhere in this repo, accumulating
   unclosed handles across a long QC run is a minor pre-existing risk.
-- **The derived-variable dependency cascade (DO→mg/L, pH voltage→pH, pH→TA, TA→Omega) is
-  implicit and unenforced.** `add_derived_variables.py`'s single loop
-  (`for variable_name, vardict in proc_vars.items():`, line 329) only works because
-  `qc/config/sciencevar_processing.yml`'s keys happen to be in dependency order, and each step's
-  precursor lookup is wrapped in a bare `except KeyError: continue` (lines 331-334) with **no
-  log entry at all**. Reordering YAML entries or inserting a new derived variable above this
-  block would silently break the whole pH/TA/Omega chain with no error to indicate why.
+**Fixed (2026-08-13): the derived-variable dependency cascade (DO→mg/L, pH voltage→pH, pH→TA,
+TA→Omega) was implicit and unenforced.** `add_derived_variables.py`'s single pass
+(`for variable_name, vardict in proc_vars.items():`) only worked because
+`qc/config/sciencevar_processing.yml`'s 4 entries happen to be listed in exact dependency order —
+confirmed via the real config: entry 2 (`sbe41n_ph_ref_voltage_shifted` → `pH`) must run before
+entry 3 (`pH` → `total_alkalinity`) can find its precursor, which must run before entry 4
+(`total_alkalinity` → `aragonite_saturation_state`) can find *its* precursor — each precursor
+lookup wrapped in a bare `except KeyError: continue` with no log entry. Reordering the YAML or
+inserting a new derived variable above an existing entry would have silently broken the whole
+pH/TA/Omega chain with no error to indicate why. Deliberately not just a log-line fix: a
+`KeyError` here is ambiguous between "genuinely missing precursor" (e.g. no pH sensor on this
+deployment — correct, expected, should stay silent) and "precursor exists but hasn't been
+computed yet due to ordering" (a real bug) — logging every KeyError would drown the common,
+correct case in noise while trying to catch the rare one. **Fix:** replaced the single pass with
+a retry loop that keeps re-attempting only the still-unresolved entries across multiple passes
+until a full pass makes no further progress — correct for any config ordering, since a pass that
+adds nothing new means every remaining entry's precursor is genuinely absent, not just
+not-computed-yet. Verified three ways with an isolated reproduction of the exact algorithm
+(`ioos_qc` isn't available on the host to run the real script directly): (1) a deliberately
+reordered config (TA/Omega entries placed *before* the pH entry) resolves every variable
+correctly across passes, proving the fix actually fixes the ordering dependency; (2) a genuinely
+missing precursor (no pH sensor) terminates cleanly after 1 pass with the pH/TA/Omega chain
+correctly left unresolved — no infinite loop, no fabricated output; (3) the current,
+already-correctly-ordered config produces an identical resolution order to the original
+single-pass behavior — no regression.
 - **Docker-baked QC config copies under `rugliderqc/qc/config/` have materially diverged from
   the live `qc/config/` copies and are dead weight, but a documentation trap.**
   `rugliderqc/qc/config/global_regional/usvi_configs.yml` and `regional_boundaries.yml` differ
