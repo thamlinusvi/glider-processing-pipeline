@@ -3465,7 +3465,7 @@ async function renderRawTab (dep, container) {
 }
 
 
-async function renderDatTab (dep, container) {
+async function renderDatTab (dep, container, initialSub) {
   container.innerHTML = ''
 
   let data
@@ -3473,7 +3473,7 @@ async function renderDatTab (dep, container) {
   catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load DAT files: ' + e.message)); return }
 
   // Sub-tabs: merged_data and flight_data
-  let activeSub = 'merged_data'
+  let activeSub = initialSub || 'merged_data'
   const subBody = h('div', { class: 'dat-sub-body' })
 
   function setSubTab (key) {
@@ -3484,9 +3484,9 @@ async function renderDatTab (dep, container) {
   }
 
   const subBar = h('div', { class: 'dat-sub-bar' },
-    h('button', { class: 'dat-sub-tab active', 'data-sub': 'merged_data', onclick: () => setSubTab('merged_data') },
+    h('button', { class: `dat-sub-tab${activeSub === 'merged_data' ? ' active' : ''}`, 'data-sub': 'merged_data', onclick: () => setSubTab('merged_data') },
       `merged_data (${data.merged_data.files.length})`),
-    h('button', { class: 'dat-sub-tab', 'data-sub': 'flight_data', onclick: () => setSubTab('flight_data') },
+    h('button', { class: `dat-sub-tab${activeSub === 'flight_data' ? ' active' : ''}`, 'data-sub': 'flight_data', onclick: () => setSubTab('flight_data') },
       `flight_data (${data.flight_data.files.length})`),
   )
 
@@ -3497,21 +3497,96 @@ async function renderDatTab (dep, container) {
       subBody.appendChild(h('div', { class: 'empty-state' }, `No DAT files in:\n${dir}`))
       return
     }
+
+    const checkedNames = new Set()
+    let lastClickedIdx = -1
+    const rowCbs = []
+
+    async function deleteNames (names) {
+      const results = await Promise.allSettled(names.map(name =>
+        apiFetch(`/api/deployment/${encodeURIComponent(dep)}/dat-files/${encodeURIComponent(subdir)}/${encodeURIComponent(name)}`,
+          { method: 'DELETE' })
+      ))
+      const failed = results.filter(r => r.status === 'rejected').length
+      if (failed) alert(`${failed} of ${names.length} file${names.length === 1 ? '' : 's'} failed to delete.`)
+      renderDatTab(dep, container, subdir)
+    }
+
+    // ── Selection bar: select-all + delete-selected (mirrors the cloud file list) ──
+    const headerCb = h('input', { type: 'checkbox', class: 'dat-header-cb',
+      title: 'Select / deselect all' })
+    const deleteSelBtn = h('button', { class: 'btn-danger btn-sm', style: 'display:none' })
+
+    function updateSelBar () {
+      const n = checkedNames.size
+      deleteSelBtn.style.display = n ? '' : 'none'
+      deleteSelBtn.textContent   = `✕ Delete ${n} Selected`
+      headerCb.checked       = n === files.length && files.length > 0
+      headerCb.indeterminate = n > 0 && n < files.length
+    }
+
+    headerCb.addEventListener('click', () => {
+      const allSel = checkedNames.size === files.length
+      if (allSel) checkedNames.clear()
+      else files.forEach(f => checkedNames.add(f.name))
+      rowCbs.forEach((cb, i) => { cb.checked = checkedNames.has(files[i].name) })
+      updateSelBar()
+    })
+
+    deleteSelBtn.addEventListener('click', () => {
+      const names = Array.from(checkedNames)
+      if (!names.length) return
+      if (!confirm(`Delete ${names.length} selected DAT file${names.length === 1 ? '' : 's'}?`)) return
+      deleteSelBtn.disabled = true
+      deleteSelBtn.textContent = 'Deleting…'
+      deleteNames(names)
+    })
+
+    subBody.appendChild(h('div', { class: 'dat-sel-bar' },
+      headerCb, h('span', { class: 'dat-sel-label' }, 'Select all'), deleteSelBtn))
+
     const fileList = h('div', { class: 'dat-file-list' })
     const preview  = h('div', { class: 'dat-preview' }, 'Select a file to preview its header.')
     subBody.appendChild(h('div', { class: 'dat-layout' }, fileList, preview))
-    files.forEach(f => {
+
+    files.forEach((f, idx) => {
+      const cb = h('input', { type: 'checkbox' })
+      cb.checked = checkedNames.has(f.name)
+      rowCbs.push(cb)
+      cb.addEventListener('click', e => {
+        e.stopPropagation()
+        const nowChecked = !checkedNames.has(f.name)
+        if (e.shiftKey && lastClickedIdx >= 0 && lastClickedIdx !== idx) {
+          const lo = Math.min(lastClickedIdx, idx)
+          const hi = Math.max(lastClickedIdx, idx)
+          for (let i = lo; i <= hi; i++) {
+            if (nowChecked) checkedNames.add(files[i].name)
+            else            checkedNames.delete(files[i].name)
+            rowCbs[i].checked = nowChecked
+          }
+        } else {
+          if (nowChecked) checkedNames.add(f.name)
+          else            checkedNames.delete(f.name)
+          cb.checked = nowChecked
+        }
+        lastClickedIdx = idx
+        updateSelBar()
+      })
+
       const item = h('div', { class: 'dat-file-item' },
-        h('span', { class: 'dat-file-name' }, f.name),
+        cb,
+        h('span', { class: 'dat-file-name', title: f.name }, f.name),
         h('span', { class: 'dat-file-size' }, _fmtBytes(f.size)))
       item.addEventListener('click', () => previewDat(dir, f.name, item, fileList, preview))
       fileList.appendChild(item)
     })
+
+    updateSelBar()
   }
 
   container.appendChild(subBar)
   container.appendChild(subBody)
-  setSubTab('merged_data')
+  setSubTab(activeSub)
 }
 
 
@@ -3528,6 +3603,121 @@ async function previewDat (dir, name, item, fileList, preview) {
   } catch (e) {
     preview.textContent = 'Error loading file: ' + e.message
   }
+}
+
+
+/* ── QC Config editor ───────────────────────────────────────────────────────
+   Two independent panels, both YAML, both raw-text edit (never round-tripped
+   through a YAML parser on save, so comments survive):
+     - This Deployment: deployments/<year>/<dep>/config/qc/ -- what every
+       Stage 8 rugliderqc script actually reads at runtime.
+     - Regional QC Configs: qc/config/global_regional/ at the repo root --
+       what glider_qartod_qc.py's regional streams tests actually read. NOT
+       the stale, diverged copy vendored inside rugliderqc/qc/config/global_regional/,
+       which nothing in the pipeline reads.
+*/
+async function renderQcConfig () {
+  const dep  = state.deployment
+  const page = document.getElementById('page-qc-config')
+  page.innerHTML = ''
+
+  page.appendChild(h('div', { class: 'page-header' },
+    h('h1', {}, 'QC Config'),
+    h('p',  {}, 'View and edit the YAML files that control QARTOD QC thresholds.')))
+
+  const body = h('div', { class: 'page-body' })
+  page.appendChild(body)
+
+  const depSection = h('div', { class: 'qc-config-section' },
+    h('h2', {}, 'This Deployment'))
+  body.appendChild(depSection)
+  if (!dep) {
+    depSection.appendChild(h('div', { class: 'empty-state' }, 'Select a deployment.'))
+  } else {
+    depSection.appendChild(h('p', { class: 'qc-config-hint' },
+      `deployments/…/${dep}/config/qc/ — read directly by every Stage 8 QC script.`))
+    await buildQcConfigPanel(depSection,
+      `/api/deployment/${encodeURIComponent(dep)}/qc-config`,
+      `/api/deployment/${encodeURIComponent(dep)}/qc-config/save`)
+  }
+
+  const regionalSection = h('div', { class: 'qc-config-section' },
+    h('h2', {}, 'Regional QC Configs'),
+    h('p', { class: 'qc-config-hint' },
+      'qc/config/global_regional/ — region-matched bounds applied by glider_qartod_qc.py, shared across all deployments.'))
+  body.appendChild(regionalSection)
+  await buildQcConfigPanel(regionalSection, '/api/qc-config-regional', '/api/qc-config-regional/save')
+}
+
+async function buildQcConfigPanel (container, getUrl, saveUrl) {
+  let data
+  try { data = await apiFetch(getUrl) }
+  catch (e) { container.appendChild(h('div', { class: 'empty-state' }, 'Could not load QC config: ' + e.message)); return }
+
+  const entries = Object.entries(data.files || {})
+  if (!entries.length) {
+    container.appendChild(h('div', { class: 'empty-state' }, `No .yml files in:\n${data.config_dir}`))
+    return
+  }
+
+  const fileList = h('div', { class: 'dat-file-list' })
+  const content  = h('div', { class: 'dat-preview qc-config-content' }, 'Select a file to view it.')
+  container.appendChild(h('div', { class: 'dat-layout qc-config-layout' }, fileList, content))
+
+  function showView (rel, text, item) {
+    fileList.querySelectorAll('.dat-file-item').forEach(el => el.classList.remove('active'))
+    item.classList.add('active')
+    content.innerHTML = ''
+    content.appendChild(h('div', { class: 'btn-row', style: 'margin-bottom:8px' },
+      h('button', { class: 'btn-primary btn-sm', onclick: () => showEdit(rel, text, item) }, 'Edit')))
+    content.appendChild(h('pre', { class: 'qc-config-pre' }, text ?? '(could not read file)'))
+  }
+
+  function showEdit (rel, originalText, item) {
+    content.innerHTML = ''
+    const textarea = h('textarea', { class: 'meta-editor qc-config-editor', spellcheck: 'false' })
+    textarea.value = originalText
+    const statusMsg = h('div', { class: 'meta-editor-status' })
+
+    const saveBtn = h('button', { class: 'btn-success', onclick: async () => {
+      const raw = textarea.value
+      saveBtn.disabled = true
+      saveBtn.textContent = 'Saving…'
+      statusMsg.textContent = ''
+      try {
+        await apiFetch(saveUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: rel, content: raw }),
+        })
+        // Full refresh from the server instead of a local-only update -- see
+        // the metadata editor's identical fix for why (stale file-list snapshots).
+        container.innerHTML = ''
+        await buildQcConfigPanel(container, getUrl, saveUrl)
+      } catch (e) {
+        statusMsg.textContent = e.message
+        statusMsg.style.color = '#e74c3c'
+        saveBtn.disabled = false
+        saveBtn.textContent = 'Save'
+      }
+    }}, 'Save')
+
+    const cancelBtn = h('button', { class: 'btn-secondary', onclick: () => showView(rel, originalText, item) }, 'Cancel')
+
+    content.appendChild(h('div', { class: 'btn-row', style: 'margin-bottom:8px' }, saveBtn, cancelBtn))
+    content.appendChild(textarea)
+    content.appendChild(statusMsg)
+    textarea.focus()
+  }
+
+  let firstItem = null
+  entries.forEach(([rel, text]) => {
+    const item = h('div', { class: 'dat-file-item' }, h('span', { class: 'dat-file-name', title: rel }, rel))
+    item.addEventListener('click', () => showView(rel, text, item))
+    fileList.appendChild(item)
+    if (!firstItem) firstItem = item
+  })
+  if (firstItem) firstItem.click()
 }
 
 
@@ -5825,6 +6015,7 @@ const pageRenderers = {
   logs:          renderLogs,
   reports:       renderReports,
   metadata:      renderMetadata,
+  'qc-config':   renderQcConfig,
   'dat-browser': renderDatBrowser,
   cloud:         renderCloud,
   adcp:          renderAdcp,

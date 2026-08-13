@@ -1795,10 +1795,29 @@ button {
 .cac-upload-status.success   { background: #f0fdf4; border: 1px solid #86efac; color: #166534; }
 .cac-upload-status.error     { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
 
+/* DAT file selection bar (select-all + delete-selected) */
+.dat-sel-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: #eef2f7;
+  border-bottom: 1px solid #c2ccd8;
+  flex-shrink: 0;
+}
+.dat-header-cb {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  cursor: pointer;
+  accent-color: #4a7fa5;
+}
+.dat-sel-label { font-size: 12px; color: #5a6c80; margin-right: auto; }
+
 /* DAT layout (shared by sub-tabs) */
 .dat-layout {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: 340px 1fr;
   gap: 0;
   flex: 1;
   overflow: hidden;
@@ -1825,9 +1844,13 @@ button {
   color: #3d5166;
   font-family: 'Consolas', monospace;
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .dat-file-item.active .dat-file-name { color: #1a5276; font-weight: 600; }
-.dat-file-size { font-size: 11px; color: #9aabbf; }
+.dat-file-size { font-size: 11px; color: #9aabbf; flex-shrink: 0; }
 .dat-preview {
   overflow: auto;
   padding: 16px 20px;
@@ -1837,6 +1860,25 @@ button {
   color: #3d5166;
   white-space: pre;
 }
+
+/* ── QC Config editor ──────────────────────────────────────────────────────── */
+.qc-config-section { margin-bottom: 28px; }
+.qc-config-section h2 { font-size: 15px; font-weight: 700; color: #1a2535; margin-bottom: 4px; }
+.qc-config-hint {
+  font-size: 11px;
+  color: #7a8a9a;
+  margin-bottom: 10px;
+  font-family: 'Consolas', monospace;
+}
+.qc-config-layout {
+  height: 420px;
+  border: 1px solid #c2ccd8;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.qc-config-content { height: 100%; box-sizing: border-box; }
+.qc-config-pre { margin: 0; }
+.qc-config-editor { width: 100%; min-height: 340px; }
 
 /* ── Scrollbar ──────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar { width: 7px; height: 7px; }

@@ -13,6 +13,7 @@ import os
 import json
 import glob
 import re
+import yaml
 import shutil
 import io
 import subprocess
@@ -991,6 +992,22 @@ def dat_files(dep):
     return jsonify(result)
 
 
+@app.route('/api/deployment/<dep>/dat-files/<subdir>/<filename>', methods=['DELETE'])
+def delete_dat_file(dep, subdir, filename):
+    """Delete a single DAT file from dat_files/<dep>/<merged_data|flight_data>/."""
+    if subdir not in ('merged_data', 'flight_data'):
+        return jsonify({'error': 'Invalid subdir'}), 400
+    if os.sep in filename or '/' in filename or '..' in filename:
+        return jsonify({'error': 'Invalid filename'}), 400
+    if not filename.lower().endswith('.dat'):
+        return jsonify({'error': 'Not a DAT file'}), 400
+    fpath = os.path.join(BASE_DIR, 'dat_files', dep, subdir, filename)
+    if not os.path.isfile(fpath):
+        return jsonify({'error': 'File not found'}), 404
+    os.remove(fpath)
+    return jsonify({'ok': True})
+
+
 @app.route('/api/deployment/<dep>/dat-count')
 def dat_count(dep):
     base = os.path.join(BASE_DIR, 'dat_files', dep)
@@ -1186,6 +1203,88 @@ def delete_metadata(dep):
         return jsonify({'error': 'File not found'}), 404
 
     os.remove(full_path)
+    return jsonify({'ok': True})
+
+
+# ── QC config editor (deployment_qc_config_root + global_regional) ────────────
+# deployment_qc_config_root is what every Stage 8 rugliderqc script actually
+# reads at runtime (qctests.yml/time_shift.yml/ctd_hysteresis.yml/manual_flag.yml
+# -- see rugliderqc/scripts/*.py's `deployment_qc_config_root = os.path.join(
+# deployment_location, 'config', 'qc')`). qc/config/global_regional/ at the repo
+# root is likewise what glider_qartod_qc.py's regional streams tests actually
+# read (`qc_config_root = os.path.join(data_home, 'qc', 'config')`, data_home =
+# GLIDER_DATA_HOME = /home/glider = the Docker bind-mount of this repo root) --
+# NOT the stale, diverged copy vendored inside rugliderqc/qc/config/global_regional/,
+# which nothing in the pipeline ever reads.
+
+def _yaml_files(config_dir):
+    files = {}
+    if os.path.isdir(config_dir):
+        for f in sorted(glob.glob(os.path.join(config_dir, '*.yml'))):
+            rel = os.path.basename(f)
+            try:
+                with open(f, encoding='utf-8-sig') as fp:
+                    files[rel] = fp.read()
+            except Exception:
+                files[rel] = None
+    return files
+
+
+def _save_yaml_file(config_dir, rel_path, content):
+    """Returns (ok, error_response_tuple_or_None)."""
+    if os.sep in rel_path or '/' in rel_path or '..' in rel_path:
+        return False, (jsonify({'error': 'Invalid filename'}), 400)
+    if not rel_path.endswith('.yml'):
+        return False, (jsonify({'error': 'Only .yml files allowed'}), 400)
+    try:
+        yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        return False, (jsonify({'error': f'Invalid YAML: {e}'}), 400)
+
+    config_dir = os.path.realpath(config_dir)
+    full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
+    if not _is_within(full_path, config_dir):
+        return False, (jsonify({'error': 'Invalid path'}), 403)
+
+    os.makedirs(config_dir, exist_ok=True)
+    with open(full_path, 'w', encoding='utf-8') as fp:
+        fp.write(content)
+    return True, None
+
+
+@app.route('/api/deployment/<dep>/qc-config')
+def qc_config(dep):
+    config_dir = os.path.join(_dep_dir(dep), 'config', 'qc')
+    return jsonify({'files': _yaml_files(config_dir), 'config_dir': config_dir})
+
+
+@app.route('/api/deployment/<dep>/qc-config/save', methods=['POST'])
+def save_qc_config(dep):
+    data      = request.json or {}
+    rel_path  = data.get('path', '')
+    content   = data.get('content', '')
+    config_dir = os.path.join(_dep_dir(dep), 'config', 'qc')
+    ok, err = _save_yaml_file(config_dir, rel_path, content)
+    if not ok:
+        return err
+    return jsonify({'ok': True})
+
+
+@app.route('/api/qc-config-regional')
+def qc_config_regional():
+    config_dir = os.path.join(BASE_DIR, 'qc', 'config', 'global_regional')
+    return jsonify({'files': _yaml_files(config_dir), 'config_dir': config_dir})
+
+
+@app.route('/api/qc-config-regional/save', methods=['POST'])
+def save_qc_config_regional():
+    data      = request.json or {}
+    rel_path  = data.get('path', '')
+    content   = data.get('content', '')
+    config_dir = os.path.join(BASE_DIR, 'qc', 'config', 'global_regional')
+    ok, err = _save_yaml_file(config_dir, rel_path, content)
+    if not ok:
+        return err
     return jsonify({'ok': True})
 
 
@@ -2742,7 +2841,12 @@ def adcp_report_html():
                     run_dirs[entry] = sub
 
     if not run_dirs:
-        return jsonify({'error': 'No runs found'}), 404
+        html = ('<html><body style="font-family:sans-serif;padding:40px">'
+                '<h2>No AD2CP data available</h2>'
+                '<p>No AD2CP runs were found for this deployment. Run the AD2CP stages first, '
+                'then try again.</p>'
+                '</body></html>')
+        return Response(html, mimetype='text/html'), 404
 
     # Serve cached HTML if it exists and is newer than every file in the run dir(s)
     fname     = f'adcp_report_{dep}{"_"+run if run else ""}.html'
