@@ -255,15 +255,51 @@ way the items above were checked.
 
 ## Other rugliderqc QC-script issues
 
-- **`ctd_hysteresis_test.py`/`time_shift.py` minimum-profile-span pre-checks use unconverted
-  bar-unit literals as if they were dbar.** `pressure_diff < 5` (hysteresis, ~lines 271-272) and
-  `calculate_pressure_range(...) < 3` (time_shift, ~lines 370,417) are meant to gate on ~5m/~3m
-  of profile depth change (dbar≈1m), but now run against bar-unit `sci_water_pressure`, silently
-  raising the effective gate to ~51m/~30m before either test runs at all. Verified this mostly
-  doesn't matter for deep missions (808/816 profiles in `uvi_02-20260429T1420` still clear the
-  inflated threshold) — it would matter most for shallow/nearshore missions. The downstream
-  FAIL/SUSPECT decision itself (`area = valid_polygons.area / pressure_range`) is scale-invariant
-  and NOT affected — only the pre-check gate is.
+**Fixed (2026-08-13): `ctd_hysteresis_test.py`'s minimum-profile-span pre-check used an
+unconverted bar-unit literal as if it were dbar.** Two identical gates (lines ~271-272 and
+~340-346, one per profile in the down/up pair): `pressure_diff < 5` was meant to gate on ~5 dbar
+(~5m) of profile depth change before bothering to run the test, but for this fleet's RBR CTDs
+the source is `sci_water_pressure` in **bar**, not dbar — silently raising the effective gate to
+~5 bar (~50 dbar, ~50m). Confirmed the root cause via `CHANGES_FROM_RUTGERS.md`'s own background
+section: Seabird CTDs (upstream's original target) emit a raw glider variable literally named
+`pressure`, already in dbar; RBR Legato³ CTDs (this fleet) emit `sci_water_pressure`, in bar —
+this is a hardware/firmware fact, not a pipeline config choice, so which variable is present
+tells you which CTD was actually flown. Verified real impact on `uvi_01-20241026T1158` (625
+profiles): 3 were left NOT_EVALUATED by the old gate, 2 of which had a real span between 5-50
+dbar and should have been tested — only 1 was genuinely too short either way. Real but modest
+impact for this fleet's mostly-deep missions; would matter more for shallow/nearshore ones.
+**Fix:** convert `pressure_diff`/`pressure_diff2` to dbar (`× 10`) when the selected pressure
+variable is `sci_water_pressure`, before comparing against the literal `5` — mirrors the same
+`if pressure_var == 'sci_water_pressure': ... * 10` pattern already used in
+`add_derived_variables.py`'s `calculate_ph()`/`calculate_omega()` fix. Automatically correct for
+a hypothetical future Seabird-equipped glider too, since `pressure` (dbar) and `sci_water_pressure`
+(bar) are mutually exclusive in real data — whichever is present is left correctly unscaled or
+scaled, respectively, with no user/config change needed either way. Verified against real data:
+re-checked the gate with the fix applied — skips drop from 3 to 1 (only the genuinely-too-short
+profile), and since this only loosens the gate, the 622 profiles that already passed the old
+(stricter) gate are unaffected by construction.
+
+**Fixed (2026-08-13): `time_shift.py` had the identical unconverted-bar-literal bug — and unlike
+`ctd_hysteresis_test.py`, it also degraded the actual computed optimal-shift value, not just a
+pre-check gate.** `calculate_pressure_range(...) < 3` (~lines 370,417) is meant to gate on ~3 dbar
+(~3m); for this fleet's bar-unit `sci_water_pressure`, that silently became a ~30 dbar (~30m)
+gate — same root cause as the `ctd_hysteresis_test.py` fix above. But `pressure_bins(df,
+interval=0.25)` (line 128) — used to bin the pressure axis before computing the area-between-curves
+that the lag search minimizes over — was *also* affected: its `0.25` (meant as 0.25 dbar, ~25cm
+resolution) became ~2.5 dbar (~2.5m), a 10x coarser search resolution. This one changes an actual
+saved scientific value (the optimal time-shift applied to correct oxygen/pH sensor lag), not just
+whether a profile gets evaluated, so it got a higher bar of verification before fixing: confirmed
+the bar/dbar premise two independent ways (NC attrs say `units: bar`; cross-checked against the
+independently-computed `depth` variable, ratio ≈9.93 ≈ expected ~10), confirmed via the original
+pre-patch code on record in `CHANGES_FROM_RUTGERS.md` §3 that `0.25`/`3` are verbatim
+Seabird-dbar-authored literals never touched by the RBR patch, and empirically reproduced the real
+area-minimization search against 6 real down/up cast pairs from `uvi_01-20241026T1158` outside the
+pipeline — 2 of 6 got a different optimal shift under correct dbar-scaled binning (39s→41s,
+40s→41s). **Fix:** convert `press_da` to dbar once, at its single source of creation
+(`× 10` when `pressure_varname == 'sci_water_pressure'`), so both the gates and the binning
+interval are correct with no further changes needed. Verified the real fixed code path reproduces
+the corrected 41s result for both pairs that differed. Full before/after code and the complete
+verification writeup are in `CHANGES_FROM_RUTGERS.md` §14.
 - **`data_gap_check.py` is hardcoded to Rutgers' own ERDDAP and is silently dead for every UVI
   deployment.** `elink = f'http://slocum-data.marine.rutgers.edu/erddap/tabledap/{deployment}
   -profile-sci-rt'` (~line 19) will never resolve for a `uvi_*` deployment name — the script's

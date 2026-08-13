@@ -696,6 +696,76 @@ the pH regional-QC fix (§12) and the full Stage 8 chain are both unaffected.
 
 ---
 
+### 14. `rugliderqc/scripts/time_shift.py` (additional fix — bar/dbar unit conversion)
+
+**Type:** Bug fix — unconverted bar-unit pressure silently distorted both the minimum-profile-span
+pre-check gates and the optimal-shift computation itself for RBR deployments.
+
+**Root cause:**
+`identify_nans()`'s pressure-variable detection (§3) supports both `pressure` (Seabird, dbar) and
+`sci_water_pressure` (RBR, bar), but only fixed the *variable name lookup* — the actual VALUES
+were passed through unconverted under a generic `pressure` label
+(`press_da = ds[pressure_varname].copy(); press_da.name = 'pressure'`). Confirmed via the
+original pre-patch code shown in §3 (`dataset.pressure.values`, `ds.pressure.to_dataframe()`,
+etc. — accessed unconditionally, with no unit handling anywhere) that every downstream consumer
+of this value — `calculate_pressure_range()`'s two `< 3` (dbar) minimum-span gates (lines ~370,
+417) and `pressure_bins(df, interval=0.25)`'s bin width (line 128, meant as 0.25 dbar) — was
+written and validated exclusively against genuine Seabird dbar data, and never touched when RBR
+support was added. For this fleet's `sci_water_pressure` (bar), both effects compound: the ~3
+dbar gate silently becomes a ~30 dbar gate, and the 0.25 dbar bin width silently becomes a ~2.5
+dbar bin width — an order of magnitude coarser than intended, degrading the resolution of the
+curve-matching search that the optimal-shift value is computed from.
+
+**Verification before fixing, since this affects an actual computed scientific value, not just a
+skip/proceed gate:**
+1. Confirmed the bar/dbar premise two independent ways on real data
+   (`uvi_01-20241026T1158`): `sci_water_pressure`'s own NC attrs declare `units: bar`; cross-checked
+   against the independently-computed `depth` variable (meters) — for a profile with max
+   `sci_water_pressure` = 20.5657, max `depth` = 204.32 m, ratio = 9.93 (expected ~10, since
+   1 bar ≈ 10 dbar ≈ 10 m). Not circular — `depth` comes from a separate computation path.
+2. Extracted real down/up cast pairs and reproduced `pressure_bins()` + the area-between-curves
+   shift search exactly (same helper functions, same 0-59 s search range) outside the pipeline,
+   comparing the current bar-unit-binned result against a correctly-dbar-scaled equivalent.
+   **2 of 6 real pairs tested got a different optimal shift** (39s→41s, 40s→41s); the other 4
+   matched (one of those hit the 59s search boundary either way, meaning it would have fallen
+   back to the previous segment's shift regardless — see the `opt_shift == 0 or == max(seconds)`
+   fallback logic already in this script). Small sample, so not a precise rate, but confirms the
+   effect is real and occasionally changes the actual saved shift value, not just theoretical.
+3. Verified the fix (converting at the source, below) reproduces the corrected 41s result exactly
+   for both pairs that differed.
+
+```python
+# ORIGINAL (post-§3 RBR patch, pre-this-fix)
+press_da = ds[pressure_varname].copy()
+press_da.name = 'pressure'
+```
+
+```python
+# PIPELINE
+press_da = ds[pressure_varname].copy()
+press_da.name = 'pressure'
+if pressure_varname == 'sci_water_pressure':
+    # sci_water_pressure (RBR) is in bar; convert to dbar here, once, at the
+    # source, so every downstream consumer (the <3 dbar pressure-range gates
+    # AND pressure_bins()'s 0.25 dbar binning interval) operates on
+    # correctly-scaled values. 'pressure' (Seabird) is already dbar.
+    press_da = press_da * 10
+    press_da.name = 'pressure'
+```
+
+Converting once at the single source of `press_da` (rather than patching each downstream literal
+individually) means both the two `< 3` gates and `pressure_bins()`'s `0.25` interval are correct
+with no further changes — and this is the *only* place `press_da` is constructed
+(`identify_nans()`'s own internal `pressure_varname` fallback at line 107 is unreachable dead
+code — its only caller always passes a pre-resolved `pressure_da`, confirmed via grep — left
+untouched).
+
+**To revert:** remove the `if pressure_varname == 'sci_water_pressure': ...` block shown above;
+`press_da` returns to being the raw, unconverted source value. `KNOWN_ISSUES.md` and this section
+document the evidence trail if this needs re-evaluating.
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |

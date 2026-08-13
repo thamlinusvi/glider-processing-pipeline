@@ -269,6 +269,11 @@ def main(args):
 
                     # if the pressure values are all nan or profile spans <5 dbar, don't run test
                     pressure_diff = np.nanmax(pressure_copy.values) - np.nanmin(pressure_copy.values)
+                    if pressure_var == 'sci_water_pressure':
+                        # sci_water_pressure (RBR) is in bar; pressure_diff must be in dbar to
+                        # compare against the literal 5 below (1 bar = 10 dbar). 'pressure'
+                        # (Seabird) is already dbar and needs no conversion.
+                        pressure_diff = pressure_diff * 10
                     if np.logical_or(np.isnan(pressure_diff), pressure_diff < 5):
                         # leave flag values as NOT_EVALUATED/UNKNOWN (2) and set the attributes
                         add_da(ds, flag_vals, attrs, testvar, qc_varname)
@@ -338,6 +343,11 @@ def main(args):
 
                         # if the pressure values are all nan or profile spans <5 dbar, don't run test
                         pressure_diff2 = np.nanmax(pressure_copy2.values) - np.nanmin(pressure_copy2.values)
+                        if pressure_var2 == 'sci_water_pressure':
+                            # sci_water_pressure (RBR) is in bar; pressure_diff2 must be in dbar
+                            # to compare against the literal 5 below (1 bar = 10 dbar). 'pressure'
+                            # (Seabird) is already dbar and needs no conversion.
+                            pressure_diff2 = pressure_diff2 * 10
                         if np.logical_or(np.isnan(pressure_diff2), pressure_diff2 < 5):
                             # leave flag values on the first file as NOT_EVALUATED/UNKNOWN (2) and set the attributes
                             add_da(ds, flag_vals, attrs, testvar, qc_varname)

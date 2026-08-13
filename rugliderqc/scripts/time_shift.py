@@ -301,6 +301,13 @@ def main(args):
                             continue
                         press_da = ds[pressure_varname].copy()
                         press_da.name = 'pressure'
+                        if pressure_varname == 'sci_water_pressure':
+                            # sci_water_pressure (RBR) is in bar; convert to dbar here, once, at
+                            # the source, so every downstream consumer (the <3 dbar pressure-range
+                            # gates AND pressure_bins()'s 0.25 dbar binning interval) operates on
+                            # correctly-scaled values. 'pressure' (Seabird) is already dbar.
+                            press_da = press_da * 10
+                            press_da.name = 'pressure'
 
                         dstime = cf.convert_epoch_ts(ds['time'])
                         times = np.append(times, dstime)
