@@ -528,9 +528,9 @@ def html_climatology(clim_df):
 
     # 4.3 depth distribution
     html += '<h3>4.3 &nbsp; Depth Distribution of Flagged Observations</h3>\n'
-    depth_bins   = [0, 50, 100, 200, 300, 400, 500]
+    depth_bins   = [0, 50, 100, 200, 300, 400, 500, np.inf]
     depth_labels = ['0–50 m', '50–100 m', '100–200 m',
-                    '200–300 m', '300–400 m', '400–500 m']
+                    '200–300 m', '300–400 m', '400–500 m', '500+ m']
     html += ('<table>\n<tr><th>Variable</th><th>Flag</th>'
              + ''.join(f'<th>{l}</th>' for l in depth_labels)
              + '</tr>\n')

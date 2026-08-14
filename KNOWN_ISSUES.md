@@ -736,14 +736,29 @@ single-pass behavior — no regression.
   — exactly the crash this entry originally described); and the good files' aggregated data
   (temperature/conductivity min/max/count/units) came out byte-for-byte identical whether or not
   the bad file was present, confirming zero regression to real output.
-- **`qc_report.py`'s depth-distribution table silently truncates at 500m, undercounting deep
-  flagged observations.** `html_climatology` (~522-543): `depth_bins = [0, 50, 100, 200, 300,
-  400, 500]`. `pd.cut` drops out-of-range values as NaN rather than bucketing them — and this
-  fleet documents ~700m dives (`uvi_02-20260429T1420`). The report's own explanatory text (4.4)
-  says climatology flags occur mostly in "deep-water measurements," but the 4.3 per-depth-bin
-  table has no bin past 500m, so most of the very observations being explained vanish from that
-  table with no truncation notice. (Section 4.1's totals-by-variable table is computed
-  independently and is unaffected.)
+- **Fixed (2026-08-14): `qc_report.py`'s depth-distribution table silently truncated at 500m,
+  undercounting deep flagged observations.** `html_climatology()` (`qc_report.py:529-551`):
+  `depth_bins = [0, 50, 100, 200, 300, 400, 500]`. `pd.cut` produces `NaN` for anything outside
+  `[0, 500]`, and `value_counts()` silently drops NaN — so a deep flag just vanished from the
+  table with no truncation notice, no "other" bucket, nothing. Found something sharper than the
+  original description while re-verifying: section 4.4's own explanatory text computes its
+  min/max depth range *independently* from the full, untruncated `clim_df` — so a real deep flag
+  would have made section 4.4 correctly say e.g. "Suspect: 40–620 m depth" in its prose, while
+  the table two sections above it (4.3) showed a "400–500 m" bin undercounting the very range
+  being described — a visible internal contradiction within the same report, not just a silent
+  gap. **Checked real data before fixing, honestly:** neither deployment currently processed in
+  this repo actually triggers this — `uvi_01-20241026T1158`'s 255 flagged observations max out
+  at 1.85m depth, and even `uvi_02-20260429T1420` (this fleet's genuine ~700m-dive deployment)
+  has only one flagged observation total, at 0.16m. The bug is real and structurally exactly as
+  described, but currently dormant — no live reproduction available with data actually in this
+  repo. **Fix:** extended `depth_bins`/`depth_labels` with an open-ended final bucket (`..., 500,
+  np.inf`, labeled `'500+ m'`). **Verified two ways** since real data couldn't exercise this
+  path: (1) a synthetic `clim_df` with observations at 30m/450m/620m/700m confirmed the 620m and
+  700m observations now correctly land in the new "500+ m" bucket instead of vanishing — total
+  count across all bins for a given variable/flag matches the true total exactly, nothing lost;
+  (2) re-ran against the real `uvi_01-20241026T1158` deployment to confirm zero regression — the
+  new column is just always empty (`—`) for real data that has no deep flags today. (Section
+  4.1's totals-by-variable table is computed independently and was never affected either way.)
 - **`plot_qc_data.py` has a depth-axis fallback that substitutes raw bar-unit pressure for
   meter-unit depth with no conversion.** `plot_profiles` (~172-175): if `depth` is missing,
   falls back to `ds['sci_water_pressure'].values` directly, still labeled `'Depth (m)'` for
