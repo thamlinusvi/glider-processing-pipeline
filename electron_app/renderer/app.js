@@ -813,8 +813,10 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
 
   // Body
   const desc  = h('div', { class: 'stage-desc' }, info.description || '')
-  const paths = h('div', { class: 'stage-paths' })
-  paths.innerHTML = `<b>Source:</b> ${src.source}<br><b>Output:</b> ${src.output}`
+  const paths = h('div', { class: 'stage-paths' },
+    h('b', {}, 'Source:'), ' ', src.source, h('br'),
+    h('b', {}, 'Output:'), ' ', src.output
+  )
 
   const bodyEl = h('div', { class: 'stage-body' }, desc, paths)
 
@@ -1810,7 +1812,11 @@ async function renderNcVariablesTab (dep, container) {
 
   let data
   try { data = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/nc-variables`) }
-  catch (e) { container.innerHTML = `<div class="empty-state">Could not load variables: ${e.message}</div>`; return }
+  catch (e) {
+    container.innerHTML = ''
+    container.appendChild(h('div', { class: 'empty-state' }, 'Could not load variables: ' + e.message))
+    return
+  }
 
   container.innerHTML = ''
 
@@ -2012,8 +2018,11 @@ async function renderTrajectoryMap (dep, container) {
         iconSize:   [size, size],
         iconAnchor: [size / 2, size / 2],
       })
-      const popupHtml = `<b>Surfacing ${i + 1} of ${lats.length}</b><br>${times[i] || ''}`
-      L.marker([lat, lons[i]], { icon }).bindPopup(popupHtml).addTo(leafletMap)
+      // bindPopup accepts a DOM element directly, so build it via h() instead
+      // of an HTML string -- times[i] is parsed trajectory-NC GPS data, not
+      // meant to ever be treated as markup.
+      const popupEl = h('span', {}, h('b', {}, `Surfacing ${i + 1} of ${lats.length}`), h('br'), times[i] || '')
+      L.marker([lat, lons[i]], { icon }).bindPopup(popupEl).addTo(leafletMap)
     })
 
     // Fit to track bounds
@@ -5757,26 +5766,27 @@ async function renderAdcp () {
           if (r.rec_xaxis != null) {
             const isCurrent = adcpOpts.xaxis === r.rec_xaxis
             const borderColor = r.rec_xaxis === 1 ? '#1e8449' : r.rec_xaxis === 2 ? '#2471a3' : '#b7770d'
-            const currentNote = isCurrent
-              ? ' <span style="color:#1e8449">✔ already set</span>'
-              : ` — <em>currently set to xaxis=${adcpOpts.xaxis}</em>`
-            const sourceNote = (r.source_run && r.source_run !== runLabel)
-              ? `<div style="margin-top:6px;font-size:11.5px;color:#888">` +
-                `Based on shear stats from existing run <code>${r.source_run}</code> ` +
-                `— ping rates are consistent across xaxis settings so this estimate is valid.</div>`
-              : ''
-            const actionHtml = r.rec_action && !isCurrent
-              ? `<div style="margin-top:8px;padding:7px 10px;background:rgba(0,0,0,0.04);` +
-                `border-radius:3px;font-size:12px"><strong>To apply:</strong> ${r.rec_action.replace('To apply: ', '')}</div>`
-              : ''
-            recBox.innerHTML =
-              `<div style="margin:12px 0 4px;padding:12px 16px;background:var(--card-bg,#f4f6fb);` +
-              `border-left:4px solid ${borderColor};border-radius:3px;font-size:12.5px;line-height:1.65">` +
-              `<div style="font-weight:700;margin-bottom:6px">` +
-              `X-axis recommendation: xaxis=${r.rec_xaxis}${currentNote}</div>` +
-              `<div style="color:var(--text-muted,#555)">${r.rec_reason}</div>` +
-              actionHtml + sourceNote +
-              `</div>`
+            const currentNoteEl = isCurrent
+              ? h('span', { style: 'color:#1e8449' }, ' ✔ already set')
+              : h('span', {}, ' — ', h('em', {}, `currently set to xaxis=${adcpOpts.xaxis}`))
+            const sourceNoteEl = (r.source_run && r.source_run !== runLabel)
+              ? h('div', { style: 'margin-top:6px;font-size:11.5px;color:#888' },
+                  'Based on shear stats from existing run ', h('code', {}, r.source_run),
+                  ' — ping rates are consistent across xaxis settings so this estimate is valid.')
+              : null
+            const actionEl = (r.rec_action && !isCurrent)
+              ? h('div', { style: 'margin-top:8px;padding:7px 10px;background:rgba(0,0,0,0.04);border-radius:3px;font-size:12px' },
+                  h('strong', {}, 'To apply:'), ' ' + r.rec_action.replace('To apply: ', ''))
+              : null
+            recBox.innerHTML = ''
+            recBox.appendChild(h('div',
+              { style: `margin:12px 0 4px;padding:12px 16px;background:var(--card-bg,#f4f6fb);border-left:4px solid ${borderColor};border-radius:3px;font-size:12.5px;line-height:1.65` },
+              h('div', { style: 'font-weight:700;margin-bottom:6px' },
+                `X-axis recommendation: xaxis=${r.rec_xaxis}`, currentNoteEl),
+              h('div', { style: 'color:var(--text-muted,#555)' }, r.rec_reason),
+              actionEl,
+              sourceNoteEl,
+            ))
           }
         } catch (_) {}
       })()

@@ -652,14 +652,29 @@ single-pass behavior — no regression.
   both ways: the old logic really did leave the stale old-name entry behind exactly as
   described; the fixed version correctly removes it with no phantom entry created for the new
   name (which has nothing cached under it yet regardless).
-- **Several `innerHTML` sinks are fed by server-derived strings instead of the codebase's
-  normal safe-DOM `h()` helper**, inconsistent with the convention used almost everywhere else:
-  `getStagePaths` output embedding `dep` raw (~776, low risk — deployment names are
-  regex-locked at creation), `apiFetch` error messages (~1735, 1853, 1984, 2237 — server's raw
-  `error` JSON field, unescaped), AD2CP recommendation text (~5436-5443), and a Leaflet popup
-  built from parsed trajectory-NC GPS timestamps (~1937). None are demonstrated exploitable
-  given current server-side validation, but worth normalizing if this app's threat model ever
-  changes (e.g. multi-user or synced/shared deployment folders).
+- **Fixed (2026-08-14): several `innerHTML` sinks were fed by server-derived strings instead of
+  the codebase's normal safe-DOM `h()` helper**, inconsistent with the convention used almost
+  everywhere else. Re-checked each against current code before fixing: `getStagePaths` output
+  embedding `dep` raw (`buildStageCard`'s path panel) — traced where `dep` actually comes from
+  and found Windows filenames structurally can't contain `< > : " \ / | ? *` at all, so the
+  classic `<script>`/`onerror=` vectors were never actually reachable through a real folder
+  name on this OS, not just "not demonstrated." AD2CP recommendation text
+  (`renderAdcpFilesTab`'s xaxis-recommendation panel) — checked what actually populates
+  `source_run`: `_adcp_run_label()` (server.py) builds it entirely from `int()`/`float()`-coerced
+  numeric config values, no free-text path into it at all. A Leaflet popup built from parsed
+  trajectory-NC GPS timestamps (`renderer` map code). One `apiFetch` error message
+  (`renderNcVariablesTab`) — the write-up originally cited 4 line numbers for this pattern;
+  re-checked and found only 1 remains today, the other 3 were apparently cleaned up as a side
+  effect of unrelated refactoring earlier this session without this entry being updated to
+  match. None were ever demonstrated exploitable given the constraints above, but fixed for
+  consistency and defense-in-depth (worth having regardless if this app's threat model ever
+  changes — e.g. multi-user or synced/shared deployment folders). **Fix:** converted all four to
+  build real DOM nodes via `h()` (Leaflet's `bindPopup()` accepts a DOM element directly, so no
+  string round-trip needed there either). Verified by actually executing the real `h()` helper
+  against a minimal DOM mock with deliberately hostile test input (`<script>alert(1)</script>`,
+  `<img src=x onerror=alert(1)>`, a fake `<b>` injection) for all four conversions — confirmed
+  every case comes out as escaped inert text (`&lt;script&gt;...`), not live markup, proving the
+  fix actually closes the gap rather than just moving the same string through a different API.
 
 - **Fixed (2026-08-14): a running stage's live timer didn't survive a page rebuild, and could
   never resume once lost.** `buildStageCard()` only handled the timer display in two cases: an
