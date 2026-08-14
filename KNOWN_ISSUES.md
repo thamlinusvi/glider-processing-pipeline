@@ -711,14 +711,31 @@ single-pass behavior — no regression.
 
 ## Root utility script issues
 
-- **`qc_report.py` has no exception handling around NC file opens — one bad file kills the
-  entire report.** `collect_all()` (`qc_report.py:264-359`) has zero try/except around
-  `xr.open_dataset` (line 288) or per-file processing; a single corrupted/unreadable NC file, or
-  one with an empty `profile_time` array, throws uncaught and kills the script before any HTML
-  is written. Its sibling `plot_qc_data.py`, chained right after it in the same Stage 9 command,
-  *is* defensive about this (`load_deployment()` wraps the open in try/except and skips bad
-  files) — the two scripts process the same directory with inconsistent robustness. A single bad
-  file in a large deployment means Stage 9 produces no HTML QC report at all.
+- **Fixed (2026-08-14): `qc_report.py` had no exception handling around NC file opens or
+  per-file processing — one bad file killed the entire report.** `collect_all()`
+  (`qc_report.py:264-358`) had zero try/except around `xr.open_dataset` or the rest of that
+  file's processing; a single corrupted/unreadable NC file, or one with an empty `profile_time`
+  array, threw uncaught and killed the script before any HTML was written — wrapping only the
+  `open()` call wouldn't have been enough, since the empty-array case fails later, inside the
+  per-file processing itself (`float(ds['profile_time'].values.flat[0])` on a zero-length
+  array). Confirmed a real, unconditional `ds.close()` already existed at the end of the loop
+  body for files that *did* succeed — no separate handle-leak issue here, just missing error
+  handling. **Also checked exactly how this chains with its sibling `plot_qc_data.py`**
+  (`app/pipeline/stages.py:349-354`) rather than assume from the "chained" wording: it's not a
+  shell `&&`— `r2 = subprocess.run([...plot_qc_data.py...])` runs unconditionally regardless of
+  `r1`'s (`qc_report.py`'s) exit code, so a crash here doesn't also block the plots; the real
+  damage was narrower than it sounds — Stage 9 lost the HTML report specifically, not
+  everything. **Fix:** wrapped the `open()` in its own try/except (skip + warn, matching
+  `plot_qc_data.py`'s existing `load_deployment()` pattern exactly), and wrapped the rest of
+  that file's processing in a second try/except with `ds.close()` moved into a `finally` so a
+  file is always closed whether its processing succeeded or errored partway through. Verified
+  against real data (a 15-file subset of `uvi_01-20241026T1158`'s real QC output): both named
+  failure modes reproduced and confirmed fixed — a genuinely corrupted file is caught by the
+  open-guard with a clear warning naming the file; a file with an empty `profile_time` array is
+  caught by the processing-guard (`IndexError: index 0 is out of bounds for axis 0 with size 0`
+  — exactly the crash this entry originally described); and the good files' aggregated data
+  (temperature/conductivity min/max/count/units) came out byte-for-byte identical whether or not
+  the bad file was present, confirming zero regression to real output.
 - **`qc_report.py`'s depth-distribution table silently truncates at 500m, undercounting deep
   flagged observations.** `html_climatology` (~522-543): `depth_bins = [0, 50, 100, 200, 300,
   400, 500]`. `pd.cut` drops out-of-range values as NaN rather than bucketing them — and this

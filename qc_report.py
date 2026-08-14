@@ -285,78 +285,86 @@ def collect_all(files):
     for i, f in enumerate(files, 1):
         if i % 200 == 0 or i == n:
             print(f'  [{i}/{n}] processed...')
-        ds = xr.open_dataset(f, decode_times=False)
+        try:
+            ds = xr.open_dataset(f, decode_times=False)
+        except Exception as e:
+            print(f'  Warning: could not open {os.path.basename(f)}: {e}', flush=True)
+            continue
 
-        # --- Deployment summary ---
-        if 'profile_time' in ds:
-            pt = float(ds['profile_time'].values.flat[0])
-            if not np.isnan(pt):
-                times.append(epoch_to_dt(pt))
-        if 'profile_lat' in ds:
-            lats.append(float(ds['profile_lat'].values.flat[0]))
-        if 'profile_lon' in ds:
-            lons.append(float(ds['profile_lon'].values.flat[0]))
-        if 'depth' in ds:
-            d = ds['depth'].values.astype(float)
-            vd = d[~np.isnan(d)]
-            if len(vd):
-                depth_min = min(depth_min, float(vd.min()))
-                depth_max = max(depth_max, float(vd.max()))
-        total_obs += int(ds.sizes.get('time', 0))
-        if 'temperature' in ds and np.all(np.isnan(ds['temperature'].values.astype(float))):
-            nosci_count += 1
+        try:
+            # --- Deployment summary ---
+            if 'profile_time' in ds:
+                pt = float(ds['profile_time'].values.flat[0])
+                if not np.isnan(pt):
+                    times.append(epoch_to_dt(pt))
+            if 'profile_lat' in ds:
+                lats.append(float(ds['profile_lat'].values.flat[0]))
+            if 'profile_lon' in ds:
+                lons.append(float(ds['profile_lon'].values.flat[0]))
+            if 'depth' in ds:
+                d = ds['depth'].values.astype(float)
+                vd = d[~np.isnan(d)]
+                if len(vd):
+                    depth_min = min(depth_min, float(vd.min()))
+                    depth_max = max(depth_max, float(vd.max()))
+            total_obs += int(ds.sizes.get('time', 0))
+            if 'temperature' in ds and np.all(np.isnan(ds['temperature'].values.astype(float))):
+                nosci_count += 1
 
-        # --- Variable ranges (running min/max, no data accumulation) ---
-        for var, default_units in SCI_VARS:
-            if var not in ds.data_vars:
-                continue
-            vals  = ds[var].values.astype(float)
-            valid = vals[~np.isnan(vals)]
-            if len(valid):
-                var_min[var]   = min(var_min.get(var,    np.inf), float(valid.min()))
-                var_max[var]   = max(var_max.get(var,  - np.inf), float(valid.max()))
-                var_count[var] = var_count.get(var, 0) + len(valid)
-            if 'units' in ds[var].attrs:
-                var_units[var] = ds[var].attrs['units']
-            elif var not in var_units:
-                var_units[var] = default_units
-
-        # --- QC flag counts ---
-        for _, sensor_key, qc_list in QC_VARS_ORDER:
-            for v in qc_list:
-                if v not in ds.data_vars:
+            # --- Variable ranges (running min/max, no data accumulation) ---
+            for var, default_units in SCI_VARS:
+                if var not in ds.data_vars:
                     continue
-                vals = ds[v].values.astype(int).flatten()
-                if v not in qc_counts:
-                    qc_counts[v] = {f: 0 for f in [1, 2, 3, 4, 9]}
-                for flag in [1, 2, 3, 4, 9]:
-                    qc_counts[v][flag] += int(np.sum(vals == flag))
+                vals  = ds[var].values.astype(float)
+                valid = vals[~np.isnan(vals)]
+                if len(valid):
+                    var_min[var]   = min(var_min.get(var,    np.inf), float(valid.min()))
+                    var_max[var]   = max(var_max.get(var,  - np.inf), float(valid.max()))
+                    var_count[var] = var_count.get(var, 0) + len(valid)
+                if 'units' in ds[var].attrs:
+                    var_units[var] = ds[var].attrs['units']
+                elif var not in var_units:
+                    var_units[var] = default_units
 
-        # --- Climatology flagged observations ---
-        for var, thr in CLIM_THRESHOLDS.items():
-            flag_var = var + '_qartod_climatology_test'
-            if var not in ds.data_vars or flag_var not in ds.data_vars:
-                continue
-            vals  = ds[var].values.astype(float)
-            flags = ds[flag_var].values.astype(int)
-            depth = (ds['depth'].values.astype(float) if 'depth' in ds.data_vars
-                     else np.full(len(vals), np.nan))
-            mask  = (flags == 3) | (flags == 4)
-            if not mask.any():
-                continue
-            sus_lo, sus_hi   = thr['suspect_span']
-            fail_lo, fail_hi = thr['fail_span']
-            for idx in np.where(mask)[0]:
-                v  = float(vals[idx])
-                fl = int(flags[idx])
-                d  = float(depth[idx])
-                if fl == 4:
-                    reason = f'&lt; fail_min ({fail_lo})' if v < fail_lo else f'&gt; fail_max ({fail_hi})'
-                else:
-                    reason = f'&lt; suspect_min ({sus_lo})' if v < sus_lo else f'&gt; suspect_max ({sus_hi})'
-                clim_rows.append({'variable': var, 'depth_m': d, 'value': v,
-                                  'flag': FLAG_MEANING.get(fl, str(fl)), 'reason': reason})
-        ds.close()
+            # --- QC flag counts ---
+            for _, sensor_key, qc_list in QC_VARS_ORDER:
+                for v in qc_list:
+                    if v not in ds.data_vars:
+                        continue
+                    vals = ds[v].values.astype(int).flatten()
+                    if v not in qc_counts:
+                        qc_counts[v] = {f: 0 for f in [1, 2, 3, 4, 9]}
+                    for flag in [1, 2, 3, 4, 9]:
+                        qc_counts[v][flag] += int(np.sum(vals == flag))
+
+            # --- Climatology flagged observations ---
+            for var, thr in CLIM_THRESHOLDS.items():
+                flag_var = var + '_qartod_climatology_test'
+                if var not in ds.data_vars or flag_var not in ds.data_vars:
+                    continue
+                vals  = ds[var].values.astype(float)
+                flags = ds[flag_var].values.astype(int)
+                depth = (ds['depth'].values.astype(float) if 'depth' in ds.data_vars
+                         else np.full(len(vals), np.nan))
+                mask  = (flags == 3) | (flags == 4)
+                if not mask.any():
+                    continue
+                sus_lo, sus_hi   = thr['suspect_span']
+                fail_lo, fail_hi = thr['fail_span']
+                for idx in np.where(mask)[0]:
+                    v  = float(vals[idx])
+                    fl = int(flags[idx])
+                    d  = float(depth[idx])
+                    if fl == 4:
+                        reason = f'&lt; fail_min ({fail_lo})' if v < fail_lo else f'&gt; fail_max ({fail_hi})'
+                    else:
+                        reason = f'&lt; suspect_min ({sus_lo})' if v < sus_lo else f'&gt; suspect_max ({sus_hi})'
+                    clim_rows.append({'variable': var, 'depth_m': d, 'value': v,
+                                      'flag': FLAG_MEANING.get(fl, str(fl)), 'reason': reason})
+        except Exception as e:
+            print(f'  Warning: error processing {os.path.basename(f)}: {e}', flush=True)
+        finally:
+            ds.close()
 
     summary = dict(
         times=times, lats=lats, lons=lons,
