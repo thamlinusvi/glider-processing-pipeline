@@ -435,9 +435,16 @@ single-pass behavior — no regression.
   400 before `_dep_dir` is ever called; also changed `_dep_dir`'s hyphen-less fallback from the
   frozen `'2025'` literal to `datetime.datetime.now().year`, so it can't go stale again the same
   way — defensive only, since every route path now rejects a hyphen-less name before reaching it.
-- **Two file-ingestion endpoints have opposite overwrite behavior:**
-  `/api/deployment/<dep>/import-raw` (~1346-1383) refuses to overwrite an existing file;
-  `/api/cac-files/upload` (~1597-1610) unconditionally overwrites with no existence check.
+- **Stale, already fixed independently — not by this session's work:** this entry claimed
+  `/api/cac-files/upload` unconditionally overwrites with no existence check, in contrast with
+  `/api/deployment/<dep>/import-raw`'s refuse-to-overwrite behavior. Re-checked the live code:
+  `upload_cac_files` (server.py:1899) now takes a `conflict` form field (default `'skip'`),
+  matching the same `'overwrite'`/`'skip'` convention `/api/cloud/upload` already uses — an
+  existing file is left untouched and reported in `skipped` unless the caller explicitly passes
+  `'overwrite'`. `git log` traces this to commit `f997372` ("Add overwrite confirmation to CAC
+  file upload..."), unrelated to this punch-list session. Confirmed wired end-to-end on the
+  frontend too: `uploadFiles()` (`app.js`:3976) defaults to `conflict = 'skip'` and posts it
+  through. No longer a real behavioral gap — nobody circled back to mark this entry done.
 - **Fixed (2026-08-14): `/api/deployment/<dep>/rename`** (`rename_deployment`, ~1649-1725)
   renames a deployment across **8 separate top-level path joins** (`incoming_data`,
   `deployments/<year>`, `dat_files`, `gncutils_slocum_nc_output`, `post_processing`, `logs`,
