@@ -2117,9 +2117,30 @@ def download_kmz(dep):
     """Generate and stream a KMZ file of the glider track (GPS surfacings)."""
     import zipfile
 
-    # Prefer the lightweight surfacings cache; fall back to full trajectory cache
+    # Prefer the lightweight surfacings cache; fall back to full trajectory
+    # cache; fall back further to disk cache (survives server restarts) if
+    # neither is in memory yet -- same pattern as generate_map_image_route
+    # and flight_stats_report_html, which already do this.
     surf_cached = _surf_cache.get(dep)
     traj_cached = _traj_report_cache.get(dep)
+
+    if not surf_cached and not traj_cached:
+        traj_dir = os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep, 'trajectory_science')
+        if os.path.isdir(traj_dir):
+            try:
+                files = [f for f in os.listdir(traj_dir) if f.endswith('.nc')]
+                if files:
+                    sig = _dir_signature(traj_dir, files)
+                    disk = _load_disk_cache(dep, 'surfacings', sig)
+                    if disk:
+                        surf_cached = {'data': disk}
+                    else:
+                        disk = _load_disk_cache(dep, 'trajectory_report', sig)
+                        if disk:
+                            traj_cached = {'data': disk}
+            except Exception:
+                pass
+
     if surf_cached:
         sd    = surf_cached['data']
         lats  = sd.get('lats',  [])

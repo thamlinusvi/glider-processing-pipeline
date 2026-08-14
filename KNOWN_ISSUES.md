@@ -494,12 +494,21 @@ single-pass behavior — no regression.
   misses and forces recompute). Out of scope: the *separate* `_dir_mtime()`-based caches
   (`_nc_files_cache`, `_dat_files_cache`, `_raw_files_cache`, `_cloud_files_cache`, etc.) use a
   different, simpler mechanism and weren't part of this fix.
-- **KMZ export has no disk-cache fallback, unlike its sibling report endpoints.**
-  `download_kmz` (~1882-1901) only checks in-memory `_surf_cache`/`_traj_report_cache` and
-  404s ("open the Map tab first") if cold. `generate_map_image_route` and
-  `flight_stats_report_html` both retry via `_load_disk_cache(...)` when memory is empty. Net
-  effect: after a server restart, KMZ export fails even when a valid disk cache exists that the
-  other two endpoints would happily use.
+- **Fixed (2026-08-14): KMZ export had no disk-cache fallback, unlike its sibling report
+  endpoints.** `download_kmz` (~2115-2134) only checked in-memory `_surf_cache`/
+  `_traj_report_cache` and 404'd ("open the Map tab first") if cold, while
+  `generate_map_image_route` and `flight_stats_report_html` both already retried via
+  `_load_disk_cache(...)` when memory was empty. Net effect: after a server restart, KMZ export
+  failed even when a valid disk cache existed that the other two endpoints would happily use.
+  **Fix:** added the identical disk-cache-fallback pattern (reusing `_dir_signature()` from the
+  content-based-cache fix above) when both in-memory caches are empty — tries `surfacings` first
+  to match the function's existing surf-then-traj preference order, falling back to
+  `trajectory_report` if that's what's actually on disk. Verified against real data: in a fresh
+  process with both in-memory caches genuinely empty and no prior call to `/surfacings` in that
+  process (simulating a real server restart), `/kmz` against a deployment with an existing disk
+  cache from an earlier run now returns a real 73KB KMZ zip (200, valid `PK` zip signature)
+  where it previously would have 404'd; confirmed no regression — a deployment with no cache
+  anywhere still correctly 404s.
 - **`total_ah_used` (trajectory-report, ~1843-1845) is a naive `max - min` of
   `m_coulomb_amphr`** across all concatenated trajectory files — doesn't detect a coulomb-counter
   reset (battery swap, glider reboot mid-deployment), which would silently produce an implausible
