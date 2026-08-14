@@ -19,7 +19,7 @@ def validate_sensors(sensor_defs, required_sensor_names):
     for required_sensor in required_sensor_names:
         if required_sensor not in sensor_names:
             logger.warning('Missing llat sensor {:s}'.format(required_sensor))
-            validate = False
+            validated = False
 
     return validated
 

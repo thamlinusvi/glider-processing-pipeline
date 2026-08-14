@@ -344,17 +344,20 @@ single-pass behavior — no regression.
 
 ## gncutils issues
 
-- **`gncutils/gncutils/validate.py:22` has a typo that makes validation a silent no-op:** it
-  sets a local `validate = False` instead of `validated = False`, so the returned `validated`
-  flag is never actually set to `False` — `validate_sensors()` always returns `True` regardless
-  of missing sensors. Currently dormant (only caller, `dba_to_ngdac_profile_nc.py`, isn't
-  invoked by `app/pipeline/stages.py`), but don't copy this pattern or re-wire that script
-  without fixing it first. **Additionally confirmed:** `dba_to_ngdac_profile_nc.py` can't even
-  be imported today — it references `gncutils.ProfileNetCDFWriter` (actual location:
-  `gncutils.writers.slocum.ProfileNetCDFWriter`) and `gncutils.readers.dba` (no such module;
-  only `readers/slocum.py` and `readers/navoceano.py` exist) — both raise `ModuleNotFoundError`
-  at import time. Not newly broken, just confirms it's fully non-functional, not merely
-  disconnected, if anyone considers reviving it.
+- **Fixed (2026-08-13): `gncutils/gncutils/validate.py:22` had a typo that made validation a
+  silent no-op.** `validate_sensors()` set a local `validate = False` instead of
+  `validated = False` on a missing-sensor warning, so the returned `validated` flag was never
+  actually set to `False` — the function always returned `True` regardless of missing sensors,
+  even though its sibling function two lines below (`validate_ngdac_var_names`) does the
+  identical check correctly, which is what made this read as a copy/paste slip rather than
+  intentional. **Confirmed safe to fix:** repo-wide grep found exactly one caller anywhere,
+  `dba_to_ngdac_profile_nc.py:61` — and that script isn't invoked by anything in this pipeline
+  (`app/pipeline/stages.py`, `server.py`, `start_app.bat`, `package.json` — zero references) and
+  can't even be imported today regardless: it references `gncutils.ProfileNetCDFWriter` (actual
+  location: `gncutils.writers.slocum.ProfileNetCDFWriter`) and `gncutils.readers.dba` (no such
+  module; only `readers/slocum.py` and `readers/navoceano.py` exist), both raising
+  `ModuleNotFoundError` at import time. **Fix:** `validate = False` → `validated = False`.
+  `gncutils` is bind-mounted live, no Docker rebuild needed for this to take effect.
 - Stray `.bak` files in the repo (`gncutils/gncutils/ctd.py.bak`, `__init__.py.bak`,
   `qc/config/global_regional/usvi_configs.yml.bak`) — the `__init__.py.bak` diff shows a real
   scipy-compat fix (`scipy.signal.boxcar` → `scipy.signal.windows.boxcar`) that isn't applied in
