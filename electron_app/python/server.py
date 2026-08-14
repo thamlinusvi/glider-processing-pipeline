@@ -422,18 +422,66 @@ def _container_name(dep, stage):
 _DOCKER_DESKTOP_EXE = r'C:\Program Files\Docker\Docker\Docker Desktop.exe'
 
 
+def _docker_process_running():
+    """True if a Docker Desktop.exe process exists, independent of whether its
+    engine is actually responding to `docker info` -- distinguishes 'not
+    started yet' (plain Start works) from 'running but engine stuck' (Start
+    just launches a redundant instance on top of the hung one; needs a real
+    kill + WSL2 reset + relaunch instead)."""
+    try:
+        r = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq Docker Desktop.exe', '/NH'],
+            capture_output=True, text=True, timeout=6)
+        return 'Docker Desktop.exe' in r.stdout
+    except Exception:
+        return False
+
+
 @app.route('/api/docker/status')
 def docker_status():
     try:
         r = subprocess.run(['docker', 'info'],
                            capture_output=True, text=True, timeout=6)
-        return jsonify({'running': r.returncode == 0})
+        running = r.returncode == 0
     except Exception:
-        return jsonify({'running': False})
+        running = False
+    result = {'running': running}
+    if not running:
+        result['process_running'] = _docker_process_running()
+    return jsonify(result)
 
 
 @app.route('/api/docker/start', methods=['POST'])
 def docker_start():
+    if not os.path.exists(_DOCKER_DESKTOP_EXE):
+        return jsonify({'ok': False, 'error': f'Docker Desktop not found at {_DOCKER_DESKTOP_EXE}'}), 404
+    try:
+        subprocess.Popen([_DOCKER_DESKTOP_EXE])
+        return jsonify({'ok': True})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/docker/force-restart', methods=['POST'])
+def docker_force_restart():
+    """Recover from 'Docker Desktop process running but engine unresponsive':
+    kill every Docker Desktop process, reset the WSL2 backend, then relaunch.
+    Plain /api/docker/start can't fix this state -- it only ever launches a
+    new instance, which does nothing useful on top of an already-running
+    (just stuck) one."""
+    for proc_name in ('Docker Desktop.exe', 'com.docker.backend.exe',
+                       'com.docker.dev-envs.exe', 'com.docker.build.exe'):
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', proc_name],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass  # best-effort -- fine if a given process wasn't running
+
+    try:
+        subprocess.run(['wsl', '--shutdown'], capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass  # best-effort -- proceed to relaunch even if this fails/no-ops
+
     if not os.path.exists(_DOCKER_DESKTOP_EXE):
         return jsonify({'ok': False, 'error': f'Docker Desktop not found at {_DOCKER_DESKTOP_EXE}'}), 404
     try:

@@ -15,6 +15,12 @@ const stageLogs   = {}     // stageKey → string[]  (persists across re-renders
 const stageEls    = {}     // stageKey → { log, badge, btnRun, btnAbort }  (live DOM refs)
 let   nicknames   = {}     // dep → short name; loaded in init, shared across functions
 
+// Torn down at the top of navigate() regardless of which page is being left/
+// entered, since this app has no per-page "on leave" lifecycle hook -- these
+// are the only two things that currently outlive the page that started them.
+let _activeCloudPoll  = null   // cleanup fn returned by pollUntilConnected(), or null
+let _activeDockerWait = null   // open EventSource from _checkDockerBanner(), or null
+
 /* ── API helpers ─────────────────────────────────────────────────────────────*/
 async function apiFetch (url, opts = {}) {
   const r = await fetch(API + url, opts)
@@ -695,10 +701,11 @@ async function renderPipeline () {
 }
 
 async function _checkDockerBanner (banner) {
-  let running = false
+  let running = false, processRunning = false
   try {
     const r = await apiFetch('/api/docker/status')
-    running = r.running
+    running        = r.running
+    processRunning = !!r.process_running
   } catch {}
 
   if (running) {
@@ -707,14 +714,39 @@ async function _checkDockerBanner (banner) {
     return
   }
 
-  // Not running — show start button
   banner.className = 'docker-banner docker-banner--down'
   banner.innerHTML = ''
+  const status = h('span', { class: 'docker-start-status' })
+
+  if (processRunning) {
+    // Docker Desktop's process exists but its engine isn't responding to
+    // `docker info` -- a plain Start just launches a redundant instance on
+    // top of the already-running (just stuck) one and accomplishes nothing.
+    banner.appendChild(document.createTextNode('Docker Desktop is running but not responding. '))
+    const btn = h('button', { class: 'docker-start-btn' }, 'Force Restart Docker')
+    banner.appendChild(btn); banner.appendChild(status)
+
+    btn.onclick = async () => {
+      if (!confirm('This will forcibly close Docker Desktop, reset its backend, and restart it. Continue?')) return
+      btn.disabled       = true
+      status.textContent = ' Restarting…'
+      try {
+        const r = await apiFetch('/api/docker/force-restart', { method: 'POST' })
+        if (!r.ok) { status.textContent = ` Error: ${r.error}`; btn.disabled = false; return }
+      } catch (e) {
+        status.textContent = ` Error: ${e.message}`
+        btn.disabled = false
+        return
+      }
+      _streamDockerWait(banner, btn, status)
+    }
+    return
+  }
+
+  // Not running at all — show plain start button
   banner.appendChild(document.createTextNode('Docker is not running. '))
   const btn = h('button', { class: 'docker-start-btn' }, 'Start Docker Desktop')
-  banner.appendChild(btn)
-  const status = h('span', { class: 'docker-start-status' })
-  banner.appendChild(status)
+  banner.appendChild(btn); banner.appendChild(status)
 
   btn.onclick = async () => {
     btn.disabled       = true
@@ -727,30 +759,39 @@ async function _checkDockerBanner (banner) {
       btn.disabled = false
       return
     }
+    _streamDockerWait(banner, btn, status)
+  }
+}
 
-    // Stream /api/docker/wait for readiness
-    const t0  = Date.now()
-    const src = new EventSource(`${API}/api/docker/wait`)
-    src.onmessage = (e) => {
-      const d = JSON.parse(e.data)
-      if (d.ready) {
-        src.close()
-        banner.className   = 'docker-banner docker-banner--ok'
-        banner.textContent = 'Docker is running'
-      } else if (d.timeout) {
-        src.close()
-        status.textContent = ' Timed out — start Docker Desktop manually.'
-        btn.disabled = false
-      } else {
-        const secs = Math.round((Date.now() - t0) / 1000)
-        status.textContent = ` Starting… ${secs}s`
-      }
-    }
-    src.onerror = () => {
+// Shared by both the "Start Docker Desktop" and "Force Restart Docker" flows --
+// streams /api/docker/wait and updates the banner/button/status once ready,
+// on timeout, or on a dropped connection.
+function _streamDockerWait (banner, btn, status) {
+  const t0  = Date.now()
+  const src = new EventSource(`${API}/api/docker/wait`)
+  _activeDockerWait = src
+  src.onmessage = (e) => {
+    const d = JSON.parse(e.data)
+    if (d.ready) {
       src.close()
-      status.textContent = ' Connection lost — try again.'
+      _activeDockerWait = null
+      banner.className   = 'docker-banner docker-banner--ok'
+      banner.textContent = 'Docker is running'
+    } else if (d.timeout) {
+      src.close()
+      _activeDockerWait = null
+      status.textContent = ' Timed out — start Docker Desktop manually.'
       btn.disabled = false
+    } else {
+      const secs = Math.round((Date.now() - t0) / 1000)
+      status.textContent = ` Starting… ${secs}s`
     }
+  }
+  src.onerror = () => {
+    src.close()
+    _activeDockerWait = null
+    status.textContent = ' Connection lost — try again.'
+    btn.disabled = false
   }
 }
 
@@ -4529,18 +4570,27 @@ async function renderCloud () {
   }
 
   // ── Helper: poll until the account becomes connected (max 90 s) ───────────
-  // Returns a cancel function that stops polling and resets the card.
+  // Returns a cancel function that stops polling and resets the card. Also
+  // tracked in the module-level _activeCloudPoll so navigate() can tear this
+  // down automatically if the user leaves the page mid-poll instead of only
+  // stopping via this card's own Cancel button or the 45-try cap.
   function pollUntilConnected (service, onConnect, onCancel) {
+    // Cancel any still-running previous poll first -- without this, clicking
+    // Connect/Switch Account twice in a row stacked duplicate intervals with
+    // no de-dup.
+    if (_activeCloudPoll) _activeCloudPoll()
     let tries = 0
+    const cancel = () => { clearInterval(iv); _activeCloudPoll = null }
     const iv = setInterval(async () => {
       tries++
-      if (tries > 45) { clearInterval(iv); onCancel?.(); return }
+      if (tries > 45) { cancel(); onCancel?.(); return }
       try {
         const ac = await apiFetch('/api/cloud/accounts')
-        if (ac[service]?.connected) { clearInterval(iv); onConnect(ac) }
+        if (ac[service]?.connected) { cancel(); onConnect(ac) }
       } catch (_) {}
     }, 2000)
-    return () => clearInterval(iv)
+    _activeCloudPoll = cancel
+    return cancel
   }
 
   // ── Helper: show "Waiting…" spinner + Cancel button inside a card body ────
@@ -6103,6 +6153,13 @@ const pageRenderers = {
 }
 
 async function navigate (page) {
+  // No per-page "on leave" lifecycle hook exists in this app -- these are the
+  // only two things that currently outlive the page that started them, so
+  // tear them down here unconditionally rather than build a generic hook for
+  // just two call sites.
+  if (_activeCloudPoll)  { _activeCloudPoll(); _activeCloudPoll = null }
+  if (_activeDockerWait) { _activeDockerWait.close(); _activeDockerWait = null }
+
   state.page = page
 
   // Update active page panel

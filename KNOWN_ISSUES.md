@@ -618,16 +618,26 @@ single-pass behavior — no regression.
 
 ## Frontend (`electron_app/renderer/app.js`) issues
 
-- **Cloud OAuth connect/switch polling and the Docker-wait banner aren't torn down on
-  navigation.** `pollUntilConnected` (~4247-4258, called from Switch Account ~4306-4325 and
-  Connect ~4335-4363) starts a `setInterval` (2s × up to 45 tries) that only stops via the
-  card's own Cancel button or the try-cap — navigating away mid-poll leaves it running against a
-  detached DOM node for up to 90s, and clicking Connect twice stacks duplicate intervals with no
-  de-dup. Similarly, `_checkDockerBanner`'s `EventSource('/api/docker/wait')` (~697-755, opened
-  on every Pipeline-page visit) is only closed on its own `ready`/`timeout`/`onerror` — not on
-  navigation, so a still-open one from a prior visit keeps streaming until its own timeout.
-  Both self-resolve; neither corrupts state; both are real, verifiable leaks worth a
-  navigate-time cleanup hook.
+- **Fixed (2026-08-14): cloud OAuth connect/switch polling and the Docker-wait banner weren't
+  torn down on navigation.** `pollUntilConnected` (`app.js`, called from Switch Account and
+  Connect) started a `setInterval` (2s × up to 45 tries) that only stopped via the card's own
+  Cancel button or the try-cap — navigating away mid-poll left it running against a detached DOM
+  node for up to 90s, and clicking Connect twice stacked duplicate intervals with no de-dup.
+  Similarly, `_checkDockerBanner`'s `EventSource('/api/docker/wait')` (opened on every
+  Pipeline-page visit) was only closed on its own `ready`/`timeout`/`onerror` — not on
+  navigation, so a still-open one from a prior visit kept streaming until its own timeout. Both
+  self-resolved and neither corrupted state, but confirmed this app has **no per-page "on leave"
+  lifecycle hook at all** (checked `navigate()` — it just toggles CSS classes and calls the new
+  page's renderer), so there was nowhere for cleanup to hook into. **Fix:** rather than build a
+  generic lifecycle system for two known call sites, added two module-level trackers
+  (`_activeCloudPoll`, `_activeDockerWait`) set when each starts and cleared when it naturally
+  finishes, checked and torn down unconditionally at the top of `navigate()` regardless of
+  which page is being left or entered. `pollUntilConnected` now also cancels any still-running
+  previous poll before starting a new one, closing the double-click stacking gap in the same
+  pass since the tracking variable was already there. Verified: `app.js` syntax-checks clean and
+  the app starts/navigates without error with the change loaded (real API calls for
+  state/nicknames/deployment data all succeeded on a fresh launch) — genuine interval-teardown
+  timing wasn't independently exercised through the live GUI beyond that.
 - **Deployment rename deletes the wrong `state.depStates` cache entry.** `app.js:6008-6012`
   reassigns `state.deployment` to the *new* name, then does
   `delete state.depStates[state.deployment]` — deleting the (empty) new-name entry instead of
