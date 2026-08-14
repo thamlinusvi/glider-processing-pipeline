@@ -804,18 +804,30 @@ single-pass behavior — no regression.
   stripped but `profile_time` intact gets a scalar `profile_id` matching `int(profile_time)`
   exactly, with no new `"profile"` dimension created; a file with *both* `profile_id` and
   `profile_time` stripped cleanly falls back to `pid=1` with no crash.
-- **`build_sensor_defs.py`'s profile-defs builder has no fallback to `sci_defs`, unlike its two
-  siblings.** `build_profile_sensor_defs` (~186-190) looks up keys only in `sci_defs`, while
-  `build_trajectory_sensor_defs`/`build_trajectory_flight_sensor_defs` (~193-217) correctly fall
-  back to `sci_defs` when a key is missing from `base_defs`. Verified against the live JSON:
-  every current `PROFILE_SENSORS` entry exists in `sci-sensor_defs.json`, so this produces zero
-  missing keys today — but any future addition to `PROFILE_SENSORS` that only exists in
-  `trajectory-sensor_defs.json` would be silently dropped from the master profile
-  `sensor_defs.json`, reported only as a `missing` print in the `/api/build-sensor-defs`
-  response body (easy to miss in the UI). Note: verified `copy_sensor_defs` (server.py
-  ~1285-1303, the downstream fan-out step) reads exactly the folder/filenames
-  `build_sensor_defs.py` writes — no mismatch there despite the documented inconsistent
-  `'trajectory_flight'` naming, which is entirely on `copy_sensor_defs`'s destination side.
+- **Fixed (2026-08-14): `build_sensor_defs.py`'s profile-defs builder had no fallback to
+  `sci_defs`, unlike its two siblings.** `build_profile_sensor_defs(sci_defs)` looked up keys
+  only in `sci_defs` — its function signature didn't even accept `base_defs` as a parameter —
+  while `build_trajectory_sensor_defs`/`build_trajectory_flight_sensor_defs` both correctly
+  check `base_defs` (`trajectory-sensor_defs.json`) first, falling back to `sci_defs`
+  (`sci-sensor_defs.json`) when a key is missing. Checked the more precise question before
+  fixing, not just "any missing keys": whether any `PROFILE_SENSORS` entry currently exists in
+  `base_defs` but *not* `sci_defs` — which would mean this was silently dropping something right
+  now, not just posing a future risk. Confirmed zero such entries; genuinely dormant today, not
+  just assumed to be. **Fix:** matched `build_trajectory_flight_sensor_defs`'s exact pattern
+  (same 2-tuple return shape, so the caller only needed the one added argument) — `base_defs`
+  checked first, `sci_defs` as fallback, `missing` now computed against both sources instead of
+  just one. Verified against real data: identical coverage to before (all 36 `PROFILE_SENSORS`
+  keys still found, zero regression) — and a synthetic test proving the fix actually works, not
+  just "doesn't break anything": removed a real key from `sci_defs` and added it to `base_defs`
+  only — the old-signature call correctly showed it as missing (reproducing the bug), the new
+  fallback-aware call correctly rescued it into the output with the exact right value. Also ran
+  the real script end-to-end via its actual CLI entry point (what `/api/build-sensor-defs`
+  invokes) to confirm the full integration still works, not just the isolated function.
+
+  Note: `copy_sensor_defs` (server.py, the downstream fan-out step) reads exactly the
+  folder/filenames `build_sensor_defs.py` writes — no mismatch there despite the documented
+  inconsistent `'trajectory_flight'` naming, which is entirely on `copy_sensor_defs`'s
+  destination side.
 
 ## Known perf issue (deferred by Travis)
 

@@ -183,10 +183,16 @@ def write_json(path, obj):
         json.dump(obj, f, indent=2)
 
 
-def build_profile_sensor_defs(sci_defs):
-    found   = PROFILE_SENSORS & set(sci_defs.keys())
-    missing = PROFILE_SENSORS - set(sci_defs.keys())
-    out = {k: sci_defs[k] for k in sorted(found)}
+def build_profile_sensor_defs(base_defs, sci_defs):
+    needed = PROFILE_SENSORS
+    out = {}
+    for k in needed:
+        if k in base_defs:
+            out[k] = base_defs[k]
+        elif k in sci_defs:
+            out[k] = sci_defs[k]
+    missing = needed - set(base_defs.keys()) - set(sci_defs.keys())
+    out = {k: out[k] for k in sorted(out.keys())}
     return out, missing
 
 
@@ -240,12 +246,12 @@ def main():
     sci_defs  = load_json_dict(SCI_SENSOR_DEFS)
 
     # ---- Profile ----
-    profile_out, profile_missing = build_profile_sensor_defs(sci_defs)
+    profile_out, profile_missing = build_profile_sensor_defs(base_defs, sci_defs)
     profile_path = os.path.join(OUTPUT_PROFILE, "sensor_defs.json")
     write_json(profile_path, profile_out)
     print(f"Wrote PROFILE sensor_defs.json         -> {profile_path}  ({len(profile_out)} keys)")
     if profile_missing:
-        print(f"  Missing from sci_sensor_defs.json: {sorted(profile_missing)}")
+        print(f"  Missing from both trajectory- and sci-sensor_defs.json: {sorted(profile_missing)}")
 
     print()
 
