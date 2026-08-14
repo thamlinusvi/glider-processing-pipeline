@@ -19,7 +19,7 @@ from gncutils.constants import (
     M_CTD_SENSORS,
     ALT_CTD_SENSORS)
 from gncutils.ctd import calculate_practical_salinity, calculate_density, calculate_sound_speed
-from gsw import pt0_from_t
+from gsw import pt0_from_t, SA_from_SP
 
 logger = logging.getLogger(os.path.basename(__name__))
 
@@ -488,7 +488,7 @@ def derive_ctd_parameters(dba):
         # Calculate density
         density = calculate_density(t, p, salt, lat, lon)
         # Calculate potential temperature
-        p_temp = pt0_from_t(salt, t, p)
+        p_temp = pt0_from_t(SA_from_SP(salt, p, lon, lat), t, p)
 
         # Add parameters as long as they exist in ncw.nc_sensor_defs
         # if 'salinity' in ncw.nc_sensor_defs:
@@ -551,7 +551,7 @@ def derive_ctd_parameters(dba):
             # Calculate density
             density = calculate_density(t, p, salt, lat, lon)
             # Calculate potential temperature
-            p_temp = pt0_from_t(salt, t, p)
+            p_temp = pt0_from_t(SA_from_SP(salt, p, lon, lat), t, p)
 
             # Add parameters as long as they exist in ncw.nc_sensor_defs
             # if 'salinity' in ncw.nc_sensor_defs:

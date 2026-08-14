@@ -386,19 +386,21 @@ single-pass behavior — no regression.
   is not just unused but would crash if it ever were invoked: it does
   `sensors = dba["sensors"]; sensors.get(...)`, but `dba['sensors']` is always a **list** of
   dicts throughout this codebase, not a dict — lists have no `.get()`.
-- **`pt0_from_t` (potential temperature) is called with Practical Salinity where GSW's function
-  signature requires Absolute Salinity.** `gncutils/gncutils/readers/slocum.py:491` (primary CTD
-  branch) and `:554` (alt-CTD branch): `p_temp = pt0_from_t(salt, t, p)`, where `salt` is
-  `calculate_practical_salinity()`'s output (Practical Salinity, PSS-78), but GSW's
+- **Fixed (2026-08-13): `pt0_from_t` (potential temperature) was called with Practical Salinity
+  where GSW's function signature requires Absolute Salinity.** `gncutils/gncutils/readers/slocum.py:491`
+  (primary CTD branch) and `:554` (alt-CTD branch): `p_temp = pt0_from_t(salt, t, p)`, where
+  `salt` is `calculate_practical_salinity()`'s output (Practical Salinity, PSS-78), but GSW's
   `pt0_from_t(SA, t, p)` requires Absolute Salinity — confirmed against the installed `gsw`
   package's own docstring. `calculate_density`/`calculate_sound_speed` in the same file
-  correctly call `SA_from_SP()` first; this one line skips that conversion. Real, reproducible
-  defect (fires on every profile with full CTD coverage, output is written to profile NetCDF
-  via the configured `potential_temperature` sensor def), but quantified numerically as
-  scientifically inert: ~7×10⁻⁶°C error at 25°C/35 PSU/50 dbar, ~7×10⁻⁵°C at 500 dbar — roughly
-  two orders of magnitude below the RBR Legato³'s stated ~0.002°C accuracy. Worth fixing for
-  correctness; not a real-world data-quality concern at any depth this fleet operates at.
-  **Fix:** `p_temp = pt0_from_t(gsw.SA_from_SP(salt, p, lon, lat), t, p)`.
+  correctly call `SA_from_SP()` first; these two lines skipped that conversion. Real,
+  reproducible defect (fired on every profile with full CTD coverage, output is written to
+  profile NetCDF via the configured `potential_temperature` sensor def), but re-verified
+  numerically as scientifically inert across a spread of realistic T/P/S combinations: max error
+  ~1.2×10⁻⁴°C at 10°C/500 dbar/36 PSU, ~7×10⁻⁶°C at 25°C/50 dbar/35 PSU — roughly two orders of
+  magnitude below the RBR Legato³'s stated ~0.002°C accuracy even at the worst-case depth this
+  fleet operates at. **Fix:** `p_temp = pt0_from_t(SA_from_SP(salt, p, lon, lat), t, p)` in both
+  branches, `SA_from_SP` added to the existing `from gsw import pt0_from_t` line. `gncutils` is
+  bind-mounted live, no Docker rebuild needed for this to take effect.
 - **The documented pressure bar→dbar "call-order landmine"** (see `CLAUDE.md`) was independently
   re-verified this session and confirmed accurate — `select_pressure_sensor` does convert to
   dbar (`readers/slocum.py:395,413`) before `create_llat_dba_reader` appends it, and every

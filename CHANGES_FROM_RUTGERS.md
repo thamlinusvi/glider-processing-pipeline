@@ -1237,6 +1237,49 @@ shown above.
 
 ---
 
+### 5. `gncutils/gncutils/readers/slocum.py`
+
+**Type:** Bug fix — wrong salinity type passed to GSW's potential-temperature function
+
+**Root cause:** `derive_ctd_parameters()` computes Practical Salinity (`calculate_practical_salinity()`,
+PSS-78) and passes it directly to `gsw.pt0_from_t(SA, t, p)`, whose signature requires Absolute
+Salinity (SA, g/kg) — confirmed against the installed `gsw` package's own docstring.
+`calculate_density()`/`calculate_sound_speed()` a few lines above correctly convert via
+`SA_from_SP()` first; this one call, duplicated in both the primary-CTD and alt-CTD branches of
+the same function, skips that conversion. Fires on every profile with full CTD coverage, output
+written to profile NetCDF via the `potential_temperature` sensor def.
+
+**Practical impact:** re-verified numerically across several realistic temperature/pressure/
+salinity combinations — max error ~1.2×10⁻⁴°C at 10°C/500 dbar/36 PSU, ~7×10⁻⁶°C at
+25°C/50 dbar/35 PSU. Roughly two orders of magnitude below the RBR Legato³'s stated ~0.002°C
+accuracy even at this fleet's deepest dives — a real correctness bug, not a data-quality concern.
+
+```python
+# ORIGINAL
+from gsw import pt0_from_t
+...
+salt = calculate_practical_salinity(c, t, p)
+density = calculate_density(t, p, salt, lat, lon)
+p_temp = pt0_from_t(salt, t, p)
+```
+
+```python
+# PIPELINE
+from gsw import pt0_from_t, SA_from_SP
+...
+salt = calculate_practical_salinity(c, t, p)
+density = calculate_density(t, p, salt, lat, lon)
+p_temp = pt0_from_t(SA_from_SP(salt, p, lon, lat), t, p)
+```
+
+Same change applied at both call sites (`derive_ctd_parameters`'s primary-CTD branch, line 491,
+and its alt-CTD branch, line 554).
+
+**To revert:** drop `SA_from_SP` from the `gsw` import and change both call sites back to
+`pt0_from_t(salt, t, p)`.
+
+---
+
 ## Docker Changes
 
 ### `Dockerfile`
@@ -1280,3 +1323,4 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `gncutils/writers/slocum/ProfileNetCDFWriter.py` + `TrajectoryNetCDFWriter.py` | Bug fix | Docker/Windows EPERM on re-run (root-owned bind-mount files); added `os.remove()` before `shutil.move()`; also fixed a format-string bug that would've crashed the error handler |
 | `gncutils/validate.py` | Bug fix | `validate_sensors()` set `validate = False` instead of `validated = False` — always returned `True`; dead code, no live callers |
 | `gncutils/scripts/dba_to_ngdac_profile_nc.py` | Bug fix | Broken imports + wrong `calculate_density()` arguments; dead code, no live callers, fix makes it correct if ever revived |
+| `gncutils/readers/slocum.py` | Bug fix | `pt0_from_t()` called with Practical Salinity where GSW requires Absolute Salinity; scientifically inert (~1×10⁻⁴°C max error) but a real defect on every profile |
