@@ -288,10 +288,23 @@ verification writeup are in `CHANGES_FROM_RUTGERS.md` §14.
   warning surfaced in the pipeline log). `app/pipeline/stages.py` (~line 263) wires it into
   Stage 8 as if it's a functioning step. Pure monitoring, doesn't set flags, so low severity —
   but Stage 8 currently gets zero value from this step for UVI.
-- **`check_duplicate_timestamps.py`'s `ds`/`ds2` file handles aren't closed on the success
-  path** — only the error branches (`OSError`/`IndexError`) call `.close()`. Given the
-  documented HDF5-segfault-risk-with->1-reader concern elsewhere in this repo, accumulating
-  unclosed handles across a long QC run is a minor pre-existing risk.
+- **Fixed (2026-08-13): `check_duplicate_timestamps.py`'s `ds`/`ds2` file handles weren't closed
+  on the success path** — only the error branches (`OSError`/`IndexError`) called `.close()`;
+  all three normal-outcome branches (ds2 is the duplicate, ds is the duplicate, neither is) fell
+  through to the next loop iteration without closing either handle, which is the common case, not
+  an edge case — it fired on essentially every iteration of a ~625-file loop. Worse than a simple
+  leak: xarray doesn't close a file just because the Python reference is dropped — it goes through
+  `CachingFileManager`'s global LRU cache (default cap 128 files), so handles only actually close
+  on eviction, not on reassignment; a 625-file run comfortably exceeds that cap. There's also a
+  concrete double-open at the loop boundary — the file that's `ds2` in iteration `i` gets reopened
+  as `ds` in iteration `i+1` (line 89) *before* the old `ds2` reference is overwritten (line 102),
+  so the same file is briefly open via two handles at once — the same class of risk this repo's
+  own `_nc_lock`/`_TRAJ_WORKERS=1` precedent (`server.py`) already treats as unsafe for HDF5. No
+  crash observed in practice (a real run's log shows this script completing cleanly), so this was
+  a latent risk, not a confirmed failure. **Fix:** wrapped the three comparison branches (lines
+  112-129) in a single `try/finally` that unconditionally closes both `ds` and `ds2`, so every
+  path through the loop closes both handles exactly once. Docker image rebuilt and verified —
+  `grep`'d the container's own copy of the script to confirm the fix is actually baked in.
 **Fixed (2026-08-13): the derived-variable dependency cascade (DO→mg/L, pH voltage→pH, pH→TA,
 TA→Omega) was implicit and unenforced.** `add_derived_variables.py`'s single pass
 (`for variable_name, vardict in proc_vars.items():`) only worked because

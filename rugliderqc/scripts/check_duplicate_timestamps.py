@@ -109,23 +109,30 @@ def main(args):
                     ds.close()
                     continue
 
-                if set(ds2.time.values).issubset(ds.time.values):
-                    # if timestamps from ds2 are completely contained in timestamps from ds
-                    # rename ds2
-                    os.rename(f2, f'{f2}.duplicate')
-                    logging.info('Duplicated timestamps found in file: {:s}'.format(f2))
-                    duplicates += 1
-                elif set(ds.time.values).issubset(ds2.time.values):
-                    # if timestamps from ds are completely contained in timestamps from ds2
-                    # rename ds
-                    try:
-                        os.rename(f, f'{f}.duplicate')
-                        logging.info('Duplicated timestamps found in file: {:s}'.format(f))
+                try:
+                    if set(ds2.time.values).issubset(ds.time.values):
+                        # if timestamps from ds2 are completely contained in timestamps from ds
+                        # rename ds2
+                        os.rename(f2, f'{f2}.duplicate')
+                        logging.info('Duplicated timestamps found in file: {:s}'.format(f2))
                         duplicates += 1
-                    except FileNotFoundError:  # file has already been identified as a duplicate
+                    elif set(ds.time.values).issubset(ds2.time.values):
+                        # if timestamps from ds are completely contained in timestamps from ds2
+                        # rename ds
+                        try:
+                            os.rename(f, f'{f}.duplicate')
+                            logging.info('Duplicated timestamps found in file: {:s}'.format(f))
+                            duplicates += 1
+                        except FileNotFoundError:  # file has already been identified as a duplicate
+                            continue
+                    else:
                         continue
-                else:
-                    continue
+                finally:
+                    # always close both handles, regardless of which branch above was taken --
+                    # previously only the error paths above closed ds/ds2, leaking a handle on
+                    # every normal (non-error) comparison
+                    ds.close()
+                    ds2.close()
 
             logging.info('Found {:} duplicated files (of {:} total files)'.format(duplicates, len(ncfiles)))
         return status
