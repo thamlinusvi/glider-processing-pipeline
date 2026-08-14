@@ -1788,8 +1788,16 @@ def list_cac_files():
 
 @app.route('/api/cac-files/upload', methods=['POST'])
 def upload_cac_files():
-    """Accept one or more uploaded files and save them to master_cac/."""
+    """Accept one or more uploaded files and save them to master_cac/.
+
+    Conflict mode (form field 'conflict', default 'skip'), matching the
+    'overwrite' | 'skip' convention already used by /api/cloud/upload:
+      - 'skip'      — an already-existing file is left untouched and reported
+                       in 'skipped' instead of being silently overwritten.
+      - 'overwrite' — an already-existing file is replaced, as before.
+    """
     os.makedirs(CAC_DIR, exist_ok=True)
+    conflict = request.form.get('conflict', 'skip')
     saved = []
     skipped = []
     for f in request.files.getlist('files'):
@@ -1797,6 +1805,9 @@ def upload_cac_files():
             continue
         name = os.path.basename(f.filename)
         dest = os.path.join(CAC_DIR, name)
+        if conflict == 'skip' and os.path.isfile(dest):
+            skipped.append(name)
+            continue
         f.save(dest)
         saved.append(name)
     return jsonify({'ok': True, 'saved': saved, 'skipped': skipped})

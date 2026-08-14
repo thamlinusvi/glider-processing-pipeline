@@ -1738,6 +1738,7 @@ button {
 .vars-empty { padding: 20px 16px; font-size: 12px; color: #9ca3af; font-style: italic; }
 
 /* ── CAC Files tab ───────────────────────────────────────────────────────────*/
+.cac-tab-scroll   { flex: 1; overflow-y: auto; min-height: 0; }
 .cac-list-wrap    { padding: 16px 16px 0; }
 .cac-section-card {
   border-radius: 9px;
@@ -1789,11 +1790,13 @@ button {
 .cac-browse-btn   { margin-top: 2px; }
 .cac-upload-status {
   margin-top: 10px; padding: 8px 14px; border-radius: 6px; font-size: 12px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
 }
 .cac-upload-status.hidden    { display: none; }
 .cac-upload-status.uploading { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }
 .cac-upload-status.success   { background: #f0fdf4; border: 1px solid #86efac; color: #166534; }
 .cac-upload-status.error     { background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; }
+.cac-upload-status.warning   { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }
 
 /* DAT file selection bar (select-all + delete-selected) */
 .dat-sel-bar {

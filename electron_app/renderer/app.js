@@ -3796,9 +3796,15 @@ async function renderQcOutputTab (dep, container) {
 async function renderCacTab (container) {
   container.innerHTML = ''
 
+  // Scrollable wrapper (tab body has overflow:hidden) -- same pattern as
+  // renderAdcpFilesTab's .adcp-files-scroll, needed once the file list +
+  // upload section combined exceed the visible tab height.
+  const scroll = h('div', { class: 'cac-tab-scroll' })
+  container.appendChild(scroll)
+
   // ── File list ─────────────────────────────────────────────────────────────
   const listWrap = h('div', { class: 'cac-list-wrap' })
-  container.appendChild(listWrap)
+  scroll.appendChild(listWrap)
 
   async function refreshList () {
     listWrap.innerHTML = ''
@@ -3859,19 +3865,36 @@ async function renderCacTab (container) {
     style: 'display:none',
   })
 
-  async function uploadFiles (files) {
+  async function uploadFiles (files, conflict = 'skip') {
     if (!files.length) return
     statusEl.textContent = `Uploading ${files.length} file${files.length > 1 ? 's' : ''}…`
     statusEl.className = 'cac-upload-status uploading'
     const fd = new FormData()
     for (const f of files) fd.append('files', f)
+    fd.append('conflict', conflict)
     try {
       const resp = await fetch(`${API}/api/cac-files/upload`, { method: 'POST', body: fd })
       const result = await resp.json()
       if (result.ok) {
         const n = result.saved.length
-        statusEl.textContent = `Saved ${n} file${n !== 1 ? 's' : ''}: ${result.saved.join(', ')}`
-        statusEl.className = 'cac-upload-status success'
+        const savedMsg = n ? `Saved ${n} file${n !== 1 ? 's' : ''}${result.saved.length ? ': ' + result.saved.join(', ') : ''}` : ''
+        if (result.skipped.length) {
+          const skippedNames = result.skipped
+          statusEl.textContent = ''
+          statusEl.className = 'cac-upload-status warning'
+          statusEl.appendChild(h('span', {},
+            `${savedMsg ? savedMsg + '. ' : ''}${skippedNames.length} already exist, not overwritten: ${skippedNames.join(', ')}. `))
+          statusEl.appendChild(h('button', {
+            class: 'btn-xs btn-secondary',
+            onclick: () => {
+              const retryFiles = files.filter(f => skippedNames.includes(f.name))
+              uploadFiles(retryFiles, 'overwrite')
+            },
+          }, 'Overwrite anyway'))
+        } else {
+          statusEl.textContent = savedMsg
+          statusEl.className = 'cac-upload-status success'
+        }
         refreshList()
       } else {
         statusEl.textContent = 'Upload failed'
@@ -3907,7 +3930,7 @@ async function renderCacTab (container) {
     uploadFiles([...e.dataTransfer.files])
   })
 
-  container.appendChild(h('div', { class: 'cac-upload-section' }, dropZone, statusEl))
+  scroll.appendChild(h('div', { class: 'cac-upload-section' }, dropZone, statusEl))
 }
 
 
