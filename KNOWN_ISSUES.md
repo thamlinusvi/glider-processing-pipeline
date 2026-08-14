@@ -638,12 +638,20 @@ single-pass behavior — no regression.
   the app starts/navigates without error with the change loaded (real API calls for
   state/nicknames/deployment data all succeeded on a fresh launch) — genuine interval-teardown
   timing wasn't independently exercised through the live GUI beyond that.
-- **Deployment rename deletes the wrong `state.depStates` cache entry.** `app.js:6008-6012`
-  reassigns `state.deployment` to the *new* name, then does
-  `delete state.depStates[state.deployment]` — deleting the (empty) new-name entry instead of
-  the actually-stale old-name one, which is left orphaned in the cache indefinitely. Harmless
-  today (nothing looks up the old name again), but wrong logic and a minor unbounded-growth
-  contributor across a long rename-heavy session.
+- **Fixed (2026-08-14): deployment rename deleted the wrong `state.depStates` cache entry.**
+  The rename-save handler (`app.js`, ~6333-6359) reassigned `state.deployment` to the *new*
+  name, then did `delete state.depStates[state.deployment]` — deleting the (empty) new-name
+  entry instead of the actually-stale old-name one, which was left orphaned in the cache
+  indefinitely. Confirmed as a genuine slip rather than intentional: the other two places this
+  same cache gets invalidated elsewhere in the file both correctly delete using whichever name
+  is actually relevant at that point — this was the one spot using an already-reassigned
+  variable instead of capturing the old name first. Harmless in effect (nothing looks up the old
+  name again after a rename), just a minor unbounded-growth contributor across a long
+  rename-heavy session. **Fix:** capture `oldName = state.deployment` before the reassignment,
+  delete using that instead. Verified with an isolated simulation of the exact object mutations
+  both ways: the old logic really did leave the stale old-name entry behind exactly as
+  described; the fixed version correctly removes it with no phantom entry created for the new
+  name (which has nothing cached under it yet regardless).
 - **Several `innerHTML` sinks are fed by server-derived strings instead of the codebase's
   normal safe-DOM `h()` helper**, inconsistent with the convention used almost everywhere else:
   `getStagePaths` output embedding `dep` raw (~776, low risk — deployment names are

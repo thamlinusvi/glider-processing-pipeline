@@ -6351,9 +6351,10 @@ async function init () {
 
       const { deployments: deps } = await loadAppState()
       rebuildSelect(deps, r.name)
+      const oldName = state.deployment
       state.deployment = r.name
       localStorage.setItem('lastDeployment', r.name)
-      delete state.depStates[state.deployment]
+      delete state.depStates[oldName]   // the actually-stale entry, not the new (empty) one
       updateNicknameLabel()
       closeRenameForm()
       navigate(state.page)
