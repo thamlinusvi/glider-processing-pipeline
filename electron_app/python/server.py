@@ -58,7 +58,7 @@ _live_logs  = {}
 # True while the process is still producing output; False once it's done/failed.
 _live_done  = {}   # key -> bool (True = finished)
 
-# Trajectory report cache: dep -> {'mtime': float, 'data': dict}
+# Trajectory report cache: dep -> {'sig': str, 'data': dict}
 _traj_report_cache = {}
 
 # File-listing caches (avoid re-statting thousands of files on every tab switch)
@@ -214,26 +214,39 @@ def _disk_cache_path(dep, name):
     return os.path.join(_dep_dir(dep), 'cache', f'{name}.json')
 
 
-def _load_disk_cache(dep, name, newest_mtime):
-    """Return cached data dict if the on-disk JSON is still valid, else None."""
+def _dir_signature(dir_path, files):
+    """Signature over (filename, size, mtime) for every file, not just the max
+    mtime -- catches a content swap that preserves the original timestamp
+    (e.g. shutil.copy2, robocopy's default /COPY:DAT, a timestamp-preserving
+    restore from backup) as a cache miss instead of silently treating it as
+    unchanged."""
+    parts = []
+    for f in sorted(files):
+        st = os.stat(os.path.join(dir_path, f))
+        parts.append(f'{f}:{st.st_size}:{st.st_mtime_ns}')
+    return hashlib.sha256('|'.join(parts).encode('utf-8')).hexdigest()
+
+
+def _load_disk_cache(dep, name, sig):
+    """Return cached data dict if the on-disk JSON's signature still matches, else None."""
     path = _disk_cache_path(dep, name)
     try:
         with open(path, 'r', encoding='utf-8') as f:
             obj = json.load(f)
-        if obj.get('newest_mtime', -1) >= newest_mtime:
+        if obj.get('sig') == sig:
             return obj['data']
     except Exception:
         pass
     return None
 
 
-def _save_disk_cache(dep, name, newest_mtime, data):
+def _save_disk_cache(dep, name, sig, data):
     """Persist computed data to a JSON file on disk."""
     path = _disk_cache_path(dep, name)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'newest_mtime': newest_mtime, 'data': data}, f)
+            json.dump({'sig': sig, 'data': data}, f)
     except Exception as exc:
         print(f'[server] warning: could not write disk cache {path}: {exc}', flush=True)
 
@@ -1841,7 +1854,7 @@ def delete_cac_file(filename):
 
 
 # ── Trajectory surfacings (lightweight — lat/lon/time only) ───────────────────
-_surf_cache = {}   # dep -> {'mtime': float, 'data': dict}
+_surf_cache = {}   # dep -> {'sig': str, 'data': dict}
 
 @app.route('/api/deployment/<dep>/surfacings')
 def surfacings(dep):
@@ -1861,18 +1874,18 @@ def surfacings(dep):
         return jsonify({'error': 'No trajectory NC files found'}), 404
 
     try:
-        newest_mtime = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+        sig = _dir_signature(traj_dir, files)
     except Exception:
-        newest_mtime = 0.0
+        sig = None
 
     cached = _surf_cache.get(dep)
-    if cached and cached.get('mtime', -1) >= newest_mtime:
+    if cached and cached.get('sig') == sig:
         return jsonify(cached['data'])
 
     # 1 — disk cache (survives server restarts)
-    disk_data = _load_disk_cache(dep, 'surfacings', newest_mtime)
+    disk_data = _load_disk_cache(dep, 'surfacings', sig)
     if disk_data:
-        _surf_cache[dep] = {'mtime': newest_mtime, 'data': disk_data}
+        _surf_cache[dep] = {'sig': sig, 'data': disk_data}
         print(f'[server] surfacings: loaded from disk cache', flush=True)
         return jsonify(disk_data)
 
@@ -1932,8 +1945,8 @@ def surfacings(dep):
         'n_files':   len(files),
     }
 
-    _surf_cache[dep] = {'mtime': newest_mtime, 'data': data}
-    _save_disk_cache(dep, 'surfacings', newest_mtime, data)
+    _surf_cache[dep] = {'sig': sig, 'data': data}
+    _save_disk_cache(dep, 'surfacings', sig, data)
     print(f'[server] surfacings done: {int(valid.sum())} GPS fixes from {len(files)} files', flush=True)
     return jsonify(data)
 
@@ -1957,18 +1970,18 @@ def trajectory_report(dep):
         return jsonify({'error': 'No trajectory NC files found'}), 404
 
     try:
-        newest_mtime = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
+        sig = _dir_signature(traj_dir, files)
     except Exception:
-        newest_mtime = 0.0
+        sig = None
 
     cached = _traj_report_cache.get(dep)
-    if cached and cached.get('mtime', -1) >= newest_mtime:
+    if cached and cached.get('sig') == sig:
         return jsonify(cached['data'])
 
     # 1 — disk cache
-    disk_data = _load_disk_cache(dep, 'trajectory_report', newest_mtime)
+    disk_data = _load_disk_cache(dep, 'trajectory_report', sig)
     if disk_data:
-        _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': disk_data}
+        _traj_report_cache[dep] = {'sig': sig, 'data': disk_data}
         print(f'[server] trajectory report: loaded from disk cache', flush=True)
         return jsonify(disk_data)
 
@@ -2086,8 +2099,8 @@ def trajectory_report(dep):
             },
         }
 
-        _traj_report_cache[dep] = {'mtime': newest_mtime, 'data': data}
-        _save_disk_cache(dep, 'trajectory_report', newest_mtime, data)
+        _traj_report_cache[dep] = {'sig': sig, 'data': data}
+        _save_disk_cache(dep, 'trajectory_report', sig, data)
         print(f'[server] trajectory report done: {n_total:,} records, '
               f'{int(valid.sum())} surfacings, {skipped} files skipped', flush=True)
         return jsonify(data)
@@ -2197,8 +2210,8 @@ def generate_map_image_route(dep):
             try:
                 files = [f for f in os.listdir(traj_dir) if f.endswith('.nc')]
                 if files:
-                    newest = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
-                    disk = _load_disk_cache(dep, 'surfacings', newest)
+                    sig = _dir_signature(traj_dir, files)
+                    disk = _load_disk_cache(dep, 'surfacings', sig)
                     if disk:
                         cached = {'data': disk}
             except Exception:
@@ -2253,8 +2266,8 @@ def flight_stats_report_html(dep):
             try:
                 files = [f for f in os.listdir(traj_dir) if f.endswith('.nc')]
                 if files:
-                    newest = max(os.path.getmtime(os.path.join(traj_dir, f)) for f in files)
-                    disk = _load_disk_cache(dep, 'trajectory_report', newest)
+                    sig = _dir_signature(traj_dir, files)
+                    disk = _load_disk_cache(dep, 'trajectory_report', sig)
                     if disk:
                         cached = {'data': disk}
             except Exception:

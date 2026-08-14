@@ -469,9 +469,31 @@ single-pass behavior — no regression.
   deployment fully intact; (3) `os.rename` mocked to fail on the 3rd call (after 2 real
   successes) — response reports `rolled_back: true`, `renamed: []`, and the deployment is
   confirmed fully back under the old name in all 8 locations, nothing left under the new one.
-- **Disk cache staleness is mtime-based, not content-based** (`_load_disk_cache`/
-  `_save_disk_cache`, ~209-234) — a file copied with timestamp preservation would leave the
-  cache silently stale.
+- **Fixed (2026-08-14): disk cache staleness was mtime-based, not content-based**
+  (`_load_disk_cache`/`_save_disk_cache`, ~212-247, backing `_surf_cache`/`_traj_report_cache`
+  for the Map tab and trajectory report). Validity was `max(mtime across all trajectory NC
+  files) >= stored value` — a pure number comparison, no hashing or content check. That silently
+  assumes file content only ever changes together with a newer mtime, which is false for
+  anything that replaces content while preserving the original timestamp: `shutil.copy2()`
+  (already used elsewhere in this same codebase, e.g. `import_raw`), `robocopy`'s default
+  timestamp-preserving flags, or a timestamp-preserving restore from backup. Realistic here
+  specifically because this session's own workflow already involved exactly that pattern
+  (`qc_fix_comparison/`-style backups) — anyone who restored trajectory NC files that way, then
+  opened the Map tab, could have gotten silently stale data with zero indication anything was
+  wrong. **Fix:** replaced the single `max(mtime)` float with `_dir_signature()`, a SHA-256 hash
+  over `(filename, size, mtime_ns)` for every file in the directory (sorted for determinism) —
+  still just `stat()` calls, no extra file reads, but now detects a same-mtime content swap.
+  Cache comparison changed from `>=` (ordered float) to `==` (opaque signature) throughout: both
+  disk-cache functions and the two in-memory caches (`_surf_cache`/`_traj_report_cache`, key
+  renamed `mtime`→`sig`). Verified directly: wrote a file, computed its signature, replaced its
+  content with different bytes, force-set the mtime back to the exact original value via
+  `os.utime` (reproducing what `shutil.copy2`/`robocopy` do) — confirmed the old max-mtime
+  approach would NOT have detected the change (mtime genuinely identical), while
+  `_dir_signature()` correctly returns a different hash; also verified `_load_disk_cache`/
+  `_save_disk_cache` round-trip correctly (matching sig hits with the right data, differing sig
+  misses and forces recompute). Out of scope: the *separate* `_dir_mtime()`-based caches
+  (`_nc_files_cache`, `_dat_files_cache`, `_raw_files_cache`, `_cloud_files_cache`, etc.) use a
+  different, simpler mechanism and weren't part of this fix.
 - **KMZ export has no disk-cache fallback, unlike its sibling report endpoints.**
   `download_kmz` (~1882-1901) only checks in-memory `_surf_cache`/`_traj_report_cache` and
   404s ("open the Map tab first") if cold. `generate_map_image_route` and
