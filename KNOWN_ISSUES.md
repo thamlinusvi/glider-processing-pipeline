@@ -414,17 +414,27 @@ single-pass behavior — no regression.
 
 ## Server-side robustness gaps
 
-- **`_dep_dir(deployment)` (server.py ~252-256) creates folders as a side effect of GET
-  requests.** It derives year via `deployment.split('-')[1][:4]`, falling back to a
-  **hardcoded `'2025'`** if the name has no `-`, then unconditionally `os.makedirs(...,
-  exist_ok=True)`. A mistyped/unknown deployment name in any request — even a plain status
-  GET — silently creates a stray folder under `deployments/2025/<name>/`, and that fallback
-  year is now wrong (current year is 2026). **Two more call sites of the identical pattern
-  confirmed in `app/pipeline/stages.py`:** `_year()` (~21-22,
-  used inside `qc_command`) and the `output_fn` lambdas for `preflight`/`qc`/`report`
-  (~423,432,441, `d.split('-')[1][:4]`) — for a hyphen-less name these raise synchronously
-  inside the Flask request thread (`server.py:446`), surfacing as a raw 500 before the SSE
-  generator's own try/except even starts, instead of a graceful failed-stage state.
+- **Fixed (2026-08-13): `_dep_dir(deployment)` (server.py ~260-265) created folders as a side
+  effect of GET requests, with a stale hardcoded year fallback.** It derives year via
+  `deployment.split('-')[1][:4]`, falling back (pre-fix) to a hardcoded `'2025'` if the name has
+  no `-`, then unconditionally `os.makedirs(..., exist_ok=True)`. Checked every call site rather
+  than just the one already known: **six GET routes called `_dep_dir(dep)` with zero name
+  validation beforehand** — `dep_state`, `stream_stage_logs`, `serve_report`, `list_plots`,
+  `generate_map_image_route`, and `cloud_list_files` — so a mistyped/unknown deployment name in
+  any of those, even a plain status check, silently created a stray folder under
+  `deployments/2025/<name>/` (a year that isn't even current anymore — it's 2026).
+  **Correction to an earlier version of this entry:** it also claimed `app/pipeline/stages.py`'s
+  `_year()` and the `output_fn` lambdas (`preflight`/`qc`/`report`) crash with a raw 500 in the
+  request thread on a hyphen-less name — re-checked and that's not accurate. `run_stage`, the
+  only caller of `command_fn`/`output_fn`, already validates `_valid_deployment_name()` (a strict
+  `name-YYYYMMDDTHHMM` regex) before touching either, so a malformed name gets a clean 400 well
+  before `_year()`/`output_fn` are ever reached. `output_fn` also turned out to be genuinely dead
+  code — nothing in the backend calls it at all, consistent with the separately-tracked "no
+  server-side stage-prerequisite gating" item below. **Fix:** added a `_valid_deployment_name(dep)`
+  guard (matching the pattern `run_stage` already used) to all six unguarded routes, returning a
+  400 before `_dep_dir` is ever called; also changed `_dep_dir`'s hyphen-less fallback from the
+  frozen `'2025'` literal to `datetime.datetime.now().year`, so it can't go stale again the same
+  way — defensive only, since every route path now rejects a hyphen-less name before reaching it.
 - **Two file-ingestion endpoints have opposite overwrite behavior:**
   `/api/deployment/<dep>/import-raw` (~1346-1383) refuses to overwrite an existing file;
   `/api/cac-files/upload` (~1597-1610) unconditionally overwrites with no existence check.

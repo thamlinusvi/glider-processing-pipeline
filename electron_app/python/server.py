@@ -258,7 +258,10 @@ def _options(_path=''):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _dep_dir(deployment):
-    year = deployment.split('-')[1][:4] if '-' in deployment else '2025'
+    # Fallback only matters for a hyphen-less name, which every route calling
+    # this now rejects via _valid_deployment_name() before it gets here --
+    # kept as a non-stale defensive default for any future/internal caller.
+    year = deployment.split('-')[1][:4] if '-' in deployment else str(datetime.datetime.now().year)
     d = os.path.join(BASE_DIR, 'deployments', year, deployment)
     os.makedirs(d, exist_ok=True)
     return d
@@ -315,6 +318,8 @@ def api_state():
 
 @app.route('/api/deployment/<dep>/state')
 def dep_state(dep):
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     dep_dir  = _dep_dir(dep)
     state    = load_state(dep_dir)
     nc_dir   = os.path.join(dep_dir, 'data', 'out', 'nc', 'sci-profile', 'delayed')
@@ -620,6 +625,8 @@ def stream_stage_logs(dep, stage):
     For all other stages: replays the in-memory live-log buffer then tails
     new lines as they arrive, so reconnect works after any page refresh.
     """
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     key     = (dep, stage)
     dep_dir = _dep_dir(dep)
 
@@ -807,6 +814,8 @@ def read_run_log():
 # ── File serving ──────────────────────────────────────────────────────────────
 @app.route('/api/deployment/<dep>/report')
 def serve_report(dep):
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     dep_dir = _dep_dir(dep)
     path    = os.path.join(dep_dir, 'reports', f'qc_report_{dep}.html')
     if not os.path.isfile(path):
@@ -856,6 +865,8 @@ def serve_file():
 
 @app.route('/api/deployment/<dep>/plots')
 def list_plots(dep):
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     dep_dir   = _dep_dir(dep)
     figs_dir  = os.path.join(dep_dir, 'figs')
     # deployment-wide plots (HTML from Plotly, PNG fallback)
@@ -2142,6 +2153,8 @@ def download_kmz(dep):
 @app.route('/api/deployment/<dep>/generate-map-image', methods=['POST'])
 def generate_map_image_route(dep):
     """Generate a static glider track map PNG from cached surfacing data."""
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     import base64, io
     import matplotlib
     matplotlib.use('Agg')
@@ -3804,6 +3817,8 @@ def dropbox_oauth_callback():
 def cloud_list_files(dep):
     """Return files organised into 5 upload categories for a deployment."""
 
+    if not _valid_deployment_name(dep):
+        return jsonify({'error': 'Invalid deployment name'}), 400
     dep_dir     = _dep_dir(dep)
     adcp_dir    = _adcp_base_dir(dep, False)
     dat_flt_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'flight_data')
