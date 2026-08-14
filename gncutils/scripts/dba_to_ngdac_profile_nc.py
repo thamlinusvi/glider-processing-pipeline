@@ -7,8 +7,8 @@ import argparse
 import tempfile
 import datetime
 import shutil
-from gncutils.ProfileNetCDFWriter import ProfileNetCDFWriter
-from gncutils.readers.dba import create_llat_dba_reader
+from gncutils.writers.slocum.ProfileNetCDFWriter import ProfileNetCDFWriter
+from gncutils.readers.slocum import create_llat_dba_reader
 from gncutils.yo import slice_sensor_data, find_profiles
 from gncutils.constants import NETCDF_FORMATS, LLAT_SENSORS
 from gncutils.validate import validate_sensors, validate_ngdac_var_names
@@ -131,7 +131,7 @@ def main(args):
         dba['data'] = np.append(dba['data'], np.expand_dims(prac_sal, axis=1), axis=1)
 
         # Calculate density
-        density = calculate_density(ctd_data[:, 0], ctd_data[:, 5], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)
+        density = calculate_density(ctd_data[:, 6], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)
         # Add density to the dba
         dba['sensors'].append({'attrs': ncw.nc_sensor_defs['density']['attrs'], 'sensor_name': 'density'})
         dba['data'] = np.append(dba['data'], np.expand_dims(density, axis=1), axis=1)

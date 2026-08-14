@@ -845,6 +845,70 @@ Docker):
 
 ---
 
+### 16. `rugliderqc/scripts/check_duplicate_timestamps.py` (additional fix — unclosed file handles)
+
+**Type:** Bug fix — resource leak / latent HDF5 multi-reader risk
+
+**Root cause:**
+`ds`/`ds2` were only closed on the early-exit error branches (`OSError`, `IndexError`, the
+already-renamed-file skip). All three normal-outcome branches of the actual timestamp comparison —
+ds2 is the duplicate, ds is the duplicate, or neither is — fell straight through to the next loop
+iteration without closing either handle. That's the common case, not an edge case: it fired on
+essentially every iteration of a ~625-file loop. xarray doesn't close a file just because the
+Python reference is dropped — it defers to `CachingFileManager`'s global LRU cache (default cap
+128 files), so a run this size comfortably exceeded that cap, and there's a concrete window at the
+loop boundary where the same file is briefly open via two handles at once (the file that's `ds2` in
+iteration `i` gets reopened as `ds` in iteration `i+1` before the old `ds2` reference is
+overwritten) — the same class of risk this pipeline already treats as unsafe for HDF5 elsewhere
+(`server.py`'s `_nc_lock`/`_TRAJ_WORKERS=1`).
+
+**What changed:** wrapped the three comparison branches in a single `try/finally` that
+unconditionally closes both `ds` and `ds2`, so every path through the loop closes both handles
+exactly once.
+
+```python
+# ORIGINAL — ds/ds2 only closed on the error branches above; every normal
+# comparison outcome (all three branches below) leaked both handles
+if set(ds2.time.values).issubset(ds.time.values):
+    os.rename(f2, f'{f2}.duplicate')
+    ...
+elif set(ds.time.values).issubset(ds2.time.values):
+    try:
+        os.rename(f, f'{f}.duplicate')
+        ...
+    except FileNotFoundError:
+        continue
+else:
+    continue
+```
+
+```python
+# PIPELINE — try/finally guarantees both handles close on every path
+try:
+    if set(ds2.time.values).issubset(ds.time.values):
+        os.rename(f2, f'{f2}.duplicate')
+        ...
+    elif set(ds.time.values).issubset(ds2.time.values):
+        try:
+            os.rename(f, f'{f}.duplicate')
+            ...
+        except FileNotFoundError:
+            continue
+    else:
+        continue
+finally:
+    ds.close()
+    ds2.close()
+```
+
+No crash observed in practice — confirmed via a real Stage 8 run's log that this script completes
+cleanly — so this was a latent risk, not a confirmed failure.
+
+**To revert:** remove the `try:`/`finally: ds.close(); ds2.close()` wrapper and the `ds.close()`
+calls it added, restoring the original fall-through branches.
+
+---
+
 ### Unchanged scripts
 
 | Script | Status |
@@ -1020,6 +1084,159 @@ with open(self._instruments_config_path, 'r', encoding='utf-8-sig') as fid:
 
 ---
 
+### 2. `gncutils/gncutils/writers/slocum/ProfileNetCDFWriter.py` and `TrajectoryNetCDFWriter.py`
+
+**Type:** Bug fix — Docker/Windows EPERM on re-run
+
+**Root cause:**
+Re-running Stage 2a/4/5 against an already-processed deployment failed `EPERM` on every single
+output file. This pipeline's Docker containers run as non-root user `glider`, and Docker Desktop's
+Windows bind mount reports every *pre-existing* file as owned by root regardless of which
+container actually wrote it — a `rename()`-based overwrite of a root-owned file by the non-root
+`glider` process (i.e. `shutil.move(tmp_nc, out_nc_file)` when `out_nc_file` already exists) is
+rejected with `[Errno 1] Operation not permitted`, even though the mode bits report `0o777`
+(world-writable). A fresh run (no file yet at the target path) is unaffected, so the bug only
+showed up on re-runs — but hit every file in the run, not just some.
+
+**What changed:** both writers now `os.remove(out_nc_file)` immediately before `shutil.move()`,
+in both of `ProfileNetCDFWriter.py`'s write paths (`dbas_to_profile_nc`/`dba_obj_to_profile_nc`)
+and `TrajectoryNetCDFWriter.py`'s. `os.remove()` succeeds on a root-owned file because unlink is
+governed by the containing directory's write permission, not the file's owner — confirmed
+directly against a real root-owned output file. Also fixed a related latent bug found in
+`TrajectoryNetCDFWriter.py`'s same except-block while there: its error log line used
+`'{:s}: {:s}'.format(tmp_nc, e)` — formatting an exception object with an explicit `s`
+presentation type raises `TypeError` (exceptions don't implement `__format__`), so logging the
+original error would itself have crashed instead of the intended graceful `continue`.
+
+```python
+# ORIGINAL (TrajectoryNetCDFWriter.py; ProfileNetCDFWriter.py's two sites lacked the
+# os.remove() guard identically, without the format-string bug)
+if nc_file:
+    try:
+        shutil.move(tmp_nc, out_nc_file)
+    except IOError as e:
+        self._logger.error('Error moving temp NetCDF file {:s}: {:s}'.format(tmp_nc, e))
+        continue
+```
+
+```python
+# PIPELINE
+if nc_file:
+    try:
+        if os.path.isfile(out_nc_file):
+            os.remove(out_nc_file)
+        shutil.move(tmp_nc, out_nc_file)
+    except IOError as e:
+        self._logger.error('Error moving temp NetCDF file {:s}: {:}'.format(tmp_nc, e))
+        continue
+```
+
+**Verified end-to-end against real data:** re-ran the actual Stage 2a Docker command against
+`uvi_01-20241026T1158` (669 profiles, fully clobbering pre-existing output) — zero `EPERM` errors
+across the whole run (previously: every single file failed).
+
+**Note:** `gncutils/scripts/dba_to_ngdac_profile_nc.py` and
+`writers/navoceano/ProfileNetCDFWriter.py` have the identical unfixed pattern but aren't invoked
+anywhere in this pipeline's stage commands — left as-is.
+
+**To revert:** remove the `os.path.isfile(out_nc_file)`/`os.remove(out_nc_file)` guard from both
+files, and revert `TrajectoryNetCDFWriter.py`'s format string back to `'{:s}: {:s}'`.
+
+---
+
+### 3. `gncutils/gncutils/validate.py`
+
+**Type:** Bug fix — silent no-op validation
+
+**Root cause:** `validate_sensors()` set a local `validate = False` on a missing-sensor warning
+instead of `validated = False` — the returned `validated` flag was never actually set to `False`,
+so the function always returned `True` regardless of missing sensors. Its sibling function two
+lines below (`validate_ngdac_var_names`) does the identical check correctly, which is what makes
+this read as a copy/paste slip rather than intentional.
+
+```python
+# ORIGINAL
+def validate_sensors(sensor_defs, required_sensor_names):
+    validated = True
+    sensor_names = sensor_defs.keys()
+    for required_sensor in required_sensor_names:
+        if required_sensor not in sensor_names:
+            logger.warning('Missing llat sensor {:s}'.format(required_sensor))
+            validate = False
+    return validated
+```
+
+```python
+# PIPELINE
+def validate_sensors(sensor_defs, required_sensor_names):
+    validated = True
+    sensor_names = sensor_defs.keys()
+    for required_sensor in required_sensor_names:
+        if required_sensor not in sensor_names:
+            logger.warning('Missing llat sensor {:s}'.format(required_sensor))
+            validated = False
+    return validated
+```
+
+**Confirmed safe:** repo-wide grep found exactly one caller anywhere, `dba_to_ngdac_profile_nc.py`
+(see next entry) — not invoked by anything in this pipeline (`app/pipeline/stages.py`,
+`server.py`, `start_app.bat`, `package.json` — zero references), so this had no effect on any
+live behavior.
+
+**To revert:** `validated = False` → `validate = False` (line ~22).
+
+---
+
+### 4. `gncutils/scripts/dba_to_ngdac_profile_nc.py`
+
+**Type:** Bug fix — broken imports + wrong function-call arguments (dead code, no callers)
+
+**Root cause:** two independent defects, either one enough to make the script unrunnable, found
+while investigating the `validate.py` fix above:
+
+1. Two broken imports — `from gncutils.ProfileNetCDFWriter import ProfileNetCDFWriter` (actual
+   location: `gncutils.writers.slocum.ProfileNetCDFWriter`) and `from gncutils.readers.dba import
+   create_llat_dba_reader` (no such module; the real one is `gncutils.readers.slocum`) — both
+   raised `ModuleNotFoundError` at import time, confirmed against the paths the working sibling
+   script `dba_to_profile_nc.py` actually uses.
+2. A deeper bug the import fix alone wouldn't surface: `calculate_density(ctd_data[:, 0],
+   ctd_data[:, 5], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)` passed 6 positional args into
+   `ctd.py`'s 5-param `calculate_density(temperature, pressure, salinity, latitude, longitude)` —
+   and the columns themselves were mismatched, not just extra: `llat_time` was being passed as
+   temperature and conductivity as pressure, unlike the correctly-mapped
+   `calculate_practical_salinity` call one line above it. Would have raised `TypeError`
+   immediately after a successful import.
+
+```python
+# ORIGINAL
+from gncutils.ProfileNetCDFWriter import ProfileNetCDFWriter
+from gncutils.readers.dba import create_llat_dba_reader
+...
+density = calculate_density(ctd_data[:, 0], ctd_data[:, 5], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)
+```
+
+```python
+# PIPELINE
+from gncutils.writers.slocum.ProfileNetCDFWriter import ProfileNetCDFWriter
+from gncutils.readers.slocum import create_llat_dba_reader
+...
+density = calculate_density(ctd_data[:, 6], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)
+```
+
+**Verified:** spot-checked the rest of the script's `ProfileNetCDFWriter` method/attribute usage
+(`init_nc`, `open_nc`, `set_trajectory_id`, `set_container_variables`, `insert_var_data`,
+`finish_nc`, etc.) against the base/slocum writer classes — all present and used the same way the
+real, working `writers/slocum/ProfileNetCDFWriter.py` uses them internally.
+
+**Still not invoked by anything in this pipeline** — this fix makes the script *correct* if it's
+ever revived (e.g. for direct IOOS NGDAC submission, its apparent original purpose), not *wired
+in*.
+
+**To revert:** restore the two original import lines and the 6-argument `calculate_density` call
+shown above.
+
+---
+
 ## Docker Changes
 
 ### `Dockerfile`
@@ -1047,6 +1264,7 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `scripts/summarize_qartod_flags.py` | Bug fix + Py3.9 compat | Own summary-flag output matched its own input filter, ratcheting flags to only get worse on a re-run; `dt.UTC` not in Py3.9 |
 | `scripts/add_derived_variables.py` | RBR support + Py3.9 compat | `pressure` hardcoded (crashed calculate_ph, silently broke calculate_omega for RBR); `dt.UTC` not in Py3.9 |
 | `scripts/check_duplicate_timestamps.py` | Bug fix | Latent crash when renamed `.duplicate` file re-opened as "current" in next iteration; set `status=1` and broke pipeline chain |
+| `scripts/check_duplicate_timestamps.py` (again) | Bug fix | `ds`/`ds2` weren't closed on the normal (non-error) comparison path — leaked handles on nearly every iteration of a ~625-file loop |
 | `scripts/check_science_variables.py` | Bug fix | `ds.to_netcdf(f)` ran unconditionally, recreating the `.nc` file that was just renamed to `.nosci`; all 24 nosci profiles propagated through every downstream script |
 | `scripts/move_nc_files.py` | Bug fix | Shell `mv`'s exit code was discarded; a partial/failed move looked like success and the log count didn't reflect what actually moved |
 | `scripts/glider_qartod_qc.py` (again) | Refactor | Extracted regional streams-test loop into `run_regional_stream_tests()` so a new script could reuse it for `pH`; verified byte-identical |
@@ -1059,3 +1277,6 @@ Without these lines the Docker build fails at the `conda env create` step.
 | `Dockerfile` | Build fix | Anaconda ToS acceptance required by recent Miniconda |
 | **gncutils** | | |
 | `gncutils/writers/BaseTrajectoryNetCDFWriter.py` | BOM tolerance | 4 JSON reads updated to `utf-8-sig`; BOM-prefixed files (e.g. from Notepad) were silently skipping config |
+| `gncutils/writers/slocum/ProfileNetCDFWriter.py` + `TrajectoryNetCDFWriter.py` | Bug fix | Docker/Windows EPERM on re-run (root-owned bind-mount files); added `os.remove()` before `shutil.move()`; also fixed a format-string bug that would've crashed the error handler |
+| `gncutils/validate.py` | Bug fix | `validate_sensors()` set `validate = False` instead of `validated = False` — always returned `True`; dead code, no live callers |
+| `gncutils/scripts/dba_to_ngdac_profile_nc.py` | Bug fix | Broken imports + wrong `calculate_density()` arguments; dead code, no live callers, fix makes it correct if ever revived |

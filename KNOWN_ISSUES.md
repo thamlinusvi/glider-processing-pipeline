@@ -352,12 +352,31 @@ single-pass behavior — no regression.
   identical check correctly, which is what made this read as a copy/paste slip rather than
   intentional. **Confirmed safe to fix:** repo-wide grep found exactly one caller anywhere,
   `dba_to_ngdac_profile_nc.py:61` — and that script isn't invoked by anything in this pipeline
-  (`app/pipeline/stages.py`, `server.py`, `start_app.bat`, `package.json` — zero references) and
-  can't even be imported today regardless: it references `gncutils.ProfileNetCDFWriter` (actual
-  location: `gncutils.writers.slocum.ProfileNetCDFWriter`) and `gncutils.readers.dba` (no such
-  module; only `readers/slocum.py` and `readers/navoceano.py` exist), both raising
-  `ModuleNotFoundError` at import time. **Fix:** `validate = False` → `validated = False`.
+  (`app/pipeline/stages.py`, `server.py`, `start_app.bat`, `package.json` — zero references), so
+  this had no effect on anything live regardless of import-ability (see the next entry for that
+  script's own since-fixed brokenness). **Fix:** `validate = False` → `validated = False`.
   `gncutils` is bind-mounted live, no Docker rebuild needed for this to take effect.
+- **Fixed (2026-08-13): `dba_to_ngdac_profile_nc.py` had two separate defects that made it
+  unrunnable even though nothing in this pipeline calls it.** (1) Two broken imports:
+  `from gncutils.ProfileNetCDFWriter import ProfileNetCDFWriter` (actual location:
+  `gncutils.writers.slocum.ProfileNetCDFWriter`) and `from gncutils.readers.dba import
+  create_llat_dba_reader` (no such module; the real one is `gncutils.readers.slocum`) — both
+  raised `ModuleNotFoundError` at import time, confirmed against the correct paths the working
+  sibling script `dba_to_profile_nc.py` actually uses. (2) A deeper bug the import fix alone
+  wouldn't have surfaced: line 134's `calculate_density(ctd_data[:, 0], ctd_data[:, 5],
+  ctd_data[:, 1], prac_sal, mean_lat, mean_lon)` passed 6 positional args into
+  `ctd.py`'s 5-param `calculate_density(temperature, pressure, salinity, latitude, longitude)` —
+  and not just an extra argument, the columns themselves were mismatched (passing `llat_time` as
+  temperature and conductivity as pressure), unlike the correctly-mapped `calculate_practical_salinity`
+  call one line above it. Would have raised `TypeError` immediately after a successful import.
+  **Fix:** corrected both import paths, and changed the call to
+  `calculate_density(ctd_data[:, 6], ctd_data[:, 1], prac_sal, mean_lat, mean_lon)` (temperature
+  = `sci_water_temp` column, pressure = `llat_pressure` column). Spot-checked the rest of the
+  script's `ProfileNetCDFWriter` method/attribute usage (`init_nc`, `open_nc`, `set_trajectory_id`,
+  `set_container_variables`, `insert_var_data`, `finish_nc`, etc.) against the base/slocum writer
+  classes — all present and used the same way the real, working `writers/slocum/ProfileNetCDFWriter.py`
+  uses them internally. Still not invoked by anything in this pipeline — this fix makes the
+  script *correct* if it's ever revived, not *wired in*.
 - Stray `.bak` files in the repo (`gncutils/gncutils/ctd.py.bak`, `__init__.py.bak`,
   `qc/config/global_regional/usvi_configs.yml.bak`) — the `__init__.py.bak` diff shows a real
   scipy-compat fix (`scipy.signal.boxcar` → `scipy.signal.windows.boxcar`) that isn't applied in
