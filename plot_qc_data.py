@@ -169,10 +169,13 @@ def plot_profiles(datasets, out_dir, nprofiles=20, min_depth=10):
             print(f'  [{i+1}/{total}] {fname} - skipped (no data)', flush=True)
             continue
 
+        # Safe NaN fill if depth is missing, matching the pattern used everywhere
+        # else in this file -- sci_water_pressure is raw bar-unit pressure, not
+        # meters, and was substituted here unconverted (~10x too small if ever used).
         depth = (
-            ds['depth'].values if 'depth' in ds.data_vars
-            else ds['sci_water_pressure'].values
-        ).astype(float)
+            ds['depth'].values.astype(float) if 'depth' in ds.data_vars
+            else np.full_like(ds[available[0][0]].values, np.nan, dtype=float)
+        )
 
         # Skip shallow dives (e.g. surface checkout dives) below the depth threshold
         depth_max = float(np.nanmax(depth)) if depth.size else 0.0

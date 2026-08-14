@@ -759,14 +759,27 @@ single-pass behavior — no regression.
   (2) re-ran against the real `uvi_01-20241026T1158` deployment to confirm zero regression — the
   new column is just always empty (`—`) for real data that has no deep flags today. (Section
   4.1's totals-by-variable table is computed independently and was never affected either way.)
-- **`plot_qc_data.py` has a depth-axis fallback that substitutes raw bar-unit pressure for
-  meter-unit depth with no conversion.** `plot_profiles` (~172-175): if `depth` is missing,
-  falls back to `ds['sci_water_pressure'].values` directly, still labeled `'Depth (m)'` for
-  every subplot — the same bar-vs-dbar confusion class as the (now-fixed) pressure gross-range
-  test, would compress the apparent depth axis ~10x. Every other depth fallback in this file (and in `qc_report.py`) uses
-  a safe NaN fill instead, making this one function look like a copy/paste slip. Traced as
-  currently dormant — `depth` (`llat_depth`) is part of the standard `PROFILE_SENSORS` set and
-  appears to always be emitted — but a live landmine if that ever changes.
+- **Fixed (2026-08-14): `plot_qc_data.py` had a depth-axis fallback that substituted raw
+  bar-unit pressure for meter-unit depth with no conversion.** `plot_profiles()`
+  (`plot_qc_data.py:172-175`): if `depth` was missing, fell back to
+  `ds['sci_water_pressure'].values` directly, still labeled `'Depth (m)'` for every subplot —
+  the same bar-vs-dbar confusion class as the earlier fixed pressure gross-range test, would
+  compress the apparent depth axis ~10x. Confirmed the "copy/paste slip" read directly: the
+  other two depth fallbacks in this same file (`plot_qc_data.py:457-461` and `:561-563`) both
+  already used a safe `np.full_like(t, np.nan)` fill — `plot_profiles` (notably the *first* one
+  in the file) was the one outlier still doing the wrong thing. Confirmed dormant with real
+  evidence rather than assumption: checked all 625 real NC files in the current deployment's QC
+  output, zero are missing `depth`. **Fix:** matched the file's own established pattern — safe
+  NaN fill shaped from the first available science variable (`plot_profiles` doesn't have an
+  already-extracted array like `t`/`v` in scope at that point, unlike the other two sites, so
+  used `available[0][0]`'s shape instead, guaranteed non-empty by the existing `if not
+  available: continue` guard a few lines above). Verified against real data both ways: with
+  `depth` present, the fallback branch produces byte-identical output to before (confirmed
+  exact match against the real array); with `depth` explicitly dropped from a real dataset, the
+  fallback now correctly produces an all-NaN array of the right shape instead of the raw
+  `sci_water_pressure` bar values — confirmed those really would have differed by the expected
+  ~10x at real depth (the printed sample happened to look numerically close purely because that
+  particular profile segment was very shallow, where the ~10x gap in absolute terms is tiny).
 - **`fix_trajectoryprofile_metadata.py`'s auto-created `profile_id` fallback mis-dimensions the
   variable.** Lines 61-70: when no `cf_role=="profile_id"` variable exists anywhere *and* no
   `profile_id` variable exists at all, it falls back to
