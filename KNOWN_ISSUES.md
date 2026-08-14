@@ -583,9 +583,28 @@ single-pass behavior — no regression.
   sensor name containing µ/⁻¹/CJK characters through the real `/api/sensor-sets` endpoint and
   called `write_json()` directly with the same test data — both produced clean UTF-8 with no
   BOM, and the content round-tripped back to the exact original string on read.
-- **`_current_sensor_sets()` (~1212-1238) silently defaults `trajectory_flight` to the full**
-  `trajectory` sensor set if not explicitly configured in `sensor_sets.json` — flight-only
-  trajectory NC files get the entire science sensor set unless someone deliberately narrows it.
+- **Fixed (2026-08-14): `_current_sensor_sets()` (server.py ~1489-1515) silently defaulted**
+  `trajectory_flight` to the full `trajectory` sensor set (science sensors included) whenever it
+  wasn't explicitly configured in `sensor_sets.json` — in both its code paths: the JSON-config
+  branch (`cfg.get('trajectory_flight', traj)`, no filtering) and the hardcoded-defaults fallback
+  (reused the full `bsd.TRAJECTORY_SENSORS` for both fields, ignoring `build_sensor_defs.py`'s
+  own already-correct module-level `TRAJECTORY_FLIGHT_SENSORS` constant, which strips `sci_*`).
+  Confirmed the live `glider_config_files_json/sensor_sets.json` already had an explicit,
+  correctly-filtered `trajectory_flight` key, so this wasn't biting current deployments — the gap
+  was a trap for the next brand-new glider/site config (or a deleted/reset `sensor_sets.json`),
+  where the Sensor Sets UI would pre-populate the flight-only tab with every science sensor
+  checked, and an unnoticed save would permanently bake that wrong set in. **Fix:** both fallback
+  paths now derive `trajectory_flight` the same sci_-stripped way `build_sensor_defs.py`'s own
+  `main()` already does — the JSON-config branch computes
+  `[s for s in traj if not s.startswith('sci_')]` when the key is absent, and the hardcoded
+  fallback now returns `sorted(bsd.TRAJECTORY_FLIGHT_SENSORS)` directly instead of re-deriving it
+  incorrectly. Verified directly against the real config: (1) regression check — with the real,
+  already-correct `trajectory_flight` key present, output is byte-identical to before (44
+  sensors, no change); (2) bug scenario — same real config with `trajectory_flight` deliberately
+  removed now correctly falls back to trajectory-minus-`sci_*` (44 sensors, zero `sci_*` leaked
+  in, matches `build_sensor_defs.py`'s own convention exactly); (3) deeper fallback —
+  `sensor_sets.json` missing entirely now correctly matches `build_sensor_defs.py`'s
+  `TRAJECTORY_FLIGHT_SENSORS` exactly (43 sensors, zero `sci_*` leaked in).
 - **`main.js` spawns Python via a hardcoded `'python'`**, not `python3` or a venv path
   (~line 18); also sets `webSecurity: false` on the BrowserWindow to allow `file://` iframes
   and localhost fetches.

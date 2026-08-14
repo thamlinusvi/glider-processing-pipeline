@@ -1492,11 +1492,13 @@ def _current_sensor_sets():
         with open(_SENSOR_SETS_CFG, encoding='utf-8-sig') as f:
             cfg = json.load(f)
         traj = sorted(cfg.get('trajectory', []))
+        # trajectory_flight defaults to trajectory minus sci_* if not explicitly
+        # configured -- flight-only deployments never record science sensors.
+        traj_flight_default = [s for s in traj if not s.startswith('sci_')]
         return {
             'profile':            sorted(cfg.get('profile', [])),
             'trajectory':         traj,
-            # trajectory_flight defaults to trajectory if not explicitly configured
-            'trajectory_flight':  sorted(cfg.get('trajectory_flight', traj)),
+            'trajectory_flight':  sorted(cfg.get('trajectory_flight', traj_flight_default)),
         }
     # Fall back to build_sensor_defs.py hardcoded defaults
     try:
@@ -1509,7 +1511,7 @@ def _current_sensor_sets():
         return {
             'profile':           sorted(bsd.PROFILE_SENSORS),
             'trajectory':        traj,
-            'trajectory_flight': traj,
+            'trajectory_flight': sorted(bsd.TRAJECTORY_FLIGHT_SENSORS),
         }
     except Exception:
         return {'profile': [], 'trajectory': [], 'trajectory_flight': []}
