@@ -509,10 +509,25 @@ single-pass behavior — no regression.
   cache from an earlier run now returns a real 73KB KMZ zip (200, valid `PK` zip signature)
   where it previously would have 404'd; confirmed no regression — a deployment with no cache
   anywhere still correctly 404s.
-- **`total_ah_used` (trajectory-report, ~1843-1845) is a naive `max - min` of
-  `m_coulomb_amphr`** across all concatenated trajectory files — doesn't detect a coulomb-counter
-  reset (battery swap, glider reboot mid-deployment), which would silently produce an implausible
-  amp-hour figure.
+- **Investigated and ruled out as a bug (2026-08-14): `total_ah_used` (trajectory-report,
+  `max(m_coulomb_amphr) - min(m_coulomb_amphr)` across a deployment's trajectory files) was
+  flagged as not detecting a coulomb-counter reset (battery swap/reboot mid-deployment).**
+  Confirmed with Travis this doesn't apply to how this fleet is actually operated: resets are
+  operator-controlled and only ever happen between deployments, never mid-mission — and when a
+  non-rechargeable battery is reused across deployments, its existing coulomb value is
+  deliberately carried over rather than reset, specifically to keep the running amp-hour total
+  correct for that physical battery. Independently corroborated against the real Slocum master
+  sensor list (`masterdata_11_07.txt`): `m_coulomb_amphr` (`# integrated current, i.e. energy`)
+  is a distinct sensor from `m_coulomb_amphr_total` (`# persistant amp-hours total`, a
+  cross-deployment lifetime counter — not what this code reads), and the nearby
+  `m_bms_battery_pack_anomaly` sensor's comment — "resets when coulomb starts" — confirms resets
+  are tied to the *start* of a counting session (a deployment/battery-install boundary), not
+  something that can happen mid-session. Given resets can't occur mid-deployment, `max - min`
+  computed within one deployment's own data window is correct regardless of whether the battery
+  started that deployment at zero (fresh) or at a carried-over nonzero value (reused) — a range
+  calculation is invariant to its starting baseline. `total_ah_used` itself is confirmed to be a
+  value computed entirely in this codebase (`server.py`), not a native glider telemetry
+  variable. No fix needed.
 - **`/api/deployment/<dep>/metadata` swallows per-file JSON errors into `None`** (~1054-1066,
   bare `except Exception: files[rel] = None`) — a corrupted config JSON is indistinguishable
   from a legitimately empty one in the response, with no error surfaced to the frontend.
