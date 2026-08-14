@@ -836,6 +836,32 @@ single-pass behavior — no regression.
   cards, and reconnects SSE from scratch. Fix would be to show a cached last-known snapshot
   immediately and patch in fresh data — not yet implemented, explicitly deferred.
 
+  **Fixed (2026-08-14), partially — the plot-image re-fetch piece:** the biggest contributor
+  to the "laggy" feel wasn't the small `/api/adcp/status`/`/api/adcp/live-stages` JSON
+  payloads (cheap to fetch/diff) but `buildAdcpExportPanel`'s plot `<img>` URLs, which appended
+  an unconditional `_t=${Date.now()}` cache-buster — forcing every plot PNG (there can be
+  dozens across several runs, each hundreds of KB to ~1MB) to be re-fetched from the server on
+  *every* render, including every time the user just navigated back to the AD2CP section with
+  nothing new to show. Fixed by cache-busting on the plot file's real `mtime` instead:
+  `_file_info()` (`server.py`, used throughout `adcp_status()`) now returns
+  `mtime: os.path.getmtime(path)` alongside `exists`/`size`; `buildAdcpExportPanel` (`app.js`)
+  now carries `{stage, fn}` pairs through `allPlots` (previously flattened to bare filenames,
+  losing the stage association needed to look up the file entry) and builds each image URL's
+  `_t=` from `statusMap[stage]?.files?.[\`${currentRun}_${fn}\`]?.mtime` (falling back to
+  `Date.now()` defensively if unavailable) instead of always `Date.now()`. An unchanged plot
+  now reuses the browser's normal image cache across a re-render; only a plot a stage actually
+  regenerated gets a new mtime and a real re-fetch. Verified: `_file_info()` change confirmed
+  via a real Flask test-client call against `uvi_01-20260114T1932`'s actual AD2CP output
+  (dozens of real files across 6 runs, all returning correct non-zero mtimes); the frontend
+  lookup logic was simulated in Node against that same real `/api/adcp/status` JSON response,
+  confirming all 34 real plot entries across all 6 runs (`analysis`, `xaxis3_d10-1000`,
+  `xaxis3_d10-1000_y10`, `xaxis3_d10-1000_y5`, `xaxis3_d500-1000_y10`, `xaxis3_d500-1000_y2`)
+  resolve to a valid mtime with zero misses; `app.js` also re-checked with `node --check`.
+  **Not addressed by this fix** — still true and still deferred: the full DOM wipe
+  (`belowArea.innerHTML = ''`), the two-fetch/rebuild-all-stage-cards cost, and the SSE
+  reconnect on every visit. Those would need the "cache last-known snapshot, patch in fresh
+  data" approach described above, which Travis has not asked for.
+
 ## Not yet in this repo — flagged proactively for planned pipeline integration
 
 ⚠️ **External MATLAB oxygen-lag-correction script (not currently part of this codebase, but

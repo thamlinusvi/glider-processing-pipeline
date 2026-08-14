@@ -6043,12 +6043,19 @@ async function renderAdcp () {
         ]
 
     const allPlots = stagePlots.flatMap(({ stage, plots }) =>
-      statusMap[stage]?.done ? plots : [])
+      statusMap[stage]?.done ? plots.map(fn => ({ stage, fn })) : [])
 
     if (allPlots.length > 0) {
       const plotsArea = h('div', { class: 'adcp-plots-area' })
-      allPlots.forEach(fn => {
-        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${currentQs}&_t=${Date.now()}`
+      allPlots.forEach(({ stage, fn }) => {
+        // Cache-bust by the plot's real mtime instead of Date.now() -- an
+        // unchanged plot then reuses the browser's image cache across a
+        // re-render (e.g. navigating away from AD2CP and back) instead of
+        // being force-refetched every single time regardless of whether the
+        // underlying stage actually produced anything new. Falls back to
+        // Date.now() defensively if mtime isn't available for some reason.
+        const mtime = statusMap[stage]?.files?.[`${currentRun}_${fn}`]?.mtime
+        const url   = `${API}/api/adcp/plot/${encodeURIComponent(fn)}?${currentQs}&_t=${mtime || Date.now()}`
         const dlUrl = `${API}/api/adcp/download/${encodeURIComponent(fn)}?${currentQs}`
         const img   = h('img', { class: 'adcp-plot-img', src: url, alt: fn })
         img.onerror = () => img.parentElement?.remove()

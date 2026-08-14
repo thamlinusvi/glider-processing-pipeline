@@ -6090,7 +6090,14 @@ def adcp_status():
 
     def _file_info(path):
         exists = os.path.exists(path)
-        return {'exists': exists, 'size': os.path.getsize(path) if exists else 0}
+        return {
+            'exists': exists,
+            'size':   os.path.getsize(path) if exists else 0,
+            # Lets the frontend cache-bust plot <img> URLs by real mtime instead
+            # of Date.now(), so an unchanged plot reuses the browser's image
+            # cache across a re-render instead of being force-refetched every time.
+            'mtime':  os.path.getmtime(path) if exists else 0,
+        }
 
     # Shared stages (not option-dependent) — files live directly in base_dir
     shared_status = {}
