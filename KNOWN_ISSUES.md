@@ -438,13 +438,37 @@ single-pass behavior — no regression.
 - **Two file-ingestion endpoints have opposite overwrite behavior:**
   `/api/deployment/<dep>/import-raw` (~1346-1383) refuses to overwrite an existing file;
   `/api/cac-files/upload` (~1597-1610) unconditionally overwrites with no existence check.
-- **`/api/deployment/<dep>/rename`** (`rename_deployment`, ~1487-1537) renames a deployment
-  across **8 separate top-level path joins** (`incoming_data`, `deployments/<year>`,
-  `dat_files`, `gncutils_slocum_nc_output`, `post_processing`, `logs`, `ad2cp`,
-  `glider_config_files_json/<glider>`) one `os.rename()` at a time, with **no
-  transaction/rollback**. A mid-sequence failure leaves the deployment split across old/new
-  names in different folders; the response only reports `renamed`/`skipped`/`errors` lists —
-  nothing auto-reconciles.
+- **Fixed (2026-08-14): `/api/deployment/<dep>/rename`** (`rename_deployment`, ~1649-1725)
+  renames a deployment across **8 separate top-level path joins** (`incoming_data`,
+  `deployments/<year>`, `dat_files`, `gncutils_slocum_nc_output`, `post_processing`, `logs`,
+  `ad2cp`, `glider_config_files_json/<glider>`) one `os.rename()` at a time. Two compounding
+  gaps, confirmed by reading the code directly: (1) only the `incoming_data` pair got a
+  pre-flight "does the destination already exist" check — the other 7 destinations were only
+  discovered to conflict when `os.rename()` itself threw mid-loop, by which point earlier
+  renames in the sequence were already committed; (2) a failure didn't stop the loop or roll
+  anything back, so the deployment ended up genuinely scattered — not "everything after the
+  failure point stays old," but exactly the one folder that failed staying old while everything
+  else (both before *and* after it in the sequence) still landed on the new name. Since
+  `incoming_data` runs first and always succeeds (it had its own pre-check and is rarely
+  locked), the deployment would start showing up under the *new* name in listings while its
+  actual pipeline state/QC output/logs stayed under the *old* name in whichever folder failed —
+  looking like lost history rather than a mis-filed folder. Realistic trigger given this runs
+  natively on Windows, not in Docker: a file inside one of these folders locked by another
+  process (antivirus, an open Explorer window) at the moment of rename. **Fix, two parts:**
+  (1) pre-flight-check all 8 destination paths before touching anything, failing cleanly with a
+  409 naming the conflicting path if any already exists (catches the "stale name collision from
+  an earlier partial failure" case for free, before any folder moves); (2) track each
+  successful rename in this batch and roll all of them back, in reverse order, if any later one
+  fails — so the deployment ends up either fully renamed or fully back on the old name, never
+  split. If the rollback itself fails on one of the reversals (e.g. the same lock is still
+  held), the response says so explicitly (`rollback_error`, distinct from the normal
+  `rolled_back: true` case) rather than silently claiming success. Verified with a real Flask
+  test-client run across all three paths: (1) a full 8-location rename succeeds and leaves
+  nothing under the old name; (2) a destination collision seeded at a non-`incoming_data`
+  location (simulating a stale leftover) is rejected with 409 before any folder moves, old
+  deployment fully intact; (3) `os.rename` mocked to fail on the 3rd call (after 2 real
+  successes) — response reports `rolled_back: true`, `renamed: []`, and the deployment is
+  confirmed fully back under the old name in all 8 locations, nothing left under the new one.
 - **Disk cache staleness is mtime-based, not content-based** (`_load_disk_cache`/
   `_save_disk_cache`, ~209-234) — a file copied with timestamp preservation would leave the
   cache silently stale.

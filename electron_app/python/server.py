@@ -1664,57 +1664,74 @@ def rename_deployment(dep):
     if running:
         return jsonify({'error': 'A stage is currently running — stop it before renaming'}), 409
 
-    # incoming_data is the source of truth; must exist
-    old_inc = os.path.join(BASE_DIR, 'incoming_data', dep)
-    new_inc = os.path.join(BASE_DIR, 'incoming_data', new_name)
-    if not os.path.isdir(old_inc):
-        return jsonify({'error': f'Deployment folder not found: {old_inc}'}), 404
-    if os.path.exists(new_inc):
-        return jsonify({'error': f'"{new_name}" already exists'}), 409
-
-    renamed, skipped, errors = [], [], []
-
-    def _try_rename(old_path, new_path, label):
-        if os.path.isdir(old_path):
-            try:
-                os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                os.rename(old_path, new_path)
-                renamed.append(label)
-            except Exception as exc:
-                errors.append(f'{label}: {exc}')
-        else:
-            skipped.append(label)
-
-    _try_rename(old_inc, new_inc, 'incoming_data')
-
-    # deployments/<year>/<dep>  (year may change if date part of name changes)
     old_year = dep.split('-')[1][:4]      if '-' in dep      else '2025'
     new_year = new_name.split('-')[1][:4] if '-' in new_name else old_year
-    _try_rename(
-        os.path.join(BASE_DIR, 'deployments', old_year, dep),
-        os.path.join(BASE_DIR, 'deployments', new_year, new_name),
-        'deployments',
-    )
-
-    # Flat directories that are keyed directly by deployment name
-    for folder in ('dat_files', 'gncutils_slocum_nc_output', 'post_processing', 'logs', 'ad2cp'):
-        _try_rename(
-            os.path.join(BASE_DIR, folder, dep),
-            os.path.join(BASE_DIR, folder, new_name),
-            folder,
-        )
-
-    # glider_config_files_json/<glider>/<dep>
     old_glider = dep.split('-')[0]
     new_glider = new_name.split('-')[0]
-    _try_rename(
+
+    # (old_path, new_path, label) for every location keyed by deployment name.
+    # incoming_data is the source of truth and is listed (and checked) first.
+    pairs = [
+        (os.path.join(BASE_DIR, 'incoming_data', dep),
+         os.path.join(BASE_DIR, 'incoming_data', new_name), 'incoming_data'),
+        (os.path.join(BASE_DIR, 'deployments', old_year, dep),
+         os.path.join(BASE_DIR, 'deployments', new_year, new_name), 'deployments'),
+    ]
+    for folder in ('dat_files', 'gncutils_slocum_nc_output', 'post_processing', 'logs', 'ad2cp'):
+        pairs.append((os.path.join(BASE_DIR, folder, dep),
+                      os.path.join(BASE_DIR, folder, new_name), folder))
+    pairs.append((
         os.path.join(BASE_DIR, 'glider_config_files_json', old_glider, dep),
         os.path.join(BASE_DIR, 'glider_config_files_json', new_glider, new_name),
         'glider_config_files_json',
-    )
+    ))
 
-    if errors:
-        return jsonify({'error': '; '.join(errors), 'renamed': renamed, 'skipped': skipped}), 500
+    if not os.path.isdir(pairs[0][0]):
+        return jsonify({'error': f'Deployment folder not found: {pairs[0][0]}'}), 404
+
+    # Pre-flight: check every destination before touching anything, so a
+    # stale/partial name collision (e.g. left over from an earlier failed
+    # rename) fails cleanly up front instead of being discovered mid-rename,
+    # after some folders have already moved.
+    conflicts = [new_path for _, new_path, _ in pairs if os.path.exists(new_path)]
+    if conflicts:
+        return jsonify({'error': f'"{new_name}" already exists: {conflicts[0]}'}), 409
+
+    renamed, skipped, completed = [], [], []  # completed: (new_path, old_path), for rollback
+
+    for old_path, new_path, label in pairs:
+        if not os.path.isdir(old_path):
+            skipped.append(label)
+            continue
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            os.rename(old_path, new_path)
+            renamed.append(label)
+            completed.append((new_path, old_path))
+        except Exception as exc:
+            # Roll back everything already renamed in this batch, in reverse
+            # order, so the deployment ends up either fully renamed or fully
+            # back on the old name -- never scattered across both.
+            rollback_errors = []
+            for done_new, done_old in reversed(completed):
+                try:
+                    os.rename(done_new, done_old)
+                except Exception as rb_exc:
+                    rollback_errors.append(f'{done_new} -> {done_old}: {rb_exc}')
+            if rollback_errors:
+                return jsonify({
+                    'error': f'{label}: {exc}',
+                    'rollback_error': (
+                        'Rename failed partway through AND automatic rollback also failed '
+                        'for some folders -- manual fix needed: ' + '; '.join(rollback_errors)
+                    ),
+                    'skipped': skipped,
+                }), 500
+            return jsonify({
+                'error': f'{label}: {exc}',
+                'rolled_back': True,
+                'renamed': [], 'skipped': skipped,
+            }), 500
 
     # Transfer nickname to the new name
     nicks = _load_nicknames()
