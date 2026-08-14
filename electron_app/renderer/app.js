@@ -854,8 +854,16 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
 
     // Restore state if this stage is currently running or has prior log output
     if (activeRuns[sk]) {
-      // This page session started the run — reconnect live DOM refs and replay log
-      stageEls[sk] = { log, badge, btnRun, btnAbort }
+      // This page session started the run — reconnect live DOM refs and replay log.
+      // Include timingEl so doRun()'s still-running setInterval (it looks up
+      // stageEls[sk]?.timingEl fresh on every tick, since the JS execution that
+      // started it isn't torn down by in-app navigation) picks up this rebuilt
+      // card's new element instead of silently writing to the orphaned old one.
+      stageEls[sk] = { log, badge, btnRun, btnAbort, timingEl }
+      if (stateEntry.started_at) {
+        const s = Math.max(0, Math.round((Date.now() - new Date(stateEntry.started_at)) / 1000))
+        timingEl.textContent = `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+      }
       ;(stageLogs[sk] || []).forEach(line => appendLog(log, line))
       log.classList.remove('hidden')
       btnRun.classList.add('hidden')
@@ -872,6 +880,16 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
 
       const note = h('div', { class: 'stage-running-note' })
 
+      // No live JS execution survives a real page reload / app restart, so unlike
+      // the same-session branch above there's no existing interval to reconnect --
+      // this one has to be created fresh, seeded from the real started_at, and torn
+      // down explicitly wherever this run's completion is detected below.
+      let _reconnectTimingIv = null
+      if (stateEntry.started_at) {
+        const s = Math.max(0, Math.round((Date.now() - new Date(stateEntry.started_at)) / 1000))
+        timingEl.textContent = `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+      }
+
       function showReconnectBtn () {
         note.innerHTML = ''
         const btn = h('button', { class: 'btn-secondary', style: 'margin-left:8px',
@@ -881,6 +899,7 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
       }
 
       function applyFinishedState (st) {
+        clearInterval(_reconnectTimingIv)
         note.remove()
         log.classList.remove('hidden')
         btnRun.classList.remove('hidden')
@@ -896,7 +915,7 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
         note.innerHTML = '⏳ Connecting…'
         const controller = new AbortController()
         activeRuns[sk] = controller
-        stageEls[sk]   = { log, badge, btnRun, btnAbort }
+        stageEls[sk]   = { log, badge, btnRun, btnAbort, timingEl }
         stageLogs[sk]  = []
 
         try {
@@ -923,6 +942,18 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
           // Successfully connected — show log pane, hide note
           note.remove()
           log.classList.remove('hidden')
+
+          // (Re)start the live timer, seeded from the real started_at rather than
+          // from now, so it reflects true elapsed time, not just time-since-reconnect.
+          clearInterval(_reconnectTimingIv)
+          const _t0 = stateEntry.started_at ? new Date(stateEntry.started_at).getTime() : Date.now()
+          _reconnectTimingIv = setInterval(() => {
+            const el = stageEls[sk]
+            if (el?.timingEl) {
+              const s = Math.max(0, Math.round((Date.now() - _t0) / 1000))
+              el.timingEl.textContent = `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
+            }
+          }, 1000)
 
           const reader = resp.body.getReader(), decoder = new TextDecoder()
           let buffer = ''
@@ -951,6 +982,7 @@ function buildStageCard (sk, info, initialStatus, dep, stateEntry = {}) {
             }
           }
         } catch (e) {
+          clearInterval(_reconnectTimingIv)
           if (e.name !== 'AbortError') { appendLog(log, 'Stream error: ' + e.message); log.classList.remove('hidden') }
           delete activeRuns[sk]; delete stageEls[sk]
           showReconnectBtn()
