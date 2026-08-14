@@ -780,16 +780,30 @@ single-pass behavior — no regression.
   `sci_water_pressure` bar values — confirmed those really would have differed by the expected
   ~10x at real depth (the printed sample happened to look numerically close purely because that
   particular profile segment was very shallow, where the ~10x gap in absolute terms is tiny).
-- **`fix_trajectoryprofile_metadata.py`'s auto-created `profile_id` fallback mis-dimensions the
-  variable.** Lines 61-70: when no `cf_role=="profile_id"` variable exists anywhere *and* no
-  `profile_id` variable exists at all, it falls back to
-  `dim_size = ds.dims.get("profile", ds.dims.get("time", 1))`. Confirmed via grep that
-  gncutils's writers never create a dimension literally named `"profile"` (profile files use
-  `"time"` as their sole per-observation dimension) — so this fallback would create a **new**
-  `"profile"` dimension sized to the time-series length and assign one sequential `profile_id`
-  **per timestep** instead of one per profile, the opposite of correct CF-TrajectoryProfile
-  semantics, directly undermining the script's own purpose. Traced as likely dormant today since
-  `profile_id` is part of the standard sensor-defs set and normally already present.
+- **Fixed (2026-08-14): `fix_trajectoryprofile_metadata.py`'s auto-created `profile_id`
+  fallback mis-dimensioned the variable.** (`fix_trajectoryprofile_metadata.py:61-69`): when no
+  `cf_role=="profile_id"` variable existed anywhere *and* no `profile_id` variable existed at
+  all, it fell back to `dim_size = ds.dims.get("profile", ds.dims.get("time", 1))`. Confirmed on
+  a real file that these profile NC files only ever have a `"time"` dimension (`dims: {'time':
+  61}`), never one literally named `"profile"` — so this always missed the first lookup and fell
+  through to `time`'s size, creating a **new** `"profile"` dimension sized to the time-series
+  length and assigning one sequential ID **per timestep** instead of one per profile — the
+  opposite of correct CF-TrajectoryProfile semantics. Confirmed dormant with real evidence: a
+  real file already has `profile_id` present, correctly scalar (`dims: ()`), with `cf_role`
+  already set — both of the fallback's guard conditions are false today. **Found the right way
+  to fix it, not just a generic patch:** compared a real file's actual `profile_id` value
+  (`1729943504.0`) against that same file's `profile_time` (`1729943504.9135242`) — they match
+  to the integer second, confirming `profile_id` in this pipeline is meant to be an
+  integer-truncated `profile_time`, matching an identical convention already documented
+  elsewhere in this codebase (`dba_to_ngdac_profile_nc.py`: *"no start_profile_id given -> use
+  mean_profile_epoch"*). **Fix:** the fallback now creates a scalar `profile_id` (`((), value)`,
+  no new dimension) derived from `int(profile_time)` when available, falling back to a plain `1`
+  only if `profile_time` is also unavailable — matching the real, already-correct convention
+  instead of inventing a new one. Verified against real data three ways: a file that already has
+  a correct `profile_id` is left untouched ("No changes needed"); a file with `profile_id`
+  stripped but `profile_time` intact gets a scalar `profile_id` matching `int(profile_time)`
+  exactly, with no new `"profile"` dimension created; a file with *both* `profile_id` and
+  `profile_time` stripped cleanly falls back to `pid=1` with no crash.
 - **`build_sensor_defs.py`'s profile-defs builder has no fallback to `sci_defs`, unlike its two
   siblings.** `build_profile_sensor_defs` (~186-190) looks up keys only in `sci_defs`, while
   `build_trajectory_sensor_defs`/`build_trajectory_flight_sensor_defs` (~193-217) correctly fall

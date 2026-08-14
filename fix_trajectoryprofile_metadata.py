@@ -61,8 +61,21 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
             # Ensure profile_id variable with cf_role exists
             if not any(v.attrs.get("cf_role") == "profile_id" for v in ds.variables.values()):
                 if "profile_id" not in ds:
-                    dim_size = ds.dims.get("profile", ds.dims.get("time", 1))
-                    ds["profile_id"] = ("profile", np.arange(1, dim_size + 1, dtype=np.int32))
+                    # Scalar, one ID for the whole profile -- matches how a real
+                    # profile_id already looks elsewhere in this pipeline (an
+                    # integer-truncated profile_time, e.g. dba_to_ngdac_profile_nc.py's
+                    # "no start_profile_id given -> use mean_profile_epoch" convention).
+                    # The old fallback here created a *new* "profile" dimension sized to
+                    # "time" (these files only ever have a "time" dim, never "profile"),
+                    # producing one ID per timestep instead of one per profile.
+                    pid = None
+                    if "profile_time" in ds.variables:
+                        pt = float(ds["profile_time"].values.flat[0])
+                        if not np.isnan(pt):
+                            pid = int(pt)
+                    if pid is None:
+                        pid = 1  # no better identifier available for this single-profile file
+                    ds["profile_id"] = ((), np.int32(pid))
                 ds["profile_id"].attrs["cf_role"] = "profile_id"
                 ds["profile_id"].attrs["long_name"] = "Profile ID"
                 ds["profile_id"].attrs["comment"] = "Sequential profile number within the trajectory"
