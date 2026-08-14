@@ -959,6 +959,12 @@ button {
 .meta-file-item:hover  { background: #f4f7fb; }
 .meta-file-item.active { background: #ebf5fb; color: #1a5276; font-weight: 600; border-left: 3px solid #3498db; }
 .meta-file-item.meta-file-copied { background: #eafaf1; }
+.meta-file-item--error { color: #b3261e; }
+.meta-file-item--error.active { background: #fbeae9; color: #b3261e; border-left-color: #b3261e; }
+.meta-broken-banner {
+  margin-bottom: 10px; padding: 10px 14px; border-radius: 6px; font-size: 13px;
+  background: #fbeae9; border: 1px solid #f5b7b1; color: #7b241c;
+}
 .meta-file-menu-btn {
   flex-shrink: 0;
   background: none;

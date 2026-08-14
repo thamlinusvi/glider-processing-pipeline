@@ -1171,14 +1171,23 @@ def metadata(dep):
     glider     = dep.split('-')[0]
     config_dir = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
     files      = {}
+    errors     = {}
     for f in glob.glob(os.path.join(config_dir, '**', '*.json'), recursive=True):
         rel = os.path.relpath(f, config_dir)
         try:
             with open(f, encoding='utf-8-sig') as fp:
-                files[rel] = json.load(fp)
-        except Exception:
-            files[rel] = None
-    return jsonify({'files': files, 'config_dir': config_dir})
+                raw = fp.read()
+            files[rel] = json.loads(raw)
+        except Exception as exc:
+            # Keep the raw text so the frontend can offer in-place repair
+            # instead of silently treating this file as absent/empty.
+            try:
+                with open(f, encoding='utf-8-sig', errors='replace') as fp:
+                    raw = fp.read()
+            except Exception:
+                raw = ''
+            errors[rel] = {'message': str(exc), 'raw': raw}
+    return jsonify({'files': files, 'errors': errors, 'config_dir': config_dir})
 
 
 @app.route('/api/deployment/<dep>/metadata/save', methods=['POST'])
@@ -1454,7 +1463,7 @@ def save_sensor_sets():
     traj              = sorted(set(data.get('trajectory', [])))
     traj_flight       = sorted(set(data.get('trajectory_flight', [])))
     cfg               = {'profile': profile, 'trajectory': traj, 'trajectory_flight': traj_flight}
-    with open(_SENSOR_SETS_CFG, 'w') as f:
+    with open(_SENSOR_SETS_CFG, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2)
     return jsonify({'ok': True, 'profile_count': len(profile), 'traj_count': len(traj), 'traj_flight_count': len(traj_flight)})
 

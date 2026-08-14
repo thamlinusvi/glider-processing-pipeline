@@ -179,7 +179,7 @@ def load_json_dict(path):
 
 
 def write_json(path, obj):
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2)
 
 
@@ -275,7 +275,7 @@ def main():
         'trajectory':        sorted(TRAJECTORY_SENSORS),
         'trajectory_flight': sorted(TRAJECTORY_FLIGHT_SENSORS),
     }
-    with open(SENSOR_SETS_CONFIG, 'w') as f:
+    with open(SENSOR_SETS_CONFIG, 'w', encoding='utf-8') as f:
         json.dump(cfg_data, f, indent=2)
 
 

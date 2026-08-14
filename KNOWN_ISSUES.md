@@ -528,17 +528,54 @@ single-pass behavior — no regression.
   calculation is invariant to its starting baseline. `total_ah_used` itself is confirmed to be a
   value computed entirely in this codebase (`server.py`), not a native glider telemetry
   variable. No fix needed.
-- **`/api/deployment/<dep>/metadata` swallows per-file JSON errors into `None`** (~1054-1066,
-  bare `except Exception: files[rel] = None`) — a corrupted config JSON is indistinguishable
-  from a legitimately empty one in the response, with no error surfaced to the frontend.
-- **JSON writes don't follow the BOM-safe convention that JSON reads do.** `save_metadata`,
-  `save_sensor_sets` (server.py ~1092/1260) write with plain `open(path, 'w')`, no explicit
-  `encoding='utf-8'` — on Windows this falls back to the locale codepage. Non-ASCII characters
-  typed into the metadata editor risk silent mis-encoding or a crash. **Same pattern confirmed
-  in `build_sensor_defs.py`** (`write_json` ~181-183, and the final `sensor_sets.json` dump
-  ~278-279) — currently dormant there since the live sensor-defs source JSONs contain no
-  non-ASCII characters, unlike `qc_report.py`'s unit labels (`'S m⁻¹'`, `'µmol L⁻¹'`) elsewhere
-  in this codebase.
+- **Fixed (2026-08-14): `/api/deployment/<dep>/metadata` swallowed per-file JSON errors into
+  `None`, and tracing the actual consequence turned up a real data-loss path, not just an
+  ambiguous value.** `metadata()` (~1169-1181) used a bare `except Exception: files[rel] = None`.
+  On the frontend, `renderMetaView`'s `JSON.stringify(jsonData, null, 2) || '{}'` (`app.js`) does
+  NOT fall back to `'{}'` for `null` input — `JSON.stringify(null, ...)` returns the *string*
+  `"null"`, which is truthy, so the editor pane silently displayed the literal text `null` as if
+  it were the file's real content, with zero indication anything was wrong. Since a bare `null`
+  is itself syntactically valid JSON, `save_metadata`'s own `json.loads()` validation would
+  happily accept it — so a user who opened a corrupted file, saw `null`, and clicked Edit → Save
+  without noticing would have **permanently overwritten the original (possibly trivially
+  fixable) file content with a literal null**, with no warning at any point in that path. A
+  smaller instance of the same ambiguity existed in `_metaCopyFromPrev` (~2845-2848), which
+  treated "file doesn't exist in the source deployment" and "file exists but is corrupted" as
+  the same case, showing a misleading "not found" message for the latter. **Fix, four parts:**
+  (1) server now tracks parse failures in a separate `errors` dict (`{message, raw}` per file,
+  the original raw text preserved) instead of mixing a `None` sentinel into `files`; (2) the
+  frontend file list keeps a broken file visible (doesn't let it silently vanish just because it
+  failed to parse) but flags it with a warning marker and tooltip; (3) selecting a flagged file
+  goes straight into an editable view of its actual raw text — not a fake "null" — with a
+  persistent banner naming the real parse error, reusing the existing raw-JSON editor/save flow
+  (which already validates via `json.loads()` before writing) so a genuine fix saves cleanly and
+  a still-broken save is still correctly rejected; (4) `_metaCopyFromPrev` now checks the new
+  `errors` dict first and reports "has invalid JSON" distinctly from "not found". Verified
+  directly against the real backend: a mix of one valid and one deliberately corrupted JSON file
+  correctly split into `files`/`errors` with the raw broken text preserved byte-for-byte (not
+  collapsed to `"null"`); a full repair round-trip (save corrected content over the broken file,
+  re-fetch) correctly moved it back into `files` and out of `errors`.
+- **Fixed (2026-08-14): JSON writes didn't follow the BOM-safe convention that JSON reads
+  already use.** `save_metadata`, `save_sensor_sets` (server.py) and `build_sensor_defs.py`'s
+  `write_json`/`sensor_sets.json` dump wrote with plain `open(path, 'w')`, no explicit
+  `encoding='utf-8'` — on Windows this falls back to the locale codepage, risking silent
+  mis-encoding or a crash for any non-ASCII character typed into the metadata editor. **Note
+  while re-checking this:** `save_metadata` (server.py) turned out to already be fixed —
+  `git log` shows `encoding='utf-8'` was added in commit `02758f4` ("Fix metadata editor:
+  encoding crash on save...", 2026-08-11), six days after this entry was originally written, as
+  a side effect of an unrelated crash fix; nobody circled back to mark it done here. The other
+  three sites were still genuinely open: `save_sensor_sets` (server.py), and
+  `build_sensor_defs.py`'s `write_json` (~181-183) and its own separate `sensor_sets.json` dump
+  (~278-279) — worth noting these last two are two different write sites for the *same*
+  physical file (`glider_config_files_json/sensor_sets.json`, confirmed both `_SENSOR_SETS_CFG`
+  in server.py and `SENSOR_SETS_CONFIG` in build_sensor_defs.py resolve to it), so both needed
+  the fix, not just one. Currently dormant in practice since none of today's live sensor-defs
+  source JSONs contain non-ASCII characters, unlike `qc_report.py`'s unit labels
+  (`'S m⁻¹'`, `'µmol L⁻¹'`) elsewhere in this codebase. **Fix:** added `encoding='utf-8'` to all
+  three remaining write sites. Verified directly (not just by re-reading the diff): posted a
+  sensor name containing µ/⁻¹/CJK characters through the real `/api/sensor-sets` endpoint and
+  called `write_json()` directly with the same test data — both produced clean UTF-8 with no
+  BOM, and the content round-tripped back to the exact original string on read.
 - **`_current_sensor_sets()` (~1212-1238) silently defaults `trajectory_flight` to the full**
   `trajectory` sensor set if not explicitly configured in `sensor_sets.json` — flight-only
   trajectory NC files get the entire science sensor set unless someone deliberately narrows it.

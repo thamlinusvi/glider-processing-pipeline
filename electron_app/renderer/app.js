@@ -2352,7 +2352,14 @@ async function renderMetadata (selectRel) {
   try { md = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata`) }
   catch { page.appendChild(h('div', { class: 'empty-state' }, 'Could not load metadata.')); return }
 
-  const entries = Object.entries(md.files || {})
+  const entries = [
+    ...Object.entries(md.files || {}),
+    // Files that failed to parse as JSON -- kept visible (not silently dropped)
+    // and tagged so the list/viewer can flag them instead of pretending they're
+    // valid content. Carries the raw text through so it can be repaired in place.
+    ...Object.entries(md.errors || {}).map(([rel, err]) =>
+      [rel, { __metaError__: true, message: err.message, raw: err.raw }]),
+  ]
 
   if (!entries.length) {
     page.appendChild(_metaEmptyPanel(dep, md.config_dir))
@@ -2417,6 +2424,7 @@ async function renderMetadata (selectRel) {
     items.forEach(([rel, fileJson]) => {
       const filename = rel.split(/[\\/]/).pop()
       const isFirst  = firstEntry === null
+      const isError  = !!(fileJson && fileJson.__metaError__)
       if (isFirst) firstEntry = [rel, fileJson]
 
       // Single ⋯ menu button (shown on hover)
@@ -2427,7 +2435,7 @@ async function renderMetadata (selectRel) {
           e.stopPropagation()
           const anchor = e.currentTarget
           const actions = []
-          if (fileJson !== null) {
+          if (fileJson !== null && !isError) {
             actions.push({ label: 'Copy to section…', action: () => _metaCopySectionPopover(anchor, dep, group, filename, fileJson, renderMetadata) })
           }
           actions.push({ label: 'Import from disk…', action: () => _metaImportFileReplace(dep, rel, fileList, content) })
@@ -2452,10 +2460,11 @@ async function renderMetadata (selectRel) {
       }, '⋯')
 
       const item = h('div', {
-        class: 'meta-file-item' + (isFirst ? ' active' : ''),
+        class: 'meta-file-item' + (isFirst ? ' active' : '') + (isError ? ' meta-file-item--error' : ''),
         'data-rel': rel,
+        title: isError ? `Invalid JSON: ${fileJson.message}` : '',
         onclick: () => selectMetaFile(rel, fileJson, fileList, content, dep),
-      }, h('span', { class: 'meta-file-name' }, filename), menuBtn)
+      }, h('span', { class: 'meta-file-name' }, (isError ? '⚠ ' : '') + filename), menuBtn)
       fileList.appendChild(item)
     })
   })
@@ -2842,6 +2851,10 @@ async function _metaCopyFromPrev (dep, glider, rel, fileList, content) {
 
   try {
     const srcMeta = await apiFetch(`/api/deployment/${encodeURIComponent(srcDep)}/metadata`)
+    if (srcMeta.errors && srcMeta.errors[rel]) {
+      alert(`"${filename}" in ${srcDep} has invalid JSON and can't be copied: ${srcMeta.errors[rel].message}`)
+      return
+    }
     const srcJson = srcMeta.files[rel]
     if (srcJson === undefined || srcJson === null) {
       alert(`"${filename}" not found in ${srcDep}`)
@@ -2928,8 +2941,20 @@ function _pickSourceDeployment (currentDep, allDeps, currentGlider, filename) {
 }
 
 function renderMetaView (rel, jsonData, content, dep) {
-  const text = JSON.stringify(jsonData, null, 2) || '{}'
   content.innerHTML = ''
+
+  // File failed to parse server-side -- go straight into an editable view of
+  // its actual raw text (not a fake "null" placeholder) so it can be repaired
+  // in place, with a persistent banner explaining what's wrong.
+  if (jsonData && jsonData.__metaError__) {
+    renderMetaEdit(rel, jsonData.raw, content, dep, () => renderMetaView(rel, jsonData, content, dep))
+    content.prepend(h('div', { class: 'meta-broken-banner' },
+      h('strong', {}, 'Invalid JSON — '), jsonData.message,
+      h('br'), 'Fix the syntax below and Save to repair this file.'))
+    return
+  }
+
+  const text = JSON.stringify(jsonData, null, 2) || '{}'
 
   // sensor_defs.json gets a variable table instead of raw JSON
   if (rel.endsWith('sensor_defs.json') && jsonData && typeof jsonData === 'object') {
@@ -3256,7 +3281,7 @@ async function showBuildSensorDefs (dep) {
   }
 }
 
-function renderMetaEdit (rel, originalText, content, dep) {
+function renderMetaEdit (rel, originalText, content, dep, onCancel) {
   content.innerHTML = ''
   content.scrollTop = 0
 
@@ -3297,7 +3322,8 @@ function renderMetaEdit (rel, originalText, content, dep) {
   }}, 'Save')
 
   const cancelBtn = h('button', { class: 'btn-secondary', onclick: () => {
-    renderMetaView(rel, JSON.parse(originalText), content, dep)
+    if (onCancel) onCancel()
+    else renderMetaView(rel, JSON.parse(originalText), content, dep)
   }}, 'Cancel')
 
   const btnRow = h('div', { class: 'btn-row', style: 'margin-bottom:8px' },
