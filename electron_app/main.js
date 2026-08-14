@@ -1,7 +1,7 @@
 'use strict'
 
-const { app, BrowserWindow, shell, ipcMain } = require('electron')
-const { spawn }  = require('child_process')
+const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron')
+const { spawn, spawnSync } = require('child_process')
 const path       = require('path')
 const http       = require('http')
 
@@ -13,9 +13,43 @@ let pythonProcess = null
 let mainWindow    = null
 
 // ── Python server ─────────────────────────────────────────────────────────────
+// Resolve which command actually launches Python. Prefers the official
+// Windows "py" launcher when present: it's only ever installed by a real
+// python.org/Microsoft Store *interpreter* install, never by the separate
+// Microsoft Store "app execution alias" stub that can also masquerade as
+// python.exe on PATH and silently no-ops (or redirects to the Store) instead
+// of running anything -- so a bare 'python' lookup isn't reliable on its own.
+// `where`/`which` only resolves PATH, it doesn't execute the candidate, so
+// this can't itself trigger that stub's Store-redirect behavior.
+function resolvePythonCommand () {
+  const candidates = process.platform === 'win32'
+    ? [['py', ['-3']], ['python', []], ['python3', []]]
+    : [['python3', []], ['python', []]]
+  const whereCmd = process.platform === 'win32' ? 'where' : 'which'
+  for (const [cmd, extraArgs] of candidates) {
+    const found = spawnSync(whereCmd, [cmd], { stdio: 'ignore' })
+    if (found.status === 0) return { cmd, extraArgs }
+  }
+  return null
+}
+
+function reportStartupFailure (message) {
+  console.error(message)
+  dialog.showErrorBox('Glider Pipeline failed to start', message)
+  app.quit()
+}
+
 function startPython () {
-  const script = path.join(__dirname, 'python', 'server.py')
-  pythonProcess = spawn('python', [script, BASE_DIR, String(PORT)], {
+  const script  = path.join(__dirname, 'python', 'server.py')
+  const resolved = resolvePythonCommand()
+  if (!resolved) {
+    reportStartupFailure(
+      'No Python interpreter found on PATH (tried py, python, python3).\n' +
+      'Install Python and make sure it is on PATH, then restart the app.'
+    )
+    return
+  }
+  pythonProcess = spawn(resolved.cmd, [...resolved.extraArgs, script, BASE_DIR, String(PORT)], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   pythonProcess.stdout.on('data', d => process.stdout.write('[py] ' + d))
@@ -31,7 +65,13 @@ function waitForServer (cb, tries = 40) {
 }
 
 function retry (cb, tries) {
-  if (tries <= 0) { console.error('Python server never started'); return }
+  if (tries <= 0) {
+    reportStartupFailure(
+      `The Python backend did not respond at http://127.0.0.1:${PORT}/api/ping in time.\n` +
+      'Check the terminal/log output above for [py] errors.'
+    )
+    return
+  }
   setTimeout(() => waitForServer(cb, tries - 1), 300)
 }
 

@@ -605,9 +605,30 @@ single-pass behavior — no regression.
   in, matches `build_sensor_defs.py`'s own convention exactly); (3) deeper fallback —
   `sensor_sets.json` missing entirely now correctly matches `build_sensor_defs.py`'s
   `TRAJECTORY_FLIGHT_SENSORS` exactly (43 sensors, zero `sci_*` leaked in).
-- **`main.js` spawns Python via a hardcoded `'python'`**, not `python3` or a venv path
-  (~line 18); also sets `webSecurity: false` on the BrowserWindow to allow `file://` iframes
-  and localhost fetches.
+- **Fixed (2026-08-14): `main.js` spawned Python via a hardcoded `'python'`**, not `python3` or
+  a venv path (~line 18), unlike every other Python subprocess in this codebase
+  (`app/pipeline/stages.py` uses `sys.executable` throughout, guaranteeing it reuses whatever
+  interpreter is already running). This was a real, confirmed risk on the actual dev host: `where
+  python` returns **two** candidates — `...\Programs\Python\Python310\python.exe` (has all the
+  pipeline deps) and `...\Microsoft\WindowsApps\python.exe` (the Microsoft Store "app execution
+  alias" stub, which either no-ops or redirects to the Store instead of running anything real).
+  It only worked today because Python310 happened to win PATH-order — not a guarantee, and if the
+  wrong one ever won, `waitForServer`/`retry` just silently gave up after ~12s with a
+  console-only `"Python server never started"`, no window, no visible explanation. **Fix:** added
+  `resolvePythonCommand()`, which prefers the official Windows `py` launcher
+  (`spawnSync('where', ['py'])` to check presence — resolves PATH only, doesn't execute the
+  candidate, so it can't itself trigger the Store stub's redirect behavior) before falling back
+  to `python`/`python3` — `py` is only ever installed by a real python.org/Store *interpreter*
+  install, never by the alias stub, so preferring it sidesteps the ambiguity. Also added a real
+  user-visible failure path (`dialog.showErrorBox` + clean `app.quit()`) for both "no interpreter
+  found" and "server never responded," replacing the silent console-only hang. Verified: `where
+  py` / `py -3 --version` on this host resolves to the exact same Python 3.10.5 as bare `python`
+  today, confirming the fix is behavior-neutral for the current environment; did a full relaunch
+  of the real Electron app after the change (`taskkill` + `npm start`) and confirmed
+  `/api/ping` → `200 {"ok":true}` and real deployment data loaded correctly with no regressions.
+  **Not addressed** — `webSecurity: false` on the BrowserWindow (~line 50, allows `file://`
+  iframes and localhost fetches) is a separate, lower-stakes, deliberate tradeoff, not touched by
+  this fix.
 - **Fixed (2026-08-14): no server-side stage-prerequisite gating.** `STAGE_INFO` (`app/pipeline/stages.py`,
   9 stages) defines `source_fn`/`output_fn` per stage, but nothing consumed them to gate
   execution — `run_stage()` only checked the stage exists, isn't `manual`, and isn't already
