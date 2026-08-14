@@ -287,6 +287,15 @@ def _is_within(path, root_dir):
     return cand_real == root_real or cand_real.startswith(root_real + os.sep)
 
 
+def _dir_has_files(path):
+    """True if `path` is a directory containing at least one regular file
+    (non-recursive -- every STAGE_INFO source_fn directory is flat)."""
+    if not os.path.isdir(path):
+        return False
+    with os.scandir(path) as it:
+        return any(entry.is_file() for entry in it)
+
+
 _DEPLOYMENT_NAME_RE = re.compile(r'^[\w]+-\d{8}T\d{4}$')
 
 def _valid_deployment_name(dep):
@@ -459,17 +468,31 @@ def docker_wait():
 def run_stage(dep, stage):
     """Start a stage process; stream stdout as SSE."""
     if not _valid_deployment_name(dep):
-        return abort(400, 'Invalid deployment name')
+        return jsonify({'error': 'Invalid deployment name'}), 400
     if stage not in STAGE_INFO:
         return abort(404)
     info = STAGE_INFO[stage]
     if info.get('manual'):
-        return abort(400, 'Manual stage — use set-status instead')
+        return jsonify({'error': 'Manual stage — use set-status instead'}), 400
 
     key = (dep, stage)
     with _lock:
         if key in _procs:
-            return abort(409, f'Stage {stage} is already running for {dep}')
+            return jsonify({'error': f'Stage {stage} is already running for {dep}'}), 409
+
+    # Prerequisite gate: STAGE_INFO's source_fn defines each stage's expected
+    # input directory, but nothing consumed it to gate execution -- a direct
+    # API call or an out-of-order UI click could run a stage against an
+    # empty/missing input dir with no warning, leaving whatever the invoked
+    # script's own robustness happened to produce (or not).
+    source_fn = info.get('source_fn')
+    if source_fn:
+        source_dir = source_fn(BASE_DIR, dep)
+        if not _dir_has_files(source_dir):
+            return jsonify({
+                'error': f'Input for "{info["label"]}" is missing or empty: {source_dir}. '
+                         f'Run the prerequisite stage first.'
+            }), 409
 
     # For the report stage, read optional config params from the request body
     cmd_kwargs = {}

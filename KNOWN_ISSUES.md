@@ -582,12 +582,39 @@ single-pass behavior — no regression.
 - **`main.js` spawns Python via a hardcoded `'python'`**, not `python3` or a venv path
   (~line 18); also sets `webSecurity: false` on the BrowserWindow to allow `file://` iframes
   and localhost fetches.
-- **No server-side stage-prerequisite gating.** `STAGE_INFO` (`stages.py:338-447`) defines
-  `source_fn`/`output_fn` per stage, but nothing consumes them to gate execution — `run_stage()`
-  only checks the stage exists, isn't `manual`, and isn't already running. A direct API call (or
-  out-of-order UI click — no gating logic found in `app.js` either) can run e.g. Stage 8 or 9
-  against an empty/stale input directory; whether that's caught depends entirely on the invoked
-  script's own robustness, which is uneven (see `data_gap_check.py` above).
+- **Fixed (2026-08-14): no server-side stage-prerequisite gating.** `STAGE_INFO` (`app/pipeline/stages.py`,
+  9 stages) defines `source_fn`/`output_fn` per stage, but nothing consumed them to gate
+  execution — `run_stage()` only checked the stage exists, isn't `manual`, and isn't already
+  running. A direct API call (or out-of-order UI click — no gating logic in `app.js` either)
+  could run e.g. Stage 4 or 5 against an empty/stale input directory; whether that was caught
+  depended entirely on the invoked script's own robustness, which is uneven (see
+  `data_gap_check.py` above). **Fix:** added a `_dir_has_files()` helper (non-recursive — every
+  `source_fn` directory across all 9 stages is confirmed flat, no nested subdirs) and a gate in
+  `run_stage()`, right after the already-running check: if `info['source_fn'](BASE_DIR, dep)`
+  doesn't exist or has zero files, reject with a 409 naming the stage and the exact missing
+  path, before `command_fn` is ever built or any process is spawned. Scope note: this only
+  checks "is there *any* file present," not "is it the *right kind* of file" — `dbd_to_dat` and
+  `dbd_to_dat_flight` share the same `incoming_data/<dep>` source and are distinguished by
+  science-vs-flight-only file content, which this gate doesn't (and isn't meant to) validate;
+  the existing stage descriptions already leave that choice to the user's judgment. Also
+  verified `fix_metadata`'s `source_fn == output_fn` case (it edits profile NC files in place)
+  doesn't cause a false-positive block on re-runs — the check only cares whether the directory
+  is non-empty, not which stage most recently wrote to it. Verified directly: every real
+  prerequisite directory for an already-processed deployment (`uvi_01-20241026T1158`) correctly
+  detected as populated for all of `dbd_to_dat`/`dat_to_profile_nc`/`fix_metadata`/`qc`/`report`;
+  a real HTTP request against a valid-but-empty deployment name was rejected with 409 and a
+  clear message, confirmed via `_procs` that nothing was ever spawned or tracked.
+  **Related fix found while touching this function:** `run_stage()`'s pre-existing invalid-name,
+  manual-stage, and already-running checks used bare `abort(400/409, 'message')`, which Flask
+  renders as an HTML error page with no custom error handler registered — the frontend's
+  `apiFetch()` only extracts an error message from a JSON body, so all three messages were
+  silently dropped, leaving the user with a bare `"409 CONFLICT"` and no explanation. Converted
+  all three to `jsonify({'error': ...}), <code>`, matching this file's dominant convention (and
+  matching what the new gate above already uses). Verified directly: invalid-name and
+  already-running both now return proper `{'error': '<real message>'}` bodies; the
+  manual-stage branch is currently unreachable (no stage in `STAGE_INFO` is presently marked
+  `manual: True`, that's dormant infrastructure for a not-yet-used feature) but is fixed the
+  same way for whenever it is used.
 
 ## Frontend (`electron_app/renderer/app.js`) issues
 
