@@ -23,6 +23,9 @@ master_cac/
 # ── Sample / scratch data files ───────────────────────────────────────────────
 erddap_uvi02_sample.csv
 
+# ── Compiled installer (push explicitly with git add -f) ─────────────────────
+installer/*.exe
+
 # ── OS / editor / tooling ─────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
