@@ -54,6 +54,7 @@ Source: "{#AppRoot}\Dockerfile";              DestDir: "{app}"; Flags: skipifsou
 Source: "{#AppRoot}\requirements.txt";        DestDir: "{app}"
 Source: "{#AppRoot}\start_app.bat";           DestDir: "{app}"
 Source: "{#AppRoot}\update.bat";              DestDir: "{app}"
+Source: "{#AppRoot}\build_docker.bat";        DestDir: "{app}"
 Source: "{#AppRoot}\*.py";                    DestDir: "{app}"; Flags: skipifsourcedoesntexist
 Source: "{#AppRoot}\*.yml";                   DestDir: "{app}"; Flags: skipifsourcedoesntexist
 Source: "{#AppRoot}\*.yaml";                  DestDir: "{app}"; Flags: skipifsourcedoesntexist
@@ -67,9 +68,10 @@ Source: "icon.ico"; DestDir: "{app}\installer"
 ; ── Shortcuts ─────────────────────────────────────────────────────────────────
 [Icons]
 ; Start Menu
-Name: "{group}\{#AppName}";      Filename: "{app}\start_app.bat"; WorkingDir: "{app}"; IconFilename: "{app}\installer\icon.ico"
-Name: "{group}\Update App";      Filename: "{app}\update.bat";    WorkingDir: "{app}"; IconFilename: "{app}\installer\icon.ico"
-Name: "{group}\Uninstall";       Filename: "{uninstallexe}"
+Name: "{group}\{#AppName}";           Filename: "{app}\start_app.bat";     WorkingDir: "{app}"; IconFilename: "{app}\installer\icon.ico"
+Name: "{group}\Build Docker Image";   Filename: "{app}\build_docker.bat";  WorkingDir: "{app}"; Comment: "Run once after Docker Desktop is installed and running"
+Name: "{group}\Update App";           Filename: "{app}\update.bat";        WorkingDir: "{app}"; IconFilename: "{app}\installer\icon.ico"
+Name: "{group}\Uninstall";            Filename: "{uninstallexe}"
 ; Desktop
 Name: "{commondesktop}\{#AppName}"; Filename: "{app}\start_app.bat"; WorkingDir: "{app}"; IconFilename: "{app}\installer\icon.ico"; Tasks: desktopicon
 
@@ -119,20 +121,33 @@ begin
   if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c git --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
     Missing := Missing + '  • Git              https://git-scm.com/' + #13#10;
 
-  if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c docker --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
-    Missing := Missing + '  • Docker Desktop   https://www.docker.com/products/docker-desktop/' + #13#10;
-
   if Missing <> '' then
   begin
     MsgBox(
       'The following prerequisites must be installed before continuing:' + #13#10#13#10 +
       Missing + #13#10 +
-      'Install them, ensure Docker Desktop is running, then re-run this installer.',
+      'Install them and re-run this installer.',
       mbError, MB_OK
     );
     Result := False;
-  end else
-    Result := True;
+    Exit;
+  end;
+
+  // Docker is optional at install time — warn but allow install to proceed.
+  // After install, use the "Build Docker Image" Start Menu shortcut.
+  if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c docker --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
+    MsgBox(
+      'Docker Desktop was not found on PATH.' + #13#10#13#10 +
+      'The installer will continue, but most pipeline stages require Docker.' + #13#10 +
+      'To finish setup after installing Docker:' + #13#10 +
+      '  1. Install Docker Desktop: https://www.docker.com/products/docker-desktop/' + #13#10 +
+      '  2. Reboot the server' + #13#10 +
+      '  3. Start Docker Desktop and wait for "Engine running"' + #13#10 +
+      '  4. Run "Build Docker Image" from the Start Menu shortcut',
+      mbInformation, MB_OK
+    );
+
+  Result := True;
 end;
 
 // ── Data directory wizard page ────────────────────────────────────────────────
