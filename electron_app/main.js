@@ -4,10 +4,22 @@ const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron')
 const { spawn, spawnSync } = require('child_process')
 const path       = require('path')
 const http       = require('http')
+const fs         = require('fs')
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const PORT     = 5757
-const BASE_DIR = path.resolve(__dirname, '..')   // electron_app/../ = pipeline root
+const PORT = 5757
+
+// If an installer wrote glider_config.json, use its dataDir as BASE_DIR so the
+// app code and data directories can live in different places.  Falls back to the
+// repo-root sibling of electron_app/ for direct git-clone installs.
+function resolveBaseDir () {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'glider_config.json'), 'utf8'))
+    if (cfg && cfg.dataDir) return cfg.dataDir
+  } catch (_) {}
+  return path.resolve(__dirname, '..')
+}
+const BASE_DIR = resolveBaseDir()
 
 let pythonProcess = null
 let mainWindow    = null
