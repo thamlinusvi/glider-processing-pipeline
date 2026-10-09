@@ -158,13 +158,13 @@ begin
     'Select Data Directory',
     'Where should glider processing data be stored?',
     'The data directory holds all files created during processing:' + #13#10 +
-    #13#10 +
+    '' + #13#10 +
     '  deployments\       — per-deployment processed NetCDF, QC output, plots' + #13#10 +
     '  dat_files\         — intermediate .dat files from glider binary conversion' + #13#10 +
     '  incoming_data\     — raw .dbd / .ebd glider binary files to be processed' + #13#10 +
     '  ad2cp\             — AD2CP (ADCP) raw and processed data' + #13#10 +
     '  logs\              — pipeline run logs' + #13#10 +
-    #13#10 +
+    '' + #13#10 +
     'This can be on a different drive from the application.' + #13#10 +
     'Choose a location with plenty of free space (deployments can be many GB each).',
     False,
