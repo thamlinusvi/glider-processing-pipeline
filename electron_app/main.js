@@ -35,7 +35,7 @@ let mainWindow    = null
 // this can't itself trigger that stub's Store-redirect behavior.
 function resolvePythonCommand () {
   const candidates = process.platform === 'win32'
-    ? [['py', ['-3']], ['python', []], ['python3', []]]
+    ? [['py', ['-3.10']], ['py', ['-3']], ['python', []], ['python3', []]]
     : [['python3', []], ['python', []]]
   const whereCmd = process.platform === 'win32' ? 'where' : 'which'
   for (const [cmd, extraArgs] of candidates) {
