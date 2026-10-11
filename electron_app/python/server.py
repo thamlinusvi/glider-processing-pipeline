@@ -33,8 +33,8 @@ BASE_DIR = os.path.normpath(sys.argv[1]) if len(sys.argv) > 1 else \
            os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 PORT     = int(sys.argv[2]) if len(sys.argv) > 2 else 5757
 
-# Add the existing app/ directory so we can reuse stages + state unchanged
-APP_DIR = os.path.join(BASE_DIR, 'app')
+# app/ is always relative to this script's repo root, not the data BASE_DIR
+APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'app')
 sys.path.insert(0, APP_DIR)
 
 from flask import Flask, jsonify, request, Response, send_file, abort
