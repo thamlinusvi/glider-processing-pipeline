@@ -1773,7 +1773,7 @@ def rename_deployment(dep):
         (os.path.join(BASE_DIR, 'deployments', old_year, dep),
          os.path.join(BASE_DIR, 'deployments', new_year, new_name), 'deployments'),
     ]
-    for folder in ('dat_files', 'gncutils_slocum_nc_output', 'post_processing', 'logs', 'ad2cp'):
+    for folder in ('dat_files', 'gncutils_slocum_nc_output', 'AD2CP_post_processing', 'logs', 'ad2cp'):
         pairs.append((os.path.join(BASE_DIR, folder, dep),
                       os.path.join(BASE_DIR, folder, new_name), folder))
     pairs.append((
@@ -1866,7 +1866,7 @@ def delete_deployment(dep):
     _try_delete(os.path.join(BASE_DIR, 'deployments', year, dep),                      'deployments')
     _try_delete(os.path.join(BASE_DIR, 'dat_files', dep),                              'dat_files')
     _try_delete(os.path.join(BASE_DIR, 'gncutils_slocum_nc_output', dep),              'gncutils_slocum_nc_output')
-    _try_delete(os.path.join(BASE_DIR, 'post_processing', dep),                        'post_processing')
+    _try_delete(os.path.join(BASE_DIR, 'AD2CP_post_processing', dep),                  'AD2CP_post_processing')
     _try_delete(os.path.join(BASE_DIR, 'logs', dep),                                   'logs')
     _try_delete(os.path.join(BASE_DIR, 'ad2cp', dep),                                  'ad2cp')
     _try_delete(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep),       'glider_config_files_json')
@@ -4393,7 +4393,7 @@ def _adcp_run_label(opts):
 def _adcp_base_dir(dep, is_test):
     if is_test:
         return os.path.join(BASE_DIR, 'ad2cp', 'tests', dep, 'output')
-    return os.path.join(BASE_DIR, 'post_processing', dep, 'adcp')
+    return os.path.join(BASE_DIR, 'AD2CP_post_processing', dep, 'adcp')
 
 
 def _adcp_run_dir(base_dir, opts):

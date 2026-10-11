@@ -200,7 +200,7 @@ begin
     ForceDirectories(DataDir + '\ad2cp\tests');
     ForceDirectories(DataDir + '\logs');
     ForceDirectories(DataDir + '\gncutils_slocum_nc_output');
-    ForceDirectories(DataDir + '\post_processing');
+    ForceDirectories(DataDir + '\AD2CP_post_processing');
 
     // Remind user about credentials
     MsgBox(
