@@ -13,6 +13,9 @@ import sys
 
 DOCKER_IMAGE = 'glider-processing'
 
+# Repo root — scripts like qc_report.py live here, not in the data base_dir
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
 
 def _glider(deployment):
     return deployment.split('-')[0]          # 'uvi_01-20250318T2008' → 'uvi_01'
@@ -341,19 +344,19 @@ def report_command(base_dir, deployment, min_depth=10, nprofiles=20):
         nprofiles:  Number of evenly-spaced profiles to sample for per-profile plots.
                     Default: 20.
     """
-    report_script = os.path.join(base_dir, 'qc_report.py')
-    plot_script   = os.path.join(base_dir, 'plot_qc_data.py')
+    report_script = os.path.join(_REPO_DIR, 'qc_report.py')
+    plot_script   = os.path.join(_REPO_DIR, 'plot_qc_data.py')
     # Chain both scripts in one subprocess call so the server streams both outputs.
     # -u on each inner call forces unbuffered stdout so progress lines appear immediately.
     # Exit 1 if either script fails.
     runner = (
         'import subprocess, sys; '
-        f'r1 = subprocess.run([sys.executable, "-u", {repr(report_script)}, {repr(deployment)}]); '
+        f'r1 = subprocess.run([sys.executable, "-u", {repr(report_script)}, {repr(deployment)}, "--data_home", {repr(base_dir)}]); '
         f'r2 = subprocess.run([sys.executable, "-u", {repr(plot_script)}, {repr(deployment)}, '
-        f'"--nprofiles", str({nprofiles}), "--min_depth", str({min_depth})]); '
+        f'"--data_home", {repr(base_dir)}, "--nprofiles", str({nprofiles}), "--min_depth", str({min_depth})]); '
         'sys.exit(0 if r1.returncode == 0 and r2.returncode == 0 else 1)'
     )
-    return [sys.executable, '-u', '-c', runner], base_dir, {'PYTHONUNBUFFERED': '1', 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'}
+    return [sys.executable, '-u', '-c', runner], _REPO_DIR, {'PYTHONUNBUFFERED': '1', 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'}
 
 
 # ── Stage metadata (for UI) ───────────────────────────────────────────────────
