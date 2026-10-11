@@ -26,13 +26,24 @@ def _year(deployment):
 
 
 def _docker_run(base_dir, inner_cmd):
-    """Wrap inner_cmd (a bash -c string) in a docker run call."""
-    return [
-        'docker', 'run', '--rm',
-        '-v', f'{base_dir}:/home/glider',
-        DOCKER_IMAGE,
-        'bash', '-c', inner_cmd,
+    """Wrap inner_cmd (a bash -c string) in a docker run call.
+
+    Mounts the repo dir as /home/glider so app code (slocum/, gncutils/,
+    qc/, master_cac/) is present, then overlays data subdirectories from
+    base_dir on top so deployment data appears at the expected paths.
+    This supports having the app code and data in separate directories.
+    When base_dir == _REPO_DIR (single-directory installs) the overlays
+    are redundant no-ops, so backward compatibility is preserved.
+    """
+    data_dirs = [
+        'incoming_data', 'dat_files', 'deployments',
+        'gncutils_slocum_nc_output', 'logs',
     ]
+    cmd = ['docker', 'run', '--rm', '-v', f'{_REPO_DIR}:/home/glider']
+    for d in data_dirs:
+        cmd += ['-v', f'{os.path.join(base_dir, d)}:/home/glider/{d}']
+    cmd += [DOCKER_IMAGE, 'bash', '-c', inner_cmd]
+    return cmd
 
 
 # ── Stage 1a: DBD + EBD → merged_data ────────────────────────────────────────
