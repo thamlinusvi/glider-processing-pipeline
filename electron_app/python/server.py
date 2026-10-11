@@ -799,7 +799,7 @@ def preflight_apply(dep):
         return jsonify({'error': 'Invalid deployment name'}), 400
 
     data   = request.json or {}
-    script = os.path.join(BASE_DIR, 'app', 'pre_qaqc_config_check.py')
+    script = os.path.join(REPO_DIR, 'app', 'pre_qaqc_config_check.py')
     if not os.path.isfile(script):
         return jsonify({'error': 'pre_qaqc_config_check.py not found'}), 404
     dep_dir = _dep_dir(dep)
@@ -811,7 +811,7 @@ def preflight_apply(dep):
             tf_path = tf.name
         result = subprocess.run(
             [sys.executable, script, BASE_DIR, dep, '--apply-file', tf_path],
-            cwd=BASE_DIR,
+            cwd=REPO_DIR,
             capture_output=True,
             text=True,
             encoding='utf-8',
@@ -938,10 +938,10 @@ def serve_report(dep):
 
 @app.route('/api/file')
 def serve_file():
-    """Serve any file within BASE_DIR (used for plot images)."""
+    """Serve any file within BASE_DIR (data) or REPO_DIR (app files, e.g. plots)."""
     fpath = request.args.get('path', '')
     real  = os.path.realpath(fpath)
-    if not _is_within(real, BASE_DIR):
+    if not (_is_within(real, BASE_DIR) or _is_within(real, REPO_DIR)):
         return abort(403)
     if not os.path.isfile(real):
         return abort(404)
@@ -1377,7 +1377,7 @@ def save_qc_config(dep):
 
 @app.route('/api/qc-config-regional')
 def qc_config_regional():
-    config_dir = os.path.join(BASE_DIR, 'qc', 'config', 'global_regional')
+    config_dir = os.path.join(REPO_DIR, 'qc', 'config', 'global_regional')
     return jsonify({'files': _yaml_files(config_dir), 'config_dir': config_dir})
 
 
@@ -1386,7 +1386,7 @@ def save_qc_config_regional():
     data      = request.json or {}
     rel_path  = data.get('path', '')
     content   = data.get('content', '')
-    config_dir = os.path.join(BASE_DIR, 'qc', 'config', 'global_regional')
+    config_dir = os.path.join(REPO_DIR, 'qc', 'config', 'global_regional')
     ok, err = _save_yaml_file(config_dir, rel_path, content)
     if not ok:
         return err
@@ -1504,7 +1504,7 @@ def _current_sensor_sets():
     # Fall back to build_sensor_defs.py hardcoded defaults
     try:
         import importlib.util
-        bsd_path = os.path.join(BASE_DIR, 'build_sensor_defs.py')
+        bsd_path = os.path.join(REPO_DIR, 'build_sensor_defs.py')
         spec = importlib.util.spec_from_file_location('bsd', bsd_path)
         bsd  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(bsd)
@@ -1545,13 +1545,13 @@ def save_sensor_sets():
 # ── Build Sensor Defs ─────────────────────────────────────────────────────────
 @app.route('/api/build-sensor-defs', methods=['POST'])
 def build_sensor_defs():
-    script = os.path.join(BASE_DIR, 'build_sensor_defs.py')
+    script = os.path.join(REPO_DIR, 'build_sensor_defs.py')
     if not os.path.isfile(script):
         return jsonify({'error': 'build_sensor_defs.py not found'}), 404
     try:
         result = subprocess.run(
             [sys.executable, script],
-            cwd=BASE_DIR, capture_output=True, text=True, timeout=30
+            cwd=REPO_DIR, capture_output=True, text=True, timeout=30
         )
         return jsonify({
             'ok':     result.returncode == 0,
@@ -1707,7 +1707,7 @@ def create_deployment():
     return jsonify({'ok': True, 'deployment': name})
 
 
-_NICKNAMES_FILE = os.path.join(BASE_DIR, 'config', 'deployment_nicknames.json')
+_NICKNAMES_FILE = os.path.join(REPO_DIR, 'config', 'deployment_nicknames.json')
 
 def _load_nicknames():
     if os.path.isfile(_NICKNAMES_FILE):
@@ -1884,7 +1884,7 @@ def delete_deployment(dep):
 
 
 # ── CAC file manager ─────────────────────────────────────────────────────────
-CAC_DIR = os.path.join(BASE_DIR, 'master_cac')
+CAC_DIR = os.path.join(REPO_DIR, 'master_cac')
 
 @app.route('/api/cac-files')
 def list_cac_files():
@@ -3361,7 +3361,7 @@ document.addEventListener('keydown', e => {{ if (e.key === 'Escape') overlay.cla
 
 
 # ── Cloud storage ─────────────────────────────────────────────────────────────
-_CLOUD_DIR         = os.path.join(BASE_DIR, 'config', 'cloud')
+_CLOUD_DIR         = os.path.join(REPO_DIR, 'config', 'cloud')
 _CLOUD_CREDS_PATH  = os.path.join(_CLOUD_DIR, 'credentials.json')
 _CLOUD_TOKENS_PATH = os.path.join(_CLOUD_DIR, 'tokens.json')
 _OAUTH_PENDING     = {}   # state -> {verifier}
