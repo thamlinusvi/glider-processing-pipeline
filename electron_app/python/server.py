@@ -420,7 +420,17 @@ def _container_name(dep, stage):
 
 # ── Docker Desktop helpers ─────────────────────────────────────────────────────
 
-_DOCKER_DESKTOP_EXE = r'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+def _find_docker_desktop_exe():
+    candidates = [
+        r'C:\Program Files\Docker\Docker\Docker Desktop.exe',
+        os.path.join(os.path.expanduser('~'), r'AppData\Local\Programs\DockerDesktop\Docker Desktop.exe'),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
+_DOCKER_DESKTOP_EXE = _find_docker_desktop_exe()
 
 
 def _docker_process_running():
