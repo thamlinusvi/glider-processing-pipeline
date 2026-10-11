@@ -33,8 +33,9 @@ BASE_DIR = os.path.normpath(sys.argv[1]) if len(sys.argv) > 1 else \
            os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..'))
 PORT     = int(sys.argv[2]) if len(sys.argv) > 2 else 5757
 
-# app/ is always relative to this script's repo root, not the data BASE_DIR
-APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'app')
+# REPO_DIR / APP_DIR are always relative to this script's location, not the data BASE_DIR
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+APP_DIR  = os.path.join(REPO_DIR, 'app')
 sys.path.insert(0, APP_DIR)
 
 from flask import Flask, jsonify, request, Response, send_file, abort
@@ -356,7 +357,7 @@ def deployments_health():
     result = {}
     for dep in deps:
         glider     = dep.split('-')[0]
-        config_base = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
+        config_base = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
         raw_dir    = os.path.join(BASE_DIR, 'incoming_data', dep)
         merged_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'merged_data')
         flight_dir = os.path.join(BASE_DIR, 'dat_files', dep, 'flight_data')
@@ -1230,7 +1231,7 @@ def validate_netcdf_config(dep):
     if not subdir:
         return jsonify({'ok': True, 'issues': []})
     glider     = dep.split('-')[0]
-    config_dir = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep, subdir)
+    config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep, subdir)
     if not os.path.isdir(config_dir):
         return jsonify({'ok': False, 'issues': [{'file': subdir + '/', 'message': 'Config directory not found'}]})
     issues = _validate_netcdf_config(config_dir)
@@ -1240,7 +1241,7 @@ def validate_netcdf_config(dep):
 @app.route('/api/deployment/<dep>/metadata')
 def metadata(dep):
     glider     = dep.split('-')[0]
-    config_dir = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
+    config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
     files      = {}
     errors     = {}
     for f in glob.glob(os.path.join(config_dir, '**', '*.json'), recursive=True):
@@ -1274,7 +1275,7 @@ def save_metadata(dep):
         return jsonify({'error': f'Invalid JSON: {e}'}), 400
 
     glider     = dep.split('-')[0]
-    config_dir = os.path.realpath(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep))
+    config_dir = os.path.realpath(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep))
     full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
 
     # Security: must stay within config_dir
@@ -1296,7 +1297,7 @@ def delete_metadata(dep):
     rel_path = data.get('path', '').replace('/', os.sep).replace('\\', os.sep)
 
     glider     = dep.split('-')[0]
-    config_dir = os.path.realpath(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep))
+    config_dir = os.path.realpath(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep))
     full_path  = os.path.realpath(os.path.join(config_dir, rel_path))
 
     if not _is_within(full_path, config_dir):
@@ -1403,8 +1404,8 @@ def copy_all_metadata(dep):
 
     glider     = dep.split('-')[0]
     src_glider = source.split('-')[0]
-    config_dir = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
-    src_dir    = os.path.join(BASE_DIR, 'glider_config_files_json', src_glider, source)
+    config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
+    src_dir    = os.path.join(REPO_DIR, 'glider_config_files_json', src_glider, source)
 
     if not os.path.isdir(src_dir):
         return jsonify({'error': f'Source config not found: {src_dir}'}), 404
@@ -1429,7 +1430,7 @@ def import_metadata_files(dep):
     data       = request.json or {}
     files      = data.get('files', [])
     glider     = dep.split('-')[0]
-    config_dir = os.path.realpath(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep))
+    config_dir = os.path.realpath(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep))
 
     results = []
     for item in files:
@@ -1461,8 +1462,8 @@ def import_metadata_files(dep):
 
 
 # ── Sensor Sets ───────────────────────────────────────────────────────────────
-_RAW_JSON_DIR      = os.path.join(BASE_DIR, 'glider_config_files_json', 'raw_json')
-_SENSOR_SETS_CFG   = os.path.join(BASE_DIR, 'glider_config_files_json', 'sensor_sets.json')
+_RAW_JSON_DIR      = os.path.join(REPO_DIR, 'glider_config_files_json', 'raw_json')
+_SENSOR_SETS_CFG   = os.path.join(REPO_DIR, 'glider_config_files_json', 'sensor_sets.json')
 
 
 def _load_raw_sensor_universe():
@@ -1564,8 +1565,8 @@ def build_sensor_defs():
 @app.route('/api/deployment/<dep>/copy-sensor-defs', methods=['POST'])
 def copy_sensor_defs(dep):
     glider   = dep.split('-')[0]
-    src_root = os.path.join(BASE_DIR, 'glider_config_files_json', 'updated_sensor_defs')
-    dst_root = os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep)
+    src_root = os.path.join(REPO_DIR, 'glider_config_files_json', 'updated_sensor_defs')
+    dst_root = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
     mapping  = {
         'profile':              'science_profile',
         'trajectory':           'science_trajectory',
@@ -1685,9 +1686,9 @@ def create_deployment():
         os.path.join(BASE_DIR, 'incoming_data', name),
         os.path.join(BASE_DIR, 'dat_files', name, 'merged_data'),
         os.path.join(BASE_DIR, 'dat_files', name, 'flight_data'),
-        os.path.join(BASE_DIR, 'glider_config_files_json', glider, name, 'science_profile'),
-        os.path.join(BASE_DIR, 'glider_config_files_json', glider, name, 'science_trajectory'),
-        os.path.join(BASE_DIR, 'glider_config_files_json', glider, name, 'trajectory_flight'),
+        os.path.join(REPO_DIR, 'glider_config_files_json', glider, name, 'science_profile'),
+        os.path.join(REPO_DIR, 'glider_config_files_json', glider, name, 'science_trajectory'),
+        os.path.join(REPO_DIR, 'glider_config_files_json', glider, name, 'trajectory_flight'),
     ]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
@@ -1696,8 +1697,8 @@ def create_deployment():
     if template and template != name:
         tmpl_glider = template.split('-')[0]
         for sub in ['science_profile', 'science_trajectory', 'trajectory_flight']:
-            src = os.path.join(BASE_DIR, 'glider_config_files_json', tmpl_glider, template, sub)
-            dst = os.path.join(BASE_DIR, 'glider_config_files_json', glider, name, sub)
+            src = os.path.join(REPO_DIR, 'glider_config_files_json', tmpl_glider, template, sub)
+            dst = os.path.join(REPO_DIR, 'glider_config_files_json', glider, name, sub)
             if os.path.isdir(src):
                 for f in os.listdir(src):
                     if f.endswith('.json'):
@@ -1776,8 +1777,8 @@ def rename_deployment(dep):
         pairs.append((os.path.join(BASE_DIR, folder, dep),
                       os.path.join(BASE_DIR, folder, new_name), folder))
     pairs.append((
-        os.path.join(BASE_DIR, 'glider_config_files_json', old_glider, dep),
-        os.path.join(BASE_DIR, 'glider_config_files_json', new_glider, new_name),
+        os.path.join(REPO_DIR, 'glider_config_files_json', old_glider, dep),
+        os.path.join(REPO_DIR, 'glider_config_files_json', new_glider, new_name),
         'glider_config_files_json',
     ))
 
@@ -1868,7 +1869,7 @@ def delete_deployment(dep):
     _try_delete(os.path.join(BASE_DIR, 'post_processing', dep),                        'post_processing')
     _try_delete(os.path.join(BASE_DIR, 'logs', dep),                                   'logs')
     _try_delete(os.path.join(BASE_DIR, 'ad2cp', dep),                                  'ad2cp')
-    _try_delete(os.path.join(BASE_DIR, 'glider_config_files_json', glider, dep),       'glider_config_files_json')
+    _try_delete(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep),       'glider_config_files_json')
 
     # Remove nickname entry
     nicks = _load_nicknames()
