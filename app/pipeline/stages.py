@@ -68,7 +68,7 @@ def dbd_to_dat_command(base_dir, deployment):
     decomp = '/home/glider/slocum/bin2ascii/decompress_dbds.sh'
 
     inner = ' && '.join([
-        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab {exes}/compexp',
+        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab {exes}/compexp || true',
         f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.ecd" -o -iname "*.mcd" -o '
         f'-iname "*.ncd" -o -iname "*.scd" -o -iname "*.tcd" -o -iname "*.ncg" -o -iname "*.mcg" \\) '
         f'-print0 | xargs -0r bash {decomp} -e {exes}',
@@ -105,11 +105,11 @@ def dbd_to_dat_flight_command(base_dir, deployment):
     # Copy only .dbd files into a temp dir so the script never sees EBD files
     inner = ' && '.join([
         f'mkdir -p {tmp}',
-        f'chmod +x {exes}/compexp',
+        f'chmod +x {exes}/compexp || true',
         f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.mcd" -o -iname "*.scd" \\) '
         f'-print0 | xargs -0r bash {decomp} -e {exes}',
         f'find {src} -maxdepth 1 -iname "*.dbd" -exec cp {{}} {tmp}/ \\;',
-        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab',
+        f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab || true',
         f'mkdir -p {dest}',
         f'cp -r {cac} /tmp/slocum_cac',
         f'bash {script} -c /tmp/slocum_cac -e {exes} {tmp} {dest}',
