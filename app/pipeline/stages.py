@@ -69,6 +69,7 @@ def dbd_to_dat_command(base_dir, deployment):
 
     inner = ' && '.join([
         f'chmod +x {exes}/dbd2asc {exes}/dba_merge {exes}/dba_sensor_filter {exes}/dba2_orig_matlab {exes}/compexp || true',
+        f'sed -i "s/\\r//" {script} {decomp}',
         f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.ecd" -o -iname "*.mcd" -o '
         f'-iname "*.ncd" -o -iname "*.scd" -o -iname "*.tcd" -o -iname "*.ncg" -o -iname "*.mcg" \\) '
         f'-print0 | xargs -0r bash {decomp} -e {exes}',
@@ -106,6 +107,7 @@ def dbd_to_dat_flight_command(base_dir, deployment):
     inner = ' && '.join([
         f'mkdir -p {tmp}',
         f'chmod +x {exes}/compexp || true',
+        f'sed -i "s/\\r//" {script} {decomp}',
         f'find {src} -maxdepth 1 \\( -iname "*.dcd" -o -iname "*.mcd" -o -iname "*.scd" \\) '
         f'-print0 | xargs -0r bash {decomp} -e {exes}',
         f'find {src} -maxdepth 1 -iname "*.dbd" -exec cp {{}} {tmp}/ \\;',
