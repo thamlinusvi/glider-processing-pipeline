@@ -111,9 +111,9 @@ var
 begin
   Missing := '';
 
-  if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c py --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
-    if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c python --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
-      Missing := Missing + '  • Python 3.10+    https://www.python.org/downloads/' + #13#10;
+  // Require Python 3.10 specifically — other versions cause import failures at runtime.
+  if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c py -3.10 --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
+    Missing := Missing + '  • Python 3.10   https://www.python.org/downloads/release/python-31011/' + #13#10;
 
   if not Exec(ExpandConstant('{sys}\cmd.exe'), '/c node --version >nul 2>&1', '', SW_HIDE, ewWaitUntilTerminated, RC) or (RC <> 0) then
     Missing := Missing + '  • Node.js 24+      https://nodejs.org/' + #13#10;
@@ -181,6 +181,7 @@ var
   EscapedDir:  String;
   ConfigPath:  String;
   JSON:        String;
+  RC:          Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -201,6 +202,13 @@ begin
     ForceDirectories(DataDir + '\logs');
     ForceDirectories(DataDir + '\gncutils_slocum_nc_output');
     ForceDirectories(DataDir + '\AD2CP_post_processing');
+
+    // Grant the installing user full control over the app directory so the
+    // Python backend can write config files, pipeline_state.json, etc.
+    // without hitting NTFS permission errors on servers or shared machines.
+    Exec(ExpandConstant('{sys}\icacls.exe'),
+         '"' + ExpandConstant('{app}') + '" /grant "' + ExpandConstant('{username}') + ':(OI)(CI)F" /T /Q',
+         '', SW_HIDE, ewWaitUntilTerminated, RC);
 
     // Remind user about credentials
     MsgBox(
