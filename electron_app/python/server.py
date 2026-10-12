@@ -1294,9 +1294,12 @@ def save_metadata(dep):
     if not full_path.endswith('.json'):
         return jsonify({'error': 'Only .json files allowed'}), 403
 
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, 'w', encoding='utf-8') as fp:
-        fp.write(content)
+    try:
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, 'w', encoding='utf-8') as fp:
+            fp.write(content)
+    except OSError as e:
+        return jsonify({'error': str(e), 'path': full_path}), 500
 
     return jsonify({'ok': True})
 
