@@ -205,7 +205,7 @@ def fix_metadata_command(base_dir, deployment):
     Input/output:  gncutils_slocum_nc_output/<deployment>/profile/  (in-place)
     """
     nc_dir = os.path.join(base_dir, 'gncutils_slocum_nc_output', deployment, 'profile')
-    script = os.path.join(base_dir, 'fix_trajectoryprofile_metadata.py')
+    script = os.path.join(_REPO_DIR, 'fix_trajectoryprofile_metadata.py')
     return (
         [sys.executable, script, nc_dir],
         base_dir,
@@ -224,7 +224,7 @@ def preflight_command(base_dir, deployment):
     PREFLIGHT_JSON line for the Electron UI to display a confirmation panel.
     The user reviews and clicks Apply — the UI POSTs to /api/preflight/apply.
     """
-    script = os.path.join(base_dir, 'app', 'pre_qaqc_config_check.py')
+    script = os.path.join(_REPO_DIR, 'app', 'pre_qaqc_config_check.py')
     return (
         [sys.executable, script, base_dir, deployment],
         base_dir,

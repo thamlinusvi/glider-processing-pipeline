@@ -9,6 +9,24 @@ import numpy as np
 # (happens when a profile has no valid timestamps — the data is still usable)
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='xarray')
 
+# Detect the best available NetCDF engine (same logic as fix_cdm_profile_variables.py).
+# netCDF4's C library has a numpy ABI mismatch on this server; h5netcdf avoids it.
+_ENGINE = None
+try:
+    import netCDF4  # noqa: F401
+    _ENGINE = 'netCDF4'
+except (ImportError, ValueError):
+    pass
+
+if _ENGINE is None:
+    try:
+        import h5netcdf  # noqa: F401
+        _ENGINE = 'h5netcdf'
+    except (ImportError, ValueError):
+        pass
+
+# None → xarray picks its own default (last resort)
+
 
 def fix_trajectoryprofile_metadata_ignore_encoding(directory):
     # Remove any stale .tmp files left by a previous crashed run
@@ -27,10 +45,13 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
         print(f"🔍 Checking: {fname}")
         tmp_path = path + ".tmp"
         try:
+            kwargs = dict(decode_times=False)
+            if _ENGINE:
+                kwargs['engine'] = _ENGINE
             # decode_times=False: keep time as raw numeric values so xarray
             # never tries to compare NoneType with datetime when re-encoding.
             # We only modify global attributes here — time data is untouched.
-            ds = xr.open_dataset(path, decode_times=False)
+            ds = xr.open_dataset(path, **kwargs)
             modified = False
 
             # Set required global attributes
@@ -61,20 +82,13 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
             # Ensure profile_id variable with cf_role exists
             if not any(v.attrs.get("cf_role") == "profile_id" for v in ds.variables.values()):
                 if "profile_id" not in ds:
-                    # Scalar, one ID for the whole profile -- matches how a real
-                    # profile_id already looks elsewhere in this pipeline (an
-                    # integer-truncated profile_time, e.g. dba_to_ngdac_profile_nc.py's
-                    # "no start_profile_id given -> use mean_profile_epoch" convention).
-                    # The old fallback here created a *new* "profile" dimension sized to
-                    # "time" (these files only ever have a "time" dim, never "profile"),
-                    # producing one ID per timestep instead of one per profile.
                     pid = None
                     if "profile_time" in ds.variables:
                         pt = float(ds["profile_time"].values.flat[0])
                         if not np.isnan(pt):
                             pid = int(pt)
                     if pid is None:
-                        pid = 1  # no better identifier available for this single-profile file
+                        pid = 1
                     ds["profile_id"] = ((), np.int32(pid))
                 ds["profile_id"].attrs["cf_role"] = "profile_id"
                 ds["profile_id"].attrs["long_name"] = "Profile ID"
@@ -82,17 +96,23 @@ def fix_trajectoryprofile_metadata_ignore_encoding(directory):
                 print("  ✅ Added or updated profile_id with cf_role = profile_id")
                 modified = True
 
-            # Save changes atomically: write to .tmp then rename
+            # Save changes atomically: load into memory, close source, write tmp, rename
             if modified:
                 try:
-                    ds.to_netcdf(tmp_path, mode="w")
-                    ds.close()
+                    ds.load()   # pull all data into memory
+                    ds.close()  # release HDF5 file handle before writing
+                    write_kwargs = dict(mode="w")
+                    if _ENGINE:
+                        write_kwargs['engine'] = _ENGINE
+                    ds.to_netcdf(tmp_path, **write_kwargs)
                     shutil.move(tmp_path, path)
                     print("  💾 Changes saved")
                 except Exception:
-                    ds.close()
                     if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
                     raise
             else:
                 ds.close()

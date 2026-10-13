@@ -26,6 +26,20 @@ import base64
 import argparse
 import numpy as np
 import xarray as xr
+
+# Detect best NetCDF engine — netCDF4's C library has a numpy ABI mismatch on this server.
+_ENGINE = None
+try:
+    import netCDF4  # noqa: F401
+    _ENGINE = 'netCDF4'
+except (ImportError, ValueError):
+    pass
+if _ENGINE is None:
+    try:
+        import h5netcdf  # noqa: F401
+        _ENGINE = 'h5netcdf'
+    except (ImportError, ValueError):
+        pass
 import yaml
 import matplotlib
 matplotlib.use('Agg')            # non-interactive backend — safe before any display is set
@@ -47,7 +61,7 @@ def find_profile_nc(base_dir, deployment):
 def read_instruments(nc_path):
     instruments = {}
     try:
-        with xr.open_dataset(nc_path, decode_times=False) as ds:
+        with xr.open_dataset(nc_path, decode_times=False, **({'engine': _ENGINE} if _ENGINE else {})) as ds:
             for var in list(ds.data_vars):
                 if var.startswith('instrument_'):
                     instruments[var] = dict(ds[var].attrs)
@@ -79,7 +93,7 @@ def get_oxygen_vars(nc_path):
     skip = {'qartod', 'hysteresis', 'shifted', 'flag', 'instrument'}
     found = []
     try:
-        with xr.open_dataset(nc_path, decode_times=False) as ds:
+        with xr.open_dataset(nc_path, decode_times=False, **({'engine': _ENGINE} if _ENGINE else {})) as ds:
             for var in ds.data_vars:
                 if 'oxygen' in var.lower() and not any(x in var for x in skip):
                     found.append(var)
@@ -193,7 +207,7 @@ def read_profile_positions(nc_dir):
     lats, lons = [], []
     for f in sorted(glob.glob(os.path.join(nc_dir, '*.nc'))):
         try:
-            with xr.open_dataset(f, decode_times=False) as ds:
+            with xr.open_dataset(f, decode_times=False, **({'engine': _ENGINE} if _ENGINE else {})) as ds:
                 if 'profile_lat' not in ds.data_vars or 'profile_lon' not in ds.data_vars:
                     continue
                 lat = float(ds['profile_lat'].values.flat[0])
@@ -401,7 +415,7 @@ def analyze_region_coverage(nc_dir, base_dir):
         result['proposed_lat']         = [lat_min, lat_max]
         result['proposed_lon']         = [lon_min, lon_max]
         result['boundaries_content']   = build_updated_boundaries_yml(
-            region_data, lat_min, lat_max, lon_min, lon_max)
+            region_data or {'regions': []}, lat_min, lat_max, lon_min, lon_max)
         result['map_base64']           = generate_region_map(
             lats, lons, current_bounds, proposed_bounds)
 
@@ -496,7 +510,7 @@ def main(args):
                 if user_lat and user_lon:
                     region_data, _ = read_region_boundaries(base_dir)
                     content = build_updated_boundaries_yml(
-                        region_data,
+                        region_data or {'regions': []},
                         float(user_lat[0]), float(user_lat[1]),
                         float(user_lon[0]), float(user_lon[1]),
                     )
