@@ -846,6 +846,14 @@ def preflight_apply(dep):
 
 
 # ── Run logs ──────────────────────────────────────────────────────────────────
+def _fmt_log_ts(stem):
+    """Format a log filename stem like '2026-10-13_143022' → '2026-10-13 14:30:22'."""
+    try:
+        return datetime.datetime.strptime(stem, '%Y-%m-%d_%H%M%S').strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return stem.replace('_', ' ', 1)
+
+
 @app.route('/api/logs')
 def list_run_logs():
     """Return saved run logs sorted newest-first. Accepts optional ?dep= filter."""
@@ -878,7 +886,7 @@ def list_run_logs():
                         'result':    result,
                         'filename':  fname,
                         'path':      fpath,
-                        'timestamp': fname[:-4].replace('_', ' ', 1),  # 2026-06-07 143022
+                        'timestamp': _fmt_log_ts(fname[:-4]),
                         'size':      os.path.getsize(fpath),
                     })
 
