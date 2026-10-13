@@ -23,6 +23,23 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+# Detect the best available NetCDF engine.
+# netCDF4's C library has a numpy ABI mismatch on the processing server (146.226.147.5)
+# and its DLL path exceeds Windows MAX_PATH — h5netcdf avoids both problems.
+_ENGINE = None
+try:
+    import netCDF4  # noqa: F401
+    _ENGINE = 'netCDF4'
+except (ImportError, ValueError):
+    pass
+if _ENGINE is None:
+    try:
+        import h5netcdf  # noqa: F401
+        _ENGINE = 'h5netcdf'
+    except (ImportError, ValueError):
+        pass
+# None → xarray picks its own default (last resort)
+
 # ── Flag metadata ──────────────────────────────────────────────────────────────
 FLAG_MEANING = {1: 'GOOD', 2: 'NOT_EVAL', 3: 'SUSPECT', 4: 'FAIL', 9: 'MISSING'}
 FLAG_CLASS   = {1: 'good', 2: 'noteval',  3: 'suspect', 4: 'fail', 9: 'missing'}
@@ -286,7 +303,10 @@ def collect_all(files):
         if i % 200 == 0 or i == n:
             print(f'  [{i}/{n}] processed...')
         try:
-            ds = xr.open_dataset(f, decode_times=False)
+            open_kwargs = dict(decode_times=False)
+            if _ENGINE:
+                open_kwargs['engine'] = _ENGINE
+            ds = xr.open_dataset(f, **open_kwargs)
         except Exception as e:
             print(f'  Warning: could not open {os.path.basename(f)}: {e}', flush=True)
             continue

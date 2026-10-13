@@ -25,6 +25,23 @@ from plotly.subplots import make_subplots
 
 warnings.filterwarnings('ignore')
 
+# Detect the best available NetCDF engine.
+# netCDF4's C library has a numpy ABI mismatch on the processing server (146.226.147.5)
+# and its DLL path exceeds Windows MAX_PATH — h5netcdf avoids both problems.
+_ENGINE = None
+try:
+    import netCDF4  # noqa: F401
+    _ENGINE = 'netCDF4'
+except (ImportError, ValueError):
+    pass
+if _ENGINE is None:
+    try:
+        import h5netcdf  # noqa: F401
+        _ENGINE = 'h5netcdf'
+    except (ImportError, ValueError):
+        pass
+# None → xarray picks its own default (last resort)
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 # 'cdn'  → small files (~20 KB each), requires internet to render
 # True   → fully self-contained (~3.5 MB each), works offline
@@ -135,7 +152,10 @@ def load_deployment(data_dir, max_files=None):
     datasets = []
     for i, f in enumerate(files):
         try:
-            datasets.append(xr.open_dataset(f, decode_times=False))
+            open_kwargs = dict(decode_times=False)
+            if _ENGINE:
+                open_kwargs['engine'] = _ENGINE
+            datasets.append(xr.open_dataset(f, **open_kwargs))
         except Exception as e:
             print(f'  Warning: could not open {os.path.basename(f)}: {e}', flush=True)
         _progress(i, total, os.path.basename(f), every=every)
