@@ -1780,9 +1780,8 @@ def generate_metadata_files(dep):
             if _prev_ga.get(k):
                 ga[k] = _prev_ga[k]
 
-    # geospatial_vertical_units always from previous mission
-    if _prev_ga.get('geospatial_vertical_units'):
-        ga['geospatial_vertical_units'] = _prev_ga['geospatial_vertical_units']
+    # geospatial_vertical_units always from previous mission; fallback to EPSG:5831
+    ga['geospatial_vertical_units'] = _prev_ga.get('geospatial_vertical_units') or 'EPSG:5831'
 
     # Build deployment.json (preserve platform block; update global_attributes subset)
     deployment = dict(base_dep)
