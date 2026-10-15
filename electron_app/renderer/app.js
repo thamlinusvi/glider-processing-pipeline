@@ -2503,37 +2503,6 @@ async function renderMetadata (selectRel) {
     const sectionHdr = h('div', { class: 'meta-section-header' },
       h('span', {}, groupLabels[group] || group))
 
-    if (items.length) {
-      const copyBtn = h('button', {
-        class: 'meta-section-copy-btn',
-        title: 'Copy all files in this section to another section…',
-        onclick: e => {
-          e.stopPropagation()
-          const SECTION_LABELS = {
-            science_profile:    'Profile',
-            science_trajectory: 'Trajectory (Science)',
-            trajectory_flight:  'Trajectory (Flight)',
-          }
-          const targets = GROUP_ORDER.filter(g => g !== group)
-          const actions = targets.map(target => ({
-            label: `→ ${SECTION_LABELS[target]}`,
-            action: async () => {
-              try {
-                await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/copy-section`, {
-                  method:  'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body:    JSON.stringify({ from: group, to: target }),
-                })
-                await renderMetadata()
-              } catch (ex) { alert('Copy failed: ' + ex.message) }
-            },
-          }))
-          _metaFileMenuPopover(e.currentTarget, actions)
-        },
-      }, 'Copy section')
-      sectionHdr.appendChild(copyBtn)
-    }
-
     if (otherDeps.length) {
       const cpFileBtn = h('button', {
         class: 'meta-section-copy-btn',
