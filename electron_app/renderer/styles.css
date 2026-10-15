@@ -1128,11 +1128,6 @@ button {
   color: #7a9bbc;
   padding: 0 2px;
   line-height: 1;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.meta-section-header:hover .meta-section-copy-btn {
-  opacity: 1;
 }
 .meta-section-copy-btn:hover {
   color: #3498db;
