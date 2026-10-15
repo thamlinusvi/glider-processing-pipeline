@@ -1674,8 +1674,11 @@ def generate_metadata_files(dep):
         dep_out = dict(deployment)
         if cdm_override:
             ga_out['cdm_data_type'] = cdm_override
+            # trajectory_flight is pure Trajectory — no profile-specific attributes
+            ga_out.pop('cdm_profile_variables', None)
             dep_ga = dict(dep_out.get('global_attributes', {}))
             dep_ga['cdm_data_type'] = cdm_override
+            dep_ga.pop('cdm_profile_variables', None)
             dep_out = dict(dep_out)
             dep_out['global_attributes'] = dep_ga
         for fname, obj in [('global_attributes.json', ga_out), ('deployment.json', dep_out)]:
