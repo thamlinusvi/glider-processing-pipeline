@@ -3010,9 +3010,28 @@ async function showGenerateConfigModal (dep) {
     }
   }
 
+  const SUBDIR_OPTS = [
+    { value: 'science_profile',    label: 'Profile (science_profile)' },
+    { value: 'science_trajectory', label: 'Trajectory — Science (science_trajectory)' },
+    { value: 'trajectory_flight',  label: 'Trajectory — Flight (trajectory_flight)' },
+  ]
+  const subdirChecks = SUBDIR_OPTS.map(({ value, label }) => {
+    const cb = h('input', { type: 'checkbox', checked: true, value, id: `gen-sd-${value}`,
+      style: 'margin-right:6px' })
+    return { cb, el: h('label', { for: `gen-sd-${value}`,
+      style: 'display:flex;align-items:center;cursor:pointer;font-size:13px;margin-bottom:4px' },
+      cb, label) }
+  })
+
   const generateBtn = h('button', { class: 'btn-primary' }, 'Generate')
   generateBtn.onclick = async () => {
     statusEl.textContent = ''
+    const subdirs = subdirChecks.filter(({ cb }) => cb.checked).map(({ cb }) => cb.value)
+    if (!subdirs.length) {
+      statusEl.textContent = 'Select at least one folder.'
+      statusEl.style.color = '#e74c3c'
+      return
+    }
     const payload = {
       summary:          fields.summary.value.trim(),
       comment:          fields.comment.value.trim(),
@@ -3023,6 +3042,7 @@ async function showGenerateConfigModal (dep) {
       contributor_role: fields.contributor_role.value.trim(),
       sea_name:         fields.sea_name.value,
       copy_from:        copyFromSel.value,
+      subdirs,
     }
     generateBtn.disabled    = true
     generateBtn.textContent = 'Generating…'
@@ -3073,6 +3093,9 @@ async function showGenerateConfigModal (dep) {
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Sea name'), fields.sea_name),
         sep.cloneNode(),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Generate for'),
+          h('div', {}, ...subdirChecks.map(({ el }) => el))),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' },
             'Copy instruments & sensor defs from'),

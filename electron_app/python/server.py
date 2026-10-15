@@ -1550,7 +1550,8 @@ def generate_metadata_files(dep):
         'summary', 'comment', 'project', 'program',
         'acknowledgment', 'contributor_name', 'contributor_role', 'sea_name',
     ]}
-    copy_from = data.get('copy_from', '').strip()
+    copy_from    = data.get('copy_from', '').strip()
+    subdirs_req  = data.get('subdirs', [])   # list of subdir names; empty = all three
     if not copy_from:
         copy_from = _find_prev_deployment(glider, dep)
 
@@ -1609,11 +1610,13 @@ def generate_metadata_files(dep):
 
     config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
     # (subdir, cdm_data_type override or None to keep base value)
-    subdirs    = [
-        ('science_profile',   None),
+    _all_subdirs = [
+        ('science_profile',    None),
         ('science_trajectory', None),
         ('trajectory_flight',  'Trajectory'),
     ]
+    subdirs = [(s, c) for s, c in _all_subdirs
+               if not subdirs_req or s in subdirs_req]
     written    = []
     errors     = []
 
