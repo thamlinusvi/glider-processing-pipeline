@@ -297,3 +297,7 @@ there's no user-visible indication of which (slower) path is active.
 - AD2CP lab testing feature: test mode (`is_test`, `ad2cp/tests/`) exists; likely needs
   dedicated UI/workflow improvements. Start from `_adcp_base_dir`, `_ADCP_TEST_OUTPUTS`,
   `adcp_create_test`, and the test tab in the frontend.
+- In-app glider config file generator: UI flow that generates the `glider_config_files_json/`
+  files (`global_attributes.json`, `instruments.json`, `sensor_defs.json`, etc.) for a new
+  deployment by (a) pulling metadata from an ERDDAP endpoint the user points to and (b) using
+  recent deployment configs as templates. Currently done manually / via Claude outside the app.

@@ -1482,6 +1482,169 @@ def import_metadata_files(dep):
     return jsonify({'results': results})
 
 
+# ── Config file generator ─────────────────────────────────────────────────────
+def _find_prev_deployment(glider, exclude_dep):
+    """Return the most recent config-dir deployment name for `glider`, or None."""
+    glider_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider)
+    if not os.path.isdir(glider_dir):
+        return None
+    deps = sorted([
+        d for d in os.listdir(glider_dir)
+        if d.startswith(glider + '-') and d != exclude_dep
+        and os.path.isdir(os.path.join(glider_dir, d))
+    ], reverse=True)
+    return deps[0] if deps else None
+
+
+@app.route('/api/erddap/fetch')
+def erddap_fetch():
+    """Proxy an ERDDAP /info/<id>/index.json URL and return matching form fields."""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'No URL provided'}), 400
+    if not url.startswith(('http://', 'https://')):
+        return jsonify({'error': 'URL must start with http:// or https://'}), 400
+    try:
+        ctx = ssl.create_default_context()
+        req = _urlreq.Request(url, headers={'Accept': 'application/json'})
+        with _urlreq.urlopen(req, timeout=15, context=ctx) as resp:
+            raw = resp.read().decode('utf-8')
+        data = json.loads(raw)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+
+    rows = data.get('table', {}).get('rows', [])
+    nc_global = {}
+    for row in rows:
+        if len(row) >= 5 and row[0] == 'attribute' and row[1] == 'NC_GLOBAL':
+            nc_global[row[2]] = row[4]
+
+    field_map = {
+        'summary':          'summary',
+        'project':          'project',
+        'program':          'program',
+        'acknowledgment':   'acknowledgment',
+        'acknowledgement':  'acknowledgment',
+        'contributor_name': 'contributor_name',
+        'contributor_role': 'contributor_role',
+        'sea_name':         'sea_name',
+        'comment':          'comment',
+    }
+    result = {}
+    for erddap_key, our_key in field_map.items():
+        if erddap_key in nc_global and nc_global[erddap_key].strip():
+            result[our_key] = nc_global[erddap_key]
+    return jsonify(result)
+
+
+@app.route('/api/deployment/<dep>/metadata/generate', methods=['POST'])
+def generate_metadata_files(dep):
+    """
+    Generate global_attributes.json and deployment.json for science_profile and
+    science_trajectory, then copy all other JSON files from copy_from deployment.
+    """
+    data   = request.json or {}
+    glider = dep.split('-')[0]
+
+    user_fields = {k: data.get(k, '').strip() for k in [
+        'summary', 'comment', 'project', 'program',
+        'acknowledgment', 'contributor_name', 'contributor_role', 'sea_name',
+    ]}
+    copy_from = data.get('copy_from', '').strip()
+    if not copy_from:
+        copy_from = _find_prev_deployment(glider, dep)
+
+    # Load base global_attributes + deployment from previous dep or raw_json
+    raw_dir = os.path.join(REPO_DIR, 'glider_config_files_json', 'raw_json')
+    base_ga  = None
+    base_dep = None
+    if copy_from:
+        src_prof = os.path.join(REPO_DIR, 'glider_config_files_json',
+                                copy_from.split('-')[0], copy_from, 'science_profile')
+        for fname, target in [('global_attributes.json', 'ga'), ('deployment.json', 'dep')]:
+            fpath = os.path.join(src_prof, fname)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, encoding='utf-8-sig') as f:
+                        obj = json.load(f)
+                    if target == 'ga':
+                        base_ga = obj
+                    else:
+                        base_dep = obj
+                except Exception:
+                    pass
+
+    if base_ga is None:
+        with open(os.path.join(raw_dir, 'global_attributes.json'), encoding='utf-8-sig') as f:
+            base_ga = json.load(f)
+    if base_dep is None:
+        with open(os.path.join(raw_dir, 'deployment.json'), encoding='utf-8-sig') as f:
+            base_dep = json.load(f)
+
+    now_iso = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # Build global_attributes.json
+    ga = dict(base_ga)
+    ga['id'] = dep
+    for k, v in user_fields.items():
+        if v:
+            ga[k] = v
+    ga['date_created']           = now_iso
+    ga['date_issued']            = now_iso
+    ga['date_modified']          = now_iso
+    ga['date_metadata_modified'] = now_iso
+
+    # Build deployment.json (preserve platform block; update global_attributes subset)
+    deployment = dict(base_dep)
+    deployment['glider']          = glider
+    deployment['trajectory_name'] = dep
+    ga_sub = dict(deployment.get('global_attributes', {}))
+    ga_sub['deployment'] = dep
+    _mission_keys = ['comment', 'contributor_name', 'contributor_role',
+                     'acknowledgment', 'summary', 'project', 'program', 'sea_name']
+    for k in _mission_keys:
+        if user_fields.get(k):
+            ga_sub[k] = user_fields[k]
+    deployment['global_attributes'] = ga_sub
+
+    config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
+    subdirs    = ['science_profile', 'science_trajectory']
+    written    = []
+    errors     = []
+
+    for subdir in subdirs:
+        dst_dir = os.path.join(config_dir, subdir)
+        os.makedirs(dst_dir, exist_ok=True)
+        for fname, obj in [('global_attributes.json', ga), ('deployment.json', deployment)]:
+            fpath = os.path.join(dst_dir, fname)
+            try:
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    json.dump(obj, f, indent=4)
+                written.append(os.path.join(subdir, fname))
+            except OSError as e:
+                errors.append(str(e))
+
+    # Copy instruments.json and sensor_defs files from copy_from
+    if copy_from:
+        src_root  = os.path.join(REPO_DIR, 'glider_config_files_json',
+                                 copy_from.split('-')[0], copy_from)
+        skip_names = {'global_attributes.json', 'deployment.json'}
+        if os.path.isdir(src_root):
+            for f in glob.glob(os.path.join(src_root, '**', '*.json'), recursive=True):
+                if os.path.basename(f) in skip_names:
+                    continue
+                rel = os.path.relpath(f, src_root)
+                dst = os.path.join(config_dir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    shutil.copy2(f, dst)
+                    written.append(rel)
+                except OSError as e:
+                    errors.append(str(e))
+
+    return jsonify({'ok': True, 'written': written, 'errors': errors})
+
+
 # ── Sensor Sets ───────────────────────────────────────────────────────────────
 _RAW_JSON_DIR      = os.path.join(REPO_DIR, 'glider_config_files_json', 'raw_json')
 _SENSOR_SETS_CFG   = os.path.join(REPO_DIR, 'glider_config_files_json', 'sensor_sets.json')

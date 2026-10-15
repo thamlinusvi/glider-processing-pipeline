@@ -2422,6 +2422,8 @@ async function renderMetadata (selectRel) {
       dep ? h('div', { style: 'display:flex;gap:8px;margin-top:4px' },
         h('button', { class: 'btn-secondary',
           onclick: () => showManageSensorSets(dep) }, 'Manage Sensor Sets'),
+        h('button', { class: 'btn-secondary',
+          onclick: () => showGenerateConfigModal(dep) }, 'Generate Config'),
         h('button', { class: 'btn-primary',
           onclick: () => showBuildSensorDefs(dep) }, 'Build Sensor Defs')
       ) : null
@@ -2910,6 +2912,176 @@ function _metaNewFileModal (dep) {
           onclick: doCreate }, 'Create'))))
   document.body.appendChild(overlay)
   nameInput.focus()
+}
+
+/* Generate global_attributes.json + deployment.json from a form ─────────────*/
+async function showGenerateConfigModal (dep) {
+  const glider   = dep.split('-')[0]
+  const allDeps  = Array.from(document.getElementById('dep-select').options)
+    .map(o => o.value).filter(Boolean).filter(d => d !== dep)
+  const sameDeps = allDeps.filter(d => d.startsWith(glider + '-')).sort().reverse()
+  const prevDep  = sameDeps[0] || null
+
+  // Pre-fill fields from the most recent same-glider deployment
+  let prefill = {}
+  if (prevDep) {
+    try {
+      const md = await apiFetch(`/api/deployment/${encodeURIComponent(prevDep)}/metadata`)
+      const ga = md.files?.['science_profile\\global_attributes.json']
+              || md.files?.['science_profile/global_attributes.json'] || {}
+      prefill = {
+        summary:          ga.summary          || '',
+        comment:          ga.comment          || '',
+        project:          ga.project          || '',
+        program:          ga.program          || '',
+        acknowledgment:   ga.acknowledgment   || '',
+        contributor_name: ga.contributor_name || '',
+        contributor_role: ga.contributor_role || '',
+        sea_name:         ga.sea_name         || 'Caribbean Sea',
+      }
+    } catch (_) {}
+  }
+
+  const erddapInput = h('input', { class: 'form-input', type: 'url',
+    placeholder: 'https://…/erddap/info/<dataset_id>/index.json',
+    style: 'flex:1;min-width:0' })
+  const fetchBtn = h('button', { class: 'btn-secondary btn-sm',
+    style: 'white-space:nowrap' }, 'Fetch')
+
+  const SEA_NAMES = ['Caribbean Sea', 'North Atlantic Ocean', 'Gulf of Mexico',
+                     'Atlantic Ocean', 'Pacific Ocean']
+  const fields = {
+    summary:          h('textarea', { class: 'form-input', rows: 3, style: 'resize:vertical' }),
+    comment:          h('textarea', { class: 'form-input', rows: 2, style: 'resize:vertical' }),
+    project:          h('input',    { class: 'form-input', type: 'text' }),
+    program:          h('input',    { class: 'form-input', type: 'text' }),
+    acknowledgment:   h('input',    { class: 'form-input', type: 'text' }),
+    contributor_name: h('input',    { class: 'form-input', type: 'text' }),
+    contributor_role: h('input',    { class: 'form-input', type: 'text' }),
+    sea_name:         h('select',   { class: 'form-input' },
+      ...SEA_NAMES.map(n => h('option', { value: n }, n))),
+  }
+
+  function setFields (vals) {
+    Object.entries(vals).forEach(([k, v]) => {
+      if (!fields[k] || !v) return
+      if (fields[k].tagName === 'SELECT') {
+        Array.from(fields[k].options).forEach(o => { o.selected = o.value === v })
+      } else {
+        fields[k].value = v
+      }
+    })
+  }
+  setFields(prefill)
+
+  // Copy-from selector (instruments.json + sensor_defs)
+  const copyFromSel = h('select', { class: 'form-input' })
+  copyFromSel.appendChild(h('option', { value: '' }, '— none —'))
+  if (sameDeps.length) {
+    const grp = document.createElement('optgroup')
+    grp.label = `Same glider — ${glider}`
+    sameDeps.forEach(d => grp.appendChild(
+      h('option', { value: d, selected: d === prevDep }, d)))
+    copyFromSel.appendChild(grp)
+  }
+  allDeps.filter(d => !d.startsWith(glider + '-')).sort().reverse().forEach(d =>
+    copyFromSel.appendChild(h('option', { value: d }, d)))
+
+  const statusEl = h('div', { class: 'modal-status' })
+
+  fetchBtn.onclick = async () => {
+    const url = erddapInput.value.trim()
+    if (!url) return
+    fetchBtn.disabled = true
+    fetchBtn.textContent = 'Fetching…'
+    statusEl.textContent = ''
+    try {
+      const r = await apiFetch(`/api/erddap/fetch?url=${encodeURIComponent(url)}`)
+      if (r.error) throw new Error(r.error)
+      setFields(r)
+      statusEl.textContent = 'Fields updated from ERDDAP.'
+      statusEl.style.color = '#27ae60'
+    } catch (e) {
+      statusEl.textContent = 'ERDDAP fetch failed: ' + e.message
+      statusEl.style.color = '#e74c3c'
+    } finally {
+      fetchBtn.disabled = false
+      fetchBtn.textContent = 'Fetch'
+    }
+  }
+
+  const generateBtn = h('button', { class: 'btn-primary' }, 'Generate')
+  generateBtn.onclick = async () => {
+    statusEl.textContent = ''
+    const payload = {
+      summary:          fields.summary.value.trim(),
+      comment:          fields.comment.value.trim(),
+      project:          fields.project.value.trim(),
+      program:          fields.program.value.trim(),
+      acknowledgment:   fields.acknowledgment.value.trim(),
+      contributor_name: fields.contributor_name.value.trim(),
+      contributor_role: fields.contributor_role.value.trim(),
+      sea_name:         fields.sea_name.value,
+      copy_from:        copyFromSel.value,
+    }
+    generateBtn.disabled    = true
+    generateBtn.textContent = 'Generating…'
+    try {
+      await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/generate`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      })
+      closeModal()
+      await renderMetadata()
+    } catch (e) {
+      statusEl.textContent    = 'Error: ' + e.message
+      statusEl.style.color    = '#e74c3c'
+      generateBtn.disabled    = false
+      generateBtn.textContent = 'Generate'
+    }
+  }
+
+  const sep = h('hr', { style: 'border:none;border-top:1px solid #2a3540;margin:10px 0' })
+  const overlay = h('div', { class: 'modal-overlay', id: 'modal-overlay',
+    onclick: e => { if (e.target === overlay) closeModal() } },
+    h('div', { class: 'modal', style: 'max-width:600px;max-height:90vh;overflow-y:auto' },
+      h('div', { class: 'modal-header' },
+        h('h2', {}, 'Generate Config Files'),
+        h('button', { class: 'modal-close', onclick: closeModal }, '×')),
+      h('div', { class: 'modal-body' },
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'ERDDAP metadata URL (optional)'),
+          h('div', { style: 'display:flex;gap:6px;align-items:center' }, erddapInput, fetchBtn)),
+        sep.cloneNode(),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Summary'), fields.summary),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Comment (crew, vessel, port)'), fields.comment),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Project'), fields.project),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Program'), fields.program),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Acknowledgment'), fields.acknowledgment),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Contributor names (comma-separated)'),
+          fields.contributor_name),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Contributor roles (comma-separated)'),
+          fields.contributor_role),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Sea name'), fields.sea_name),
+        sep.cloneNode(),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' },
+            'Copy instruments & sensor defs from'),
+          copyFromSel),
+        statusEl),
+      h('div', { class: 'modal-footer' },
+        h('button', { class: 'btn-secondary', onclick: closeModal }, 'Cancel'),
+        generateBtn)))
+  document.body.appendChild(overlay)
 }
 
 function selectMetaFile (rel, jsonData, fileList, content, dep) {
