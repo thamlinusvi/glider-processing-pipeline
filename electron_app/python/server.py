@@ -1594,6 +1594,12 @@ def _find_prev_deployment(glider, exclude_dep):
     return deps[0] if deps else None
 
 
+@app.route('/api/deployment/<dep>/metadata/prev-dep', methods=['GET'])
+def get_prev_dep(dep):
+    glider = dep.split('-')[0]
+    return jsonify({'prev_dep': _find_prev_deployment(glider, dep)})
+
+
 def _normalize_erddap_url(url):
     """Convert any ERDDAP URL to its /info/<id>/index.json form."""
     import re

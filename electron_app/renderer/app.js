@@ -2962,7 +2962,12 @@ async function showGenerateConfigModal (dep) {
     const r = await apiFetch('/api/settings/generator')
     if (r && r.ok !== false) gcSettings = r
   } catch (_) {}
-  const noStaticSource = !prevDep && !gcSettings.active
+  let hasPrevConfigDep = false
+  try {
+    const r = await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/prev-dep`)
+    hasPrevConfigDep = !!r.prev_dep
+  } catch (_) {}
+  const noStaticSource = !hasPrevConfigDep && !gcSettings.active
 
   const statusEl = h('div', { class: 'modal-status' })
 
