@@ -6402,13 +6402,13 @@ async function renderSettings () {
 function _defaultFieldTags () {
   return {
     summary:          ['erddap', 'manual'],
-    comment:          ['manual'],
+    comment:          ['erddap', 'manual'],
     project:          ['erddap', 'manual'],
-    program:          ['prev', 'manual'],
+    program:          ['erddap', 'manual'],
     acknowledgment:   ['erddap', 'manual'],
-    contributor_name: ['prev', 'manual'],
-    contributor_role: ['prev', 'manual'],
-    sea_name:         ['prev', 'manual'],
+    contributor_name: ['erddap', 'manual'],
+    contributor_role: ['erddap', 'manual'],
+    sea_name:         ['erddap', 'manual'],
   }
 }
 
