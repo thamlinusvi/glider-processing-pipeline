@@ -2957,6 +2957,13 @@ async function showGenerateConfigModal (dep) {
   const sameDeps = allDeps.filter(d => d.startsWith(glider + '-')).sort().reverse()
   const prevDep  = sameDeps[0] || null
 
+  let gcSettings = { presets: [], active: null, static_fields: {} }
+  try {
+    const r = await apiFetch('/api/settings/generator')
+    if (r && r.ok !== false) gcSettings = r
+  } catch (_) {}
+  const noStaticSource = !prevDep && !gcSettings.active
+
   const statusEl = h('div', { class: 'modal-status' })
 
   const erddapInput = h('input', { class: 'form-input', type: 'url',
@@ -3097,6 +3104,14 @@ async function showGenerateConfigModal (dep) {
         h('h2', {}, 'Generate Config Files'),
         h('button', { class: 'modal-close', onclick: closeModal }, '×')),
       h('div', { class: 'modal-body' },
+        noStaticSource ? h('div', {
+          style: 'background:#4a3800;border:1px solid #8a6500;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#ffd888;line-height:1.5'
+        },
+          h('div', { style: 'font-weight:600;margin-bottom:4px' }, '⚠ Creator / publisher fields not configured'),
+          h('div', {}, 'No previous deployment found and no preset is active. These fields will fall back to default values. Go to Settings → Static Fields to enter your organization\'s info and save a preset.'),
+          h('button', { class: 'btn-secondary btn-sm', style: 'margin-top:8px',
+            onclick: () => { closeModal(); navigate('settings') } }, 'Go to Settings')
+        ) : null,
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Generate for'),
           h('div', {}, ...subdirChecks.map(({ el }) => el))),
