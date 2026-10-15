@@ -2530,7 +2530,7 @@ async function renderMetadata (selectRel) {
           }))
           _metaFileMenuPopover(e.currentTarget, actions)
         },
-      }, '⧉')
+      }, 'Copy section')
       sectionHdr.appendChild(copyBtn)
     }
 
@@ -2668,7 +2668,7 @@ function _metaEmptyPanel (dep, configDir) {
     h('div', { class: 'meta-empty-actions' },
       otherDeps.length
         ? h('button', { class: 'btn-secondary', onclick: () => _metaCopyAllFromDep(dep, glider) },
-            '⧉  Copy all from deployment')
+            'Copy all from deployment')
         : null,
       h('button', { class: 'btn-secondary', onclick: () => _metaImportJsonFiles(dep) },
         '↑  Import JSON files'),
@@ -2684,7 +2684,7 @@ function _metaAddBar (dep) {
   return h('div', { class: 'meta-add-bar' },
     otherDeps.length
       ? h('button', { class: 'meta-add-action', title: 'Copy all config files from another deployment',
-          onclick: () => _metaCopyAllFromDep(dep, glider) }, '⧉ Copy all from dep')
+          onclick: () => _metaCopyAllFromDep(dep, glider) }, 'Copy all from dep')
       : null,
     h('button', { class: 'meta-add-action', title: 'Import JSON files from disk',
       onclick: () => _metaImportJsonFiles(dep) }, '↑ Import files'),
