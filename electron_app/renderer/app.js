@@ -2499,7 +2499,42 @@ async function renderMetadata (selectRel) {
   let firstEntry = null
   GROUP_ORDER.forEach(group => {
     const items = groups[group] || []
-    fileList.appendChild(h('div', { class: 'meta-section-header' }, groupLabels[group] || group))
+
+    const sectionHdr = h('div', { class: 'meta-section-header' },
+      h('span', {}, groupLabels[group] || group))
+
+    if (items.length) {
+      const copyBtn = h('button', {
+        class: 'meta-section-copy-btn',
+        title: 'Copy all files in this section to another section…',
+        onclick: e => {
+          e.stopPropagation()
+          const SECTION_LABELS = {
+            science_profile:    'Profile',
+            science_trajectory: 'Trajectory (Science)',
+            trajectory_flight:  'Trajectory (Flight)',
+          }
+          const targets = GROUP_ORDER.filter(g => g !== group)
+          const actions = targets.map(target => ({
+            label: `→ ${SECTION_LABELS[target]}`,
+            action: async () => {
+              try {
+                await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/copy-section`, {
+                  method:  'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body:    JSON.stringify({ from: group, to: target }),
+                })
+                await renderMetadata()
+              } catch (ex) { alert('Copy failed: ' + ex.message) }
+            },
+          }))
+          _metaFileMenuPopover(e.currentTarget, actions)
+        },
+      }, '⧉')
+      sectionHdr.appendChild(copyBtn)
+    }
+
+    fileList.appendChild(sectionHdr)
 
     if (!items.length) {
       fileList.appendChild(h('div', { class: 'meta-file-empty' }, 'No files yet'))

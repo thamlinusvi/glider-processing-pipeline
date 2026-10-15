@@ -1312,6 +1312,38 @@ def save_metadata(dep):
     return jsonify({'ok': True})
 
 
+@app.route('/api/deployment/<dep>/metadata/copy-section', methods=['POST'])
+def copy_metadata_section(dep):
+    """Copy all JSON files from one subdir to another within the same deployment."""
+    data       = request.json or {}
+    src_subdir = data.get('from', '').strip()
+    dst_subdir = data.get('to',   '').strip()
+    valid      = {'science_profile', 'science_trajectory', 'trajectory_flight'}
+    if src_subdir not in valid or dst_subdir not in valid:
+        return jsonify({'error': 'Invalid subdir'}), 400
+    if src_subdir == dst_subdir:
+        return jsonify({'error': 'Source and destination are the same'}), 400
+
+    glider     = dep.split('-')[0]
+    config_dir = os.path.realpath(os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep))
+    src_dir    = os.path.realpath(os.path.join(config_dir, src_subdir))
+    dst_dir    = os.path.realpath(os.path.join(config_dir, dst_subdir))
+
+    if not _is_within(src_dir, config_dir) or not _is_within(dst_dir, config_dir):
+        return jsonify({'error': 'Invalid path'}), 403
+    if not os.path.isdir(src_dir):
+        return jsonify({'error': f'No files in {src_subdir}'}), 404
+
+    copied = []
+    os.makedirs(dst_dir, exist_ok=True)
+    for fname in os.listdir(src_dir):
+        if not fname.endswith('.json'):
+            continue
+        shutil.copy2(os.path.join(src_dir, fname), os.path.join(dst_dir, fname))
+        copied.append(fname)
+    return jsonify({'ok': True, 'copied': copied})
+
+
 @app.route('/api/deployment/<dep>/metadata/delete', methods=['POST'])
 def delete_metadata(dep):
     data     = request.json or {}
