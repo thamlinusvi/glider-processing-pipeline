@@ -2957,6 +2957,32 @@ async function showGenerateConfigModal (dep) {
   const sameDeps = allDeps.filter(d => d.startsWith(glider + '-')).sort().reverse()
   const prevDep  = sameDeps[0] || null
 
+  // Load generator settings (field tags + active preset)
+  let fieldTags = _defaultFieldTags()
+  let activePreset = null
+  try {
+    const s = await apiFetch('/api/settings/generator')
+    if (s.field_tags) fieldTags = s.field_tags
+    if (s.active)     activePreset = s.active
+  } catch (_) {}
+
+  const hasTag = (field, tag) => (fieldTags[field] || []).includes(tag)
+
+  // Pre-fill 'prev'-tagged fields from the most recent same-glider deployment
+  let prevVals = {}
+  if (prevDep) {
+    const prevFields = Object.keys(fieldTags).filter(k => hasTag(k, 'prev'))
+    if (prevFields.length) {
+      try {
+        const md = await apiFetch(`/api/deployment/${encodeURIComponent(prevDep)}/metadata`)
+        const ga = md.files?.['science_profile\\global_attributes.json']
+                || md.files?.['science_profile/global_attributes.json'] || {}
+        prevFields.forEach(k => { if (ga[k]) prevVals[k] = ga[k] })
+      } catch (_) {}
+    }
+  }
+
+  const statusEl = h('div', { class: 'modal-status' })
 
   const erddapInput = h('input', { class: 'form-input', type: 'url',
     placeholder: 'Paste any ERDDAP dataset or info URL',
@@ -2978,9 +3004,11 @@ async function showGenerateConfigModal (dep) {
       ...SEA_NAMES.map(n => h('option', { value: n }, n))),
   }
 
-  function setFields (vals) {
+  // Apply a set of values, optionally restricted to fields with a given tag
+  function setFields (vals, onlyTag = null) {
     Object.entries(vals).forEach(([k, v]) => {
       if (!fields[k] || !v) return
+      if (onlyTag && !hasTag(k, onlyTag)) return
       if (fields[k].tagName === 'SELECT') {
         Array.from(fields[k].options).forEach(o => { o.selected = o.value === v })
       } else {
@@ -2988,20 +3016,9 @@ async function showGenerateConfigModal (dep) {
       }
     })
   }
-  // Copy-from selector (instruments.json + sensor_defs)
-  const copyFromSel = h('select', { class: 'form-input' })
-  copyFromSel.appendChild(h('option', { value: '' }, '— none —'))
-  if (sameDeps.length) {
-    const grp = document.createElement('optgroup')
-    grp.label = `Same glider — ${glider}`
-    sameDeps.forEach(d => grp.appendChild(
-      h('option', { value: d, selected: d === prevDep }, d)))
-    copyFromSel.appendChild(grp)
-  }
-  allDeps.filter(d => !d.startsWith(glider + '-')).sort().reverse().forEach(d =>
-    copyFromSel.appendChild(h('option', { value: d }, d)))
 
-  const statusEl = h('div', { class: 'modal-status' })
+  // Apply prev pre-fills
+  setFields(prevVals, 'prev')
 
   fetchBtn.onclick = async () => {
     const url = erddapInput.value.trim()
@@ -3012,7 +3029,7 @@ async function showGenerateConfigModal (dep) {
     try {
       const r = await apiFetch(`/api/erddap/fetch?url=${encodeURIComponent(url)}`)
       if (r.error) throw new Error(r.error)
-      setFields(r)
+      setFields(r, 'erddap')   // only overwrite erddap-tagged fields
       statusEl.textContent = 'Fields updated from ERDDAP.'
       statusEl.style.color = '#27ae60'
     } catch (e) {
@@ -3023,6 +3040,36 @@ async function showGenerateConfigModal (dep) {
       fetchBtn.textContent = 'Fetch'
     }
   }
+
+  // Build field rows — only show fields tagged 'manual'; tag badges on labels
+  const FIELD_META = [
+    { key: 'summary',          label: 'Summary' },
+    { key: 'comment',          label: 'Comment (crew, vessel, port)' },
+    { key: 'project',          label: 'Project' },
+    { key: 'program',          label: 'Program' },
+    { key: 'acknowledgment',   label: 'Acknowledgment' },
+    { key: 'contributor_name', label: 'Contributor names (comma-separated)' },
+    { key: 'contributor_role', label: 'Contributor roles (comma-separated)' },
+    { key: 'sea_name',         label: 'Sea name' },
+  ]
+
+  function tagBadge (tag) {
+    const colors = { erddap: '#2980b9', prev: '#6a7f96', manual: '#3a8f5a' }
+    return h('span', {
+      style: `font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;`
+           + `background:${colors[tag] || '#888'};color:#fff;margin-left:5px;`
+           + `text-transform:uppercase;letter-spacing:0.03em`,
+    }, tag)
+  }
+
+  const fieldRows = FIELD_META
+    .filter(({ key }) => hasTag(key, 'manual'))
+    .map(({ key, label }) => {
+      const tags = (fieldTags[key] || []).filter(t => t !== 'manual')
+      const labelEl = h('label', { class: 'form-label' }, label,
+        ...tags.map(tagBadge))
+      return h('div', { class: 'form-group' }, labelEl, fields[key])
+    })
 
   const SUBDIR_OPTS = [
     { value: 'science_profile',    label: 'Profile (science_profile)' },
@@ -3036,6 +3083,19 @@ async function showGenerateConfigModal (dep) {
       style: 'display:flex;align-items:center;cursor:pointer;font-size:13px;margin-bottom:4px' },
       cb, label) }
   })
+
+  // Copy-from selector (instruments.json + sensor_defs)
+  const copyFromSel = h('select', { class: 'form-input' })
+  copyFromSel.appendChild(h('option', { value: '' }, '— none —'))
+  if (sameDeps.length) {
+    const grp = document.createElement('optgroup')
+    grp.label = `Same glider — ${glider}`
+    sameDeps.forEach(d => grp.appendChild(
+      h('option', { value: d, selected: d === prevDep }, d)))
+    copyFromSel.appendChild(grp)
+  }
+  allDeps.filter(d => !d.startsWith(glider + '-')).sort().reverse().forEach(d =>
+    copyFromSel.appendChild(h('option', { value: d }, d)))
 
   const generateBtn = h('button', { class: 'btn-primary' }, 'Generate')
   generateBtn.onclick = async () => {
@@ -3077,6 +3137,13 @@ async function showGenerateConfigModal (dep) {
   }
 
   const sep = h('hr', { style: 'border:none;border-top:1px solid #2a3540;margin:10px 0' })
+
+  // Preset indicator
+  const presetHint = activePreset
+    ? h('div', { style: 'font-size:11px;color:#8a9bac;margin-bottom:8px' },
+        `Preset: ${activePreset} — configure in Settings`)
+    : null
+
   const overlay = h('div', { class: 'modal-overlay', id: 'modal-overlay',
     onclick: e => { if (e.target === overlay) closeModal() } },
     h('div', { class: 'modal', style: 'max-width:600px;max-height:90vh;overflow-y:auto' },
@@ -3084,38 +3151,20 @@ async function showGenerateConfigModal (dep) {
         h('h2', {}, 'Generate Config Files'),
         h('button', { class: 'modal-close', onclick: closeModal }, '×')),
       h('div', { class: 'modal-body' },
+        ...(presetHint ? [presetHint] : []),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Generate for'),
           h('div', {}, ...subdirChecks.map(({ el }) => el))),
         sep.cloneNode(),
         h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'ERDDAP metadata URL (optional)'),
+          h('label', { class: 'form-label' }, 'ERDDAP metadata URL'),
           h('div', { style: 'display:flex;gap:6px;align-items:center' }, erddapInput, fetchBtn),
           h('div', { style: 'font-size:11px;color:#8a9bac;margin-top:4px' },
-            'Paste any ERDDAP URL (dataset page, info page, .html or .json). Fetch pre-fills the fields below; unfound fields remain blank — fill those in manually.')),
+            'Paste any ERDDAP URL. Fields tagged ERDDAP are updated on Fetch; fields tagged PREV are pre-filled from the previous deployment. Configure tags in Settings.')),
+        ...(fieldRows.length ? [sep.cloneNode(), ...fieldRows] : []),
         sep.cloneNode(),
         h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Summary'), fields.summary),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Comment (crew, vessel, port)'), fields.comment),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Project'), fields.project),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Program'), fields.program),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Acknowledgment'), fields.acknowledgment),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Contributor names (comma-separated)'),
-          fields.contributor_name),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Contributor roles (comma-separated)'),
-          fields.contributor_role),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' }, 'Sea name'), fields.sea_name),
-        sep.cloneNode(),
-        h('div', { class: 'form-group' },
-          h('label', { class: 'form-label' },
-            'Copy instruments & sensor defs from'),
+          h('label', { class: 'form-label' }, 'Copy instruments & sensor defs from'),
           copyFromSel),
         statusEl),
       h('div', { class: 'modal-footer' },
