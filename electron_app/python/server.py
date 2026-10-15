@@ -1529,14 +1529,13 @@ _DEFAULT_GENERATOR_SETTINGS = {
         'sea_name':         ['erddap', 'manual'],
     },
     'static_fields': {
-        'creator_name':           '',
-        'creator_email':          '',
-        'creator_institution':    '',
-        'creator_type':           '',
-        'creator_url':            '',
-        'publisher_email':        '',
-        'publisher_institution':  '',
-        'geospatial_vertical_units': 'EPSG:5831',
+        'creator_name':          '',
+        'creator_email':         '',
+        'creator_institution':   '',
+        'creator_type':          '',
+        'creator_url':           '',
+        'publisher_email':       '',
+        'publisher_institution': '',
     },
     'presets': [],
     'active': None,
@@ -1750,11 +1749,40 @@ def generate_metadata_files(dep):
     ga['date_modified']          = now_iso
     ga['date_metadata_modified'] = now_iso
 
-    # Overlay static_fields from settings (always win over ERDDAP / form values)
+    # Load previous mission GA once — used for static field defaults + vertical units
+    _prev_dep  = _find_prev_deployment(glider, dep)
+    _prev_ga   = {}
+    if _prev_dep:
+        _prev_glider  = _prev_dep.split('-')[0]
+        _prev_ga_path = os.path.join(REPO_DIR, 'glider_config_files_json',
+                                     _prev_glider, _prev_dep, 'science_profile', 'global_attributes.json')
+        if os.path.isfile(_prev_ga_path):
+            try:
+                with open(_prev_ga_path, encoding='utf-8-sig') as f:
+                    _prev_ga = json.load(f)
+            except Exception:
+                pass
+
+    _CREATOR_PUBLISHER_KEYS = [
+        'creator_name', 'creator_email', 'creator_institution',
+        'creator_type', 'creator_url', 'publisher_email', 'publisher_institution',
+    ]
     _settings = _load_generator_settings()
-    for k, v in _settings.get('static_fields', {}).items():
-        if v and v.strip():
-            ga[k] = v.strip()
+    if _settings.get('active'):
+        # Preset active: use saved static_fields
+        for k in _CREATOR_PUBLISHER_KEYS:
+            v = _settings.get('static_fields', {}).get(k, '').strip()
+            if v:
+                ga[k] = v
+    else:
+        # No preset: pull from previous mission
+        for k in _CREATOR_PUBLISHER_KEYS:
+            if _prev_ga.get(k):
+                ga[k] = _prev_ga[k]
+
+    # geospatial_vertical_units always from previous mission
+    if _prev_ga.get('geospatial_vertical_units'):
+        ga['geospatial_vertical_units'] = _prev_ga['geospatial_vertical_units']
 
     # Build deployment.json (preserve platform block; update global_attributes subset)
     deployment = dict(base_dep)

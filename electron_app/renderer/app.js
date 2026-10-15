@@ -2957,31 +2957,6 @@ async function showGenerateConfigModal (dep) {
   const sameDeps = allDeps.filter(d => d.startsWith(glider + '-')).sort().reverse()
   const prevDep  = sameDeps[0] || null
 
-  // Load generator settings (field tags + active preset)
-  let fieldTags = _defaultFieldTags()
-  let activePreset = null
-  try {
-    const s = await apiFetch('/api/settings/generator')
-    if (s.field_tags) fieldTags = s.field_tags
-    if (s.active)     activePreset = s.active
-  } catch (_) {}
-
-  const hasTag = (field, tag) => (fieldTags[field] || []).includes(tag)
-
-  // Pre-fill 'prev'-tagged fields from the most recent same-glider deployment
-  let prevVals = {}
-  if (prevDep) {
-    const prevFields = Object.keys(fieldTags).filter(k => hasTag(k, 'prev'))
-    if (prevFields.length) {
-      try {
-        const md = await apiFetch(`/api/deployment/${encodeURIComponent(prevDep)}/metadata`)
-        const ga = md.files?.['science_profile\\global_attributes.json']
-                || md.files?.['science_profile/global_attributes.json'] || {}
-        prevFields.forEach(k => { if (ga[k]) prevVals[k] = ga[k] })
-      } catch (_) {}
-    }
-  }
-
   const statusEl = h('div', { class: 'modal-status' })
 
   const erddapInput = h('input', { class: 'form-input', type: 'url',
@@ -3004,11 +2979,9 @@ async function showGenerateConfigModal (dep) {
       ...SEA_NAMES.map(n => h('option', { value: n }, n))),
   }
 
-  // Apply a set of values, optionally restricted to fields with a given tag
-  function setFields (vals, onlyTag = null) {
+  function setFields (vals) {
     Object.entries(vals).forEach(([k, v]) => {
       if (!fields[k] || !v) return
-      if (onlyTag && !hasTag(k, onlyTag)) return
       if (fields[k].tagName === 'SELECT') {
         Array.from(fields[k].options).forEach(o => { o.selected = o.value === v })
       } else {
@@ -3016,9 +2989,6 @@ async function showGenerateConfigModal (dep) {
       }
     })
   }
-
-  // Apply prev pre-fills
-  setFields(prevVals, 'prev')
 
   fetchBtn.onclick = async () => {
     const url = erddapInput.value.trim()
@@ -3029,7 +2999,7 @@ async function showGenerateConfigModal (dep) {
     try {
       const r = await apiFetch(`/api/erddap/fetch?url=${encodeURIComponent(url)}`)
       if (r.error) throw new Error(r.error)
-      setFields(r, 'erddap')   // only overwrite erddap-tagged fields
+      setFields(r)
       statusEl.textContent = 'Fields updated from ERDDAP.'
       statusEl.style.color = '#27ae60'
     } catch (e) {
@@ -3041,8 +3011,7 @@ async function showGenerateConfigModal (dep) {
     }
   }
 
-  // Build field rows — only show fields tagged 'manual'; tag badges on labels
-  const FIELD_META = [
+  const fieldRows = [
     { key: 'summary',          label: 'Summary' },
     { key: 'comment',          label: 'Comment (crew, vessel, port)' },
     { key: 'project',          label: 'Project' },
@@ -3051,25 +3020,8 @@ async function showGenerateConfigModal (dep) {
     { key: 'contributor_name', label: 'Contributor names (comma-separated)' },
     { key: 'contributor_role', label: 'Contributor roles (comma-separated)' },
     { key: 'sea_name',         label: 'Sea name' },
-  ]
-
-  function tagBadge (tag) {
-    const colors = { erddap: '#2980b9', prev: '#6a7f96', manual: '#3a8f5a' }
-    return h('span', {
-      style: `font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;`
-           + `background:${colors[tag] || '#888'};color:#fff;margin-left:5px;`
-           + `text-transform:uppercase;letter-spacing:0.03em`,
-    }, tag)
-  }
-
-  const fieldRows = FIELD_META
-    .filter(({ key }) => hasTag(key, 'manual'))
-    .map(({ key, label }) => {
-      const tags = (fieldTags[key] || []).filter(t => t !== 'manual')
-      const labelEl = h('label', { class: 'form-label' }, label,
-        ...tags.map(tagBadge))
-      return h('div', { class: 'form-group' }, labelEl, fields[key])
-    })
+  ].map(({ key, label }) => h('div', { class: 'form-group' },
+    h('label', { class: 'form-label' }, label), fields[key]))
 
   const SUBDIR_OPTS = [
     { value: 'science_profile',    label: 'Profile (science_profile)' },
@@ -3138,12 +3090,6 @@ async function showGenerateConfigModal (dep) {
 
   const sep = h('hr', { style: 'border:none;border-top:1px solid #2a3540;margin:10px 0' })
 
-  // Preset indicator
-  const presetHint = activePreset
-    ? h('div', { style: 'font-size:11px;color:#8a9bac;margin-bottom:8px' },
-        `Preset: ${activePreset} — configure in Settings`)
-    : null
-
   const overlay = h('div', { class: 'modal-overlay', id: 'modal-overlay',
     onclick: e => { if (e.target === overlay) closeModal() } },
     h('div', { class: 'modal', style: 'max-width:600px;max-height:90vh;overflow-y:auto' },
@@ -3151,7 +3097,6 @@ async function showGenerateConfigModal (dep) {
         h('h2', {}, 'Generate Config Files'),
         h('button', { class: 'modal-close', onclick: closeModal }, '×')),
       h('div', { class: 'modal-body' },
-        ...(presetHint ? [presetHint] : []),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Generate for'),
           h('div', {}, ...subdirChecks.map(({ el }) => el))),
@@ -3160,8 +3105,9 @@ async function showGenerateConfigModal (dep) {
           h('label', { class: 'form-label' }, 'ERDDAP metadata URL'),
           h('div', { style: 'display:flex;gap:6px;align-items:center' }, erddapInput, fetchBtn),
           h('div', { style: 'font-size:11px;color:#8a9bac;margin-top:4px' },
-            'Paste any ERDDAP URL. Fields tagged ERDDAP are updated on Fetch; fields tagged PREV are pre-filled from the previous deployment. Configure tags in Settings.')),
-        ...(fieldRows.length ? [sep.cloneNode(), ...fieldRows] : []),
+            'Paste any ERDDAP URL. Fetch populates the fields below. Creator, publisher, and vertical units are set automatically — configure them in Settings.')),
+        sep.cloneNode(),
+        ...fieldRows,
         sep.cloneNode(),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Copy instruments & sensor defs from'),
@@ -6418,6 +6364,16 @@ async function renderAdcp () {
 }
 
 /* ── Settings page ───────────────────────────────────────────────────────────*/
+const _SF_META = [
+  { key: 'creator_name',          label: 'Creator name' },
+  { key: 'creator_email',         label: 'Creator email' },
+  { key: 'creator_institution',   label: 'Creator institution' },
+  { key: 'creator_type',          label: 'Creator type' },
+  { key: 'creator_url',           label: 'Creator URL' },
+  { key: 'publisher_email',       label: 'Publisher email' },
+  { key: 'publisher_institution', label: 'Publisher institution' },
+]
+
 async function renderSettings () {
   const page = document.getElementById('page-settings')
   page.innerHTML = ''
@@ -6431,118 +6387,37 @@ async function renderSettings () {
   const body = h('div', { class: 'page-body' })
   page.appendChild(body)
 
-  // ── Generate Config section ────────────────────────────────────────────────
-  const gcSection = h('div', { class: 'settings-section' })
-  body.appendChild(gcSection)
-  gcSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Generate Config'))
-  gcSection.appendChild(h('p', { class: 'settings-section-desc' },
-    'Controls how each field is populated when you generate deployment config files.'))
-
-  // Load current settings from server
-  let gcSettings = { presets: [], active: null, field_tags: _defaultFieldTags(), static_fields: {} }
+  // Load settings
+  let gcSettings = { presets: [], active: null, static_fields: {} }
   try {
     const r = await apiFetch('/api/settings/generator')
     if (r.ok !== false) gcSettings = r
   } catch (_) {}
-
-  renderGeneratorSettings(gcSection, gcSettings)
 
   // ── Static Fields section ──────────────────────────────────────────────────
   const sfSection = h('div', { class: 'settings-section' })
   body.appendChild(sfSection)
   sfSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Static Fields'))
   sfSection.appendChild(h('p', { class: 'settings-section-desc' },
-    'These values are written to every generated config, overriding whatever ERDDAP returns. Set them once per institution.'))
+    'Creator and publisher values to use when generating config files. When no preset is active these are pulled automatically from the most recent same-glider deployment. ' +
+    'Geospatial vertical units are always pulled from the previous deployment.'))
 
-  const SF_META = [
-    { key: 'creator_name',          label: 'Creator name' },
-    { key: 'creator_email',         label: 'Creator email' },
-    { key: 'creator_institution',   label: 'Creator institution' },
-    { key: 'creator_type',          label: 'Creator type' },
-    { key: 'creator_url',           label: 'Creator URL' },
-    { key: 'publisher_email',       label: 'Publisher email' },
-    { key: 'publisher_institution', label: 'Publisher institution' },
-    { key: 'geospatial_vertical_units', label: 'Geospatial vertical units' },
-  ]
-
-  const sfFields = {}
-  const sfWrap = h('div', { class: 'sf-fields-wrap' })
-  sfSection.appendChild(sfWrap)
-
-  SF_META.forEach(({ key, label }) => {
-    const input = h('input', { class: 'form-input', type: 'text',
-      value: (gcSettings.static_fields || {})[key] || '' })
-    sfFields[key] = input
-    sfWrap.appendChild(h('div', { class: 'form-group sf-form-group' },
-      h('label', { class: 'form-label' }, label), input))
-  })
-
-  const sfStatus = h('div', { class: 'gc-status' })
-  const sfSaveBtn = h('button', { class: 'btn-primary', style: 'margin-top:16px' }, 'Save')
-  sfWrap.appendChild(sfSaveBtn)
-  sfWrap.appendChild(sfStatus)
-
-  sfSaveBtn.addEventListener('click', async () => {
-    const static_fields = {}
-    SF_META.forEach(({ key }) => { static_fields[key] = sfFields[key].value.trim() })
-    try {
-      await apiFetch('/api/settings/generator', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...gcSettings, static_fields }) })
-      gcSettings.static_fields = static_fields
-      sfStatus.textContent = 'Saved.'
-      setTimeout(() => { sfStatus.textContent = '' }, 2000)
-    } catch (e) {
-      sfStatus.textContent = 'Error: ' + e.message
-    }
-  })
+  renderStaticFieldsEditor(sfSection, gcSettings)
 }
 
-function _defaultFieldTags () {
-  return {
-    summary:          ['erddap', 'manual'],
-    comment:          ['erddap', 'manual'],
-    project:          ['erddap', 'manual'],
-    program:          ['erddap', 'manual'],
-    acknowledgment:   ['erddap', 'manual'],
-    contributor_name: ['erddap', 'manual'],
-    contributor_role: ['erddap', 'manual'],
-    sea_name:         ['erddap', 'manual'],
-  }
-}
-
-const _FIELD_LABELS = {
-  summary:          'Summary',
-  comment:          'Comment',
-  project:          'Project',
-  program:          'Program',
-  acknowledgment:   'Acknowledgment',
-  contributor_name: 'Contributor names',
-  contributor_role: 'Contributor roles',
-  sea_name:         'Sea name',
-}
-
-const _ALL_TAGS = ['erddap', 'prev', 'manual']
-const _TAG_DESC = {
-  erddap:  'Fetch from ERDDAP URL',
-  prev:    'Copy from previous deployment',
-  manual:  'Show as editable field in form',
-}
-
-function renderGeneratorSettings (container, gcSettings) {
-  // Remove any previously rendered content below the heading/desc
-  const existing = container.querySelector('.gc-settings-body')
+function renderStaticFieldsEditor (container, gcSettings) {
+  const existing = container.querySelector('.sf-editor')
   if (existing) existing.remove()
 
-  const wrap = h('div', { class: 'gc-settings-body' })
+  const wrap = h('div', { class: 'sf-editor' })
   container.appendChild(wrap)
 
-  // ── Preset bar ──────────────────────────────────────────────────────────────
+  // ── Preset bar ────────────────────────────────────────────────────────────
   const presetBar = h('div', { class: 'gc-preset-bar' })
   wrap.appendChild(presetBar)
 
   const presetSel = h('select', { class: 'form-input gc-preset-select' })
-  presetSel.appendChild(h('option', { value: '' }, '— no preset —'))
+  presetSel.appendChild(h('option', { value: '' }, '— no preset (use previous deployment) —'))
   ;(gcSettings.presets || []).forEach(p => {
     const opt = h('option', { value: p.name }, p.name)
     if (p.name === gcSettings.active) opt.selected = true
@@ -6552,117 +6427,83 @@ function renderGeneratorSettings (container, gcSettings) {
   const loadBtn   = h('button', { class: 'btn-secondary btn-sm' }, 'Load')
   const saveBtn   = h('button', { class: 'btn-primary btn-sm' },   'Save as preset…')
   const deleteBtn = h('button', { class: 'btn-secondary btn-sm' }, 'Delete')
+  presetBar.append(
+    h('label', { class: 'form-label', style: 'margin:0;align-self:center' }, 'Preset'),
+    presetSel, loadBtn, saveBtn, deleteBtn)
 
-  presetBar.appendChild(h('label', { class: 'form-label', style: 'margin:0;align-self:center' }, 'Preset'))
-  presetBar.appendChild(presetSel)
-  presetBar.appendChild(loadBtn)
-  presetBar.appendChild(saveBtn)
-  presetBar.appendChild(deleteBtn)
+  // ── Field inputs ──────────────────────────────────────────────────────────
+  const sfFields = {}
+  const fieldsWrap = h('div', { class: 'sf-fields-wrap', style: 'margin-top:12px' })
+  wrap.appendChild(fieldsWrap)
 
-  // ── Field tag table ──────────────────────────────────────────────────────────
-  const table = h('table', { class: 'gc-field-table' })
-  wrap.appendChild(table)
-  const thead = h('thead')
-  table.appendChild(thead)
-  thead.appendChild(h('tr', {},
-    h('th', {}, 'Field'),
-    ..._ALL_TAGS.map(t => h('th', { title: _TAG_DESC[t] }, t)),
-  ))
-
-  const tbody = h('tbody')
-  table.appendChild(tbody)
-
-  // current working copy of tags (editable)
-  const workingTags = JSON.parse(JSON.stringify(gcSettings.field_tags || _defaultFieldTags()))
-
-  for (const [field, label] of Object.entries(_FIELD_LABELS)) {
-    const tr = h('tr')
-    tbody.appendChild(tr)
-    tr.appendChild(h('td', { class: 'gc-field-name' }, label))
-    for (const tag of _ALL_TAGS) {
-      const checked = (workingTags[field] || []).includes(tag)
-      const cb = h('input', { type: 'checkbox', checked })
-      cb.addEventListener('change', () => {
-        if (cb.checked) {
-          if (!workingTags[field]) workingTags[field] = []
-          if (!workingTags[field].includes(tag)) workingTags[field].push(tag)
-        } else {
-          workingTags[field] = (workingTags[field] || []).filter(t => t !== tag)
-        }
-      })
-      const td = h('td', { class: 'gc-tag-cell' })
-      td.appendChild(cb)
-      tr.appendChild(td)
-    }
-  }
-
-  // ── Save button ──────────────────────────────────────────────────────────────
-  const statusEl  = h('div', { class: 'gc-status' })
-  const applyBtn  = h('button', { class: 'btn-primary', style: 'margin-top:16px' }, 'Apply')
-  wrap.appendChild(applyBtn)
-  wrap.appendChild(statusEl)
-
-  applyBtn.addEventListener('click', async () => {
-    const body = { field_tags: workingTags, presets: gcSettings.presets, active: gcSettings.active }
-    try {
-      await apiFetch('/api/settings/generator', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body) })
-      gcSettings.field_tags = workingTags
-      statusEl.textContent = 'Saved.'
-      setTimeout(() => { statusEl.textContent = '' }, 2000)
-    } catch (e) {
-      statusEl.textContent = 'Error: ' + e.message
-    }
+  _SF_META.forEach(({ key, label }) => {
+    const input = h('input', { class: 'form-input', type: 'text',
+      value: (gcSettings.static_fields || {})[key] || '' })
+    sfFields[key] = input
+    fieldsWrap.appendChild(h('div', { class: 'form-group sf-form-group' },
+      h('label', { class: 'form-label' }, label), input))
   })
 
-  // ── Load preset ──────────────────────────────────────────────────────────────
-  loadBtn.addEventListener('click', async () => {
+  const statusEl = h('div', { class: 'gc-status' })
+  const saveFieldsBtn = h('button', { class: 'btn-primary', style: 'margin-top:16px' }, 'Save')
+  fieldsWrap.appendChild(saveFieldsBtn)
+  fieldsWrap.appendChild(statusEl)
+
+  function currentFields () {
+    const sf = {}
+    _SF_META.forEach(({ key }) => { sf[key] = sfFields[key].value.trim() })
+    return sf
+  }
+
+  async function persist (patch) {
+    await apiFetch('/api/settings/generator', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...gcSettings, ...patch }) })
+    Object.assign(gcSettings, patch)
+  }
+
+  saveFieldsBtn.addEventListener('click', async () => {
+    try {
+      await persist({ static_fields: currentFields() })
+      statusEl.textContent = 'Saved.'
+      setTimeout(() => { statusEl.textContent = '' }, 2000)
+    } catch (e) { statusEl.textContent = 'Error: ' + e.message }
+  })
+
+  loadBtn.addEventListener('click', () => {
     const name = presetSel.value
     if (!name) return
     const preset = (gcSettings.presets || []).find(p => p.name === name)
     if (!preset) return
-    Object.assign(workingTags, JSON.parse(JSON.stringify(preset.field_tags)))
+    _SF_META.forEach(({ key }) => { sfFields[key].value = (preset.static_fields || {})[key] || '' })
     gcSettings.active = name
-    // re-render to reflect loaded values
-    renderGeneratorSettings(container, gcSettings)
   })
 
-  // ── Save as preset ───────────────────────────────────────────────────────────
   saveBtn.addEventListener('click', async () => {
     const name = prompt('Preset name:')
     if (!name || !name.trim()) return
     const trimmed = name.trim()
-    const existing = gcSettings.presets.findIndex(p => p.name === trimmed)
-    const newPreset = { name: trimmed, field_tags: JSON.parse(JSON.stringify(workingTags)) }
-    if (existing >= 0) gcSettings.presets[existing] = newPreset
-    else gcSettings.presets.push(newPreset)
-    gcSettings.active = trimmed
+    const sf = currentFields()
+    const newPreset = { name: trimmed, static_fields: sf }
+    const idx = (gcSettings.presets || []).findIndex(p => p.name === trimmed)
+    const presets = [...(gcSettings.presets || [])]
+    if (idx >= 0) presets[idx] = newPreset; else presets.push(newPreset)
     try {
-      await apiFetch('/api/settings/generator', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ field_tags: workingTags, presets: gcSettings.presets, active: trimmed }) })
-      renderGeneratorSettings(container, gcSettings)
-    } catch (e) {
-      statusEl.textContent = 'Error: ' + e.message
-    }
+      await persist({ presets, active: trimmed, static_fields: sf })
+      renderStaticFieldsEditor(container, gcSettings)
+    } catch (e) { statusEl.textContent = 'Error: ' + e.message }
   })
 
-  // ── Delete preset ─────────────────────────────────────────────────────────────
   deleteBtn.addEventListener('click', async () => {
     const name = presetSel.value
     if (!name) return
     if (!confirm(`Delete preset "${name}"?`)) return
-    gcSettings.presets = gcSettings.presets.filter(p => p.name !== name)
-    if (gcSettings.active === name) gcSettings.active = null
+    const presets = (gcSettings.presets || []).filter(p => p.name !== name)
+    const active  = gcSettings.active === name ? null : gcSettings.active
     try {
-      await apiFetch('/api/settings/generator', { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ field_tags: workingTags, presets: gcSettings.presets, active: gcSettings.active }) })
-      renderGeneratorSettings(container, gcSettings)
-    } catch (e) {
-      statusEl.textContent = 'Error: ' + e.message
-    }
+      await persist({ presets, active })
+      renderStaticFieldsEditor(container, gcSettings)
+    } catch (e) { statusEl.textContent = 'Error: ' + e.message }
   })
 }
 
