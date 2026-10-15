@@ -2511,7 +2511,7 @@ async function renderMetadata (selectRel) {
           e.stopPropagation()
           _metaCopyFileFromDepModal(dep, glider, group, renderMetadata)
         },
-      }, 'Copy file from Deployment')
+      }, 'Copy file from different deployment')
       sectionHdr.appendChild(cpFileBtn)
     }
 
