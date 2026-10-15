@@ -3665,3 +3665,31 @@ button {
   font-size: 12px;
   color: #4a6080;
 }
+
+/* ── Settings page ─────────────────────────────────────────────────────────── */
+.settings-section { max-width: 680px; margin-bottom: 32px; }
+.settings-section-title { font-size: 15px; font-weight: 600; color: #1a2a3a; margin: 0 0 4px; }
+.settings-section-desc  { font-size: 12px; color: #6a7f96; margin: 0 0 16px; }
+
+.gc-settings-body { display: flex; flex-direction: column; gap: 12px; }
+
+.gc-preset-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; background: #f5f8fb; border: 1px solid #d8e2ec;
+  border-radius: 6px;
+}
+.gc-preset-select { width: 180px; }
+
+.gc-field-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.gc-field-table th {
+  text-align: left; padding: 6px 10px; background: #eef2f7;
+  color: #4a6080; font-weight: 600; border-bottom: 1px solid #d0d8e4;
+}
+.gc-field-table th:not(:first-child) { text-align: center; width: 90px; }
+.gc-field-table td { padding: 7px 10px; border-bottom: 1px solid #edf1f5; }
+.gc-field-table tbody tr:hover td { background: #f5f8fb; }
+.gc-field-name { font-weight: 500; color: #2a3a4a; }
+.gc-tag-cell   { text-align: center; }
+.gc-tag-cell input[type=checkbox] { cursor: pointer; width: 14px; height: 14px; }
+
+.gc-status { font-size: 12px; color: #3a8f5a; min-height: 18px; }

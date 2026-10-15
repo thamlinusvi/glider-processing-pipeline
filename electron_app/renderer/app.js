@@ -6389,6 +6389,205 @@ async function renderAdcp () {
   renderMain()
 }
 
+/* ── Settings page ───────────────────────────────────────────────────────────*/
+async function renderSettings () {
+  const page = document.getElementById('page-settings')
+  page.innerHTML = ''
+  page.style.overflowY = 'auto'
+
+  page.appendChild(h('div', { class: 'page-header' },
+    h('h1', {}, 'Settings'),
+    h('p',  {}, 'App-wide configuration.'),
+  ))
+
+  const body = h('div', { class: 'page-body' })
+  page.appendChild(body)
+
+  // ── Generate Config section ────────────────────────────────────────────────
+  const gcSection = h('div', { class: 'settings-section' })
+  body.appendChild(gcSection)
+  gcSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Generate Config'))
+  gcSection.appendChild(h('p', { class: 'settings-section-desc' },
+    'Controls how each field is populated when you generate deployment config files.'))
+
+  // Load current settings from server
+  let gcSettings = { presets: [], active: null, field_tags: _defaultFieldTags() }
+  try {
+    const r = await apiFetch('/api/settings/generator')
+    if (r.ok !== false) gcSettings = r
+  } catch (_) {}
+
+  renderGeneratorSettings(gcSection, gcSettings)
+}
+
+function _defaultFieldTags () {
+  return {
+    summary:          ['erddap', 'manual'],
+    comment:          ['manual'],
+    project:          ['erddap', 'manual'],
+    program:          ['prev', 'manual'],
+    acknowledgment:   ['erddap', 'manual'],
+    contributor_name: ['prev', 'manual'],
+    contributor_role: ['prev', 'manual'],
+    sea_name:         ['prev', 'manual'],
+  }
+}
+
+const _FIELD_LABELS = {
+  summary:          'Summary',
+  comment:          'Comment',
+  project:          'Project',
+  program:          'Program',
+  acknowledgment:   'Acknowledgment',
+  contributor_name: 'Contributor names',
+  contributor_role: 'Contributor roles',
+  sea_name:         'Sea name',
+}
+
+const _ALL_TAGS = ['erddap', 'prev', 'manual']
+const _TAG_DESC = {
+  erddap:  'Fetch from ERDDAP URL',
+  prev:    'Copy from previous deployment',
+  manual:  'Show as editable field in form',
+}
+
+function renderGeneratorSettings (container, gcSettings) {
+  // Remove any previously rendered content below the heading/desc
+  const existing = container.querySelector('.gc-settings-body')
+  if (existing) existing.remove()
+
+  const wrap = h('div', { class: 'gc-settings-body' })
+  container.appendChild(wrap)
+
+  // ── Preset bar ──────────────────────────────────────────────────────────────
+  const presetBar = h('div', { class: 'gc-preset-bar' })
+  wrap.appendChild(presetBar)
+
+  const presetSel = h('select', { class: 'form-input gc-preset-select' })
+  presetSel.appendChild(h('option', { value: '' }, '— no preset —'))
+  ;(gcSettings.presets || []).forEach(p => {
+    const opt = h('option', { value: p.name }, p.name)
+    if (p.name === gcSettings.active) opt.selected = true
+    presetSel.appendChild(opt)
+  })
+
+  const loadBtn   = h('button', { class: 'btn-secondary btn-sm' }, 'Load')
+  const saveBtn   = h('button', { class: 'btn-primary btn-sm' },   'Save as preset…')
+  const deleteBtn = h('button', { class: 'btn-secondary btn-sm' }, 'Delete')
+
+  presetBar.appendChild(h('label', { class: 'form-label', style: 'margin:0;align-self:center' }, 'Preset'))
+  presetBar.appendChild(presetSel)
+  presetBar.appendChild(loadBtn)
+  presetBar.appendChild(saveBtn)
+  presetBar.appendChild(deleteBtn)
+
+  // ── Field tag table ──────────────────────────────────────────────────────────
+  const table = h('table', { class: 'gc-field-table' })
+  wrap.appendChild(table)
+  const thead = h('thead')
+  table.appendChild(thead)
+  thead.appendChild(h('tr', {},
+    h('th', {}, 'Field'),
+    ..._ALL_TAGS.map(t => h('th', { title: _TAG_DESC[t] }, t)),
+  ))
+
+  const tbody = h('tbody')
+  table.appendChild(tbody)
+
+  // current working copy of tags (editable)
+  const workingTags = JSON.parse(JSON.stringify(gcSettings.field_tags || _defaultFieldTags()))
+
+  for (const [field, label] of Object.entries(_FIELD_LABELS)) {
+    const tr = h('tr')
+    tbody.appendChild(tr)
+    tr.appendChild(h('td', { class: 'gc-field-name' }, label))
+    for (const tag of _ALL_TAGS) {
+      const checked = (workingTags[field] || []).includes(tag)
+      const cb = h('input', { type: 'checkbox', checked })
+      cb.addEventListener('change', () => {
+        if (cb.checked) {
+          if (!workingTags[field]) workingTags[field] = []
+          if (!workingTags[field].includes(tag)) workingTags[field].push(tag)
+        } else {
+          workingTags[field] = (workingTags[field] || []).filter(t => t !== tag)
+        }
+      })
+      const td = h('td', { class: 'gc-tag-cell' })
+      td.appendChild(cb)
+      tr.appendChild(td)
+    }
+  }
+
+  // ── Save button ──────────────────────────────────────────────────────────────
+  const statusEl  = h('div', { class: 'gc-status' })
+  const applyBtn  = h('button', { class: 'btn-primary', style: 'margin-top:16px' }, 'Apply')
+  wrap.appendChild(applyBtn)
+  wrap.appendChild(statusEl)
+
+  applyBtn.addEventListener('click', async () => {
+    const body = { field_tags: workingTags, presets: gcSettings.presets, active: gcSettings.active }
+    try {
+      await apiFetch('/api/settings/generator', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) })
+      gcSettings.field_tags = workingTags
+      statusEl.textContent = 'Saved.'
+      setTimeout(() => { statusEl.textContent = '' }, 2000)
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message
+    }
+  })
+
+  // ── Load preset ──────────────────────────────────────────────────────────────
+  loadBtn.addEventListener('click', async () => {
+    const name = presetSel.value
+    if (!name) return
+    const preset = (gcSettings.presets || []).find(p => p.name === name)
+    if (!preset) return
+    Object.assign(workingTags, JSON.parse(JSON.stringify(preset.field_tags)))
+    gcSettings.active = name
+    // re-render to reflect loaded values
+    renderGeneratorSettings(container, gcSettings)
+  })
+
+  // ── Save as preset ───────────────────────────────────────────────────────────
+  saveBtn.addEventListener('click', async () => {
+    const name = prompt('Preset name:')
+    if (!name || !name.trim()) return
+    const trimmed = name.trim()
+    const existing = gcSettings.presets.findIndex(p => p.name === trimmed)
+    const newPreset = { name: trimmed, field_tags: JSON.parse(JSON.stringify(workingTags)) }
+    if (existing >= 0) gcSettings.presets[existing] = newPreset
+    else gcSettings.presets.push(newPreset)
+    gcSettings.active = trimmed
+    try {
+      await apiFetch('/api/settings/generator', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field_tags: workingTags, presets: gcSettings.presets, active: trimmed }) })
+      renderGeneratorSettings(container, gcSettings)
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message
+    }
+  })
+
+  // ── Delete preset ─────────────────────────────────────────────────────────────
+  deleteBtn.addEventListener('click', async () => {
+    const name = presetSel.value
+    if (!name) return
+    if (!confirm(`Delete preset "${name}"?`)) return
+    gcSettings.presets = gcSettings.presets.filter(p => p.name !== name)
+    if (gcSettings.active === name) gcSettings.active = null
+    try {
+      await apiFetch('/api/settings/generator', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field_tags: workingTags, presets: gcSettings.presets, active: gcSettings.active }) })
+      renderGeneratorSettings(container, gcSettings)
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message
+    }
+  })
+}
+
 /* ── Navigation ──────────────────────────────────────────────────────────────*/
 const pageRenderers = {
   dashboard:     renderDashboard,
@@ -6400,6 +6599,7 @@ const pageRenderers = {
   'dat-browser': renderDatBrowser,
   cloud:         renderCloud,
   adcp:          renderAdcp,
+  settings:      renderSettings,
 }
 
 async function navigate (page) {

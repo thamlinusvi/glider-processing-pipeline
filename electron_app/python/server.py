@@ -1514,6 +1514,63 @@ def import_metadata_files(dep):
     return jsonify({'results': results})
 
 
+# ── App settings ──────────────────────────────────────────────────────────────
+_SETTINGS_FILE = os.path.join(REPO_DIR, 'glider_config_files_json', 'generator_settings.json')
+
+_DEFAULT_GENERATOR_SETTINGS = {
+    'field_tags': {
+        'summary':          ['erddap', 'manual'],
+        'comment':          ['manual'],
+        'project':          ['erddap', 'manual'],
+        'program':          ['prev', 'manual'],
+        'acknowledgment':   ['erddap', 'manual'],
+        'contributor_name': ['prev', 'manual'],
+        'contributor_role': ['prev', 'manual'],
+        'sea_name':         ['prev', 'manual'],
+    },
+    'presets': [],
+    'active': None,
+}
+
+
+def _load_generator_settings():
+    if os.path.isfile(_SETTINGS_FILE):
+        try:
+            with open(_SETTINGS_FILE, encoding='utf-8') as f:
+                data = json.load(f)
+            # merge defaults for any missing keys
+            merged = dict(_DEFAULT_GENERATOR_SETTINGS)
+            merged.update(data)
+            return merged
+        except Exception:
+            pass
+    return dict(_DEFAULT_GENERATOR_SETTINGS)
+
+
+@app.route('/api/settings/generator', methods=['GET'])
+def get_generator_settings():
+    return jsonify(_load_generator_settings())
+
+
+@app.route('/api/settings/generator', methods=['POST'])
+def save_generator_settings():
+    data = request.json or {}
+    current = _load_generator_settings()
+    if 'field_tags' in data:
+        current['field_tags'] = data['field_tags']
+    if 'presets' in data:
+        current['presets'] = data['presets']
+    if 'active' in data:
+        current['active'] = data['active']
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS_FILE), exist_ok=True)
+        with open(_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(current, f, indent=2)
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True})
+
+
 # ── Config file generator ─────────────────────────────────────────────────────
 def _find_prev_deployment(glider, exclude_dep):
     """Return the most recent config-dir deployment name for `glider`, or None."""
