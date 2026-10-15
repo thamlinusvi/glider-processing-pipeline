@@ -2503,17 +2503,15 @@ async function renderMetadata (selectRel) {
     const sectionHdr = h('div', { class: 'meta-section-header' },
       h('span', {}, groupLabels[group] || group))
 
-    if (otherDeps.length) {
-      const cpFileBtn = h('button', {
-        class: 'meta-section-copy-btn',
-        title: 'Copy a specific file from another deployment into this section…',
-        onclick: e => {
-          e.stopPropagation()
-          _metaCopyFileFromDepModal(dep, glider, group, renderMetadata)
-        },
-      }, 'Copy file from dep…')
-      sectionHdr.appendChild(cpFileBtn)
-    }
+    const cpFileBtn = h('button', {
+      class: 'meta-section-copy-btn',
+      title: 'Copy a specific file from another deployment into this section…',
+      onclick: e => {
+        e.stopPropagation()
+        _metaCopyFileFromDepModal(dep, glider, group, renderMetadata)
+      },
+    }, 'Copy file from Deployment')
+    sectionHdr.appendChild(cpFileBtn)
 
     fileList.appendChild(sectionHdr)
 
