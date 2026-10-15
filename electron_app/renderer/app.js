@@ -2990,9 +2990,9 @@ async function _metaCopyFileFromDepModal (dep, glider, targetGroup, onDone) {
         entries.forEach(([rel, fileJson]) => {
           const filename = rel.split(/[\\/]/).pop()
           const isError  = !!(fileJson && fileJson.__metaError__)
-          const cb = h('input', { type: 'checkbox', checked: false,
-            id: `cpff-${rel}`, style: 'margin-right:6px',
-            disabled: isError })
+          const cbAttrs  = { type: 'checkbox', id: `cpff-${rel}`, style: 'margin-right:6px' }
+          if (isError) cbAttrs.disabled = ''
+          const cb = h('input', cbAttrs)
           checkboxes.push({ cb, filename, isError })
           fileListWrap.appendChild(h('label', {
             for: `cpff-${rel}`,
