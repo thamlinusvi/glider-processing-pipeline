@@ -1528,6 +1528,16 @@ _DEFAULT_GENERATOR_SETTINGS = {
         'contributor_role': ['erddap', 'manual'],
         'sea_name':         ['erddap', 'manual'],
     },
+    'static_fields': {
+        'creator_name':           '',
+        'creator_email':          '',
+        'creator_institution':    '',
+        'creator_type':           '',
+        'creator_url':            '',
+        'publisher_email':        '',
+        'publisher_institution':  '',
+        'geospatial_vertical_units': 'EPSG:5831',
+    },
     'presets': [],
     'active': None,
 }
@@ -1624,15 +1634,56 @@ def erddap_fetch():
             nc_global[row[2]] = row[4]
 
     field_map = {
-        'summary':          'summary',
-        'project':          'project',
-        'program':          'program',
-        'acknowledgment':   'acknowledgment',
-        'acknowledgement':  'acknowledgment',
-        'contributor_name': 'contributor_name',
-        'contributor_role': 'contributor_role',
-        'sea_name':         'sea_name',
-        'comment':          'comment',
+        # Mission-specific
+        'summary':               'summary',
+        'comment':               'comment',
+        'project':               'project',
+        'program':               'program',
+        'acknowledgment':        'acknowledgment',
+        'acknowledgement':       'acknowledgment',
+        'contributor_name':      'contributor_name',
+        'contributor_role':      'contributor_role',
+        'sea_name':              'sea_name',
+        # Creator / publisher (may be overridden by static_fields)
+        'creator_name':          'creator_name',
+        'creator_email':         'creator_email',
+        'creator_institution':   'creator_institution',
+        'creator_type':          'creator_type',
+        'creator_url':           'creator_url',
+        'publisher_email':       'publisher_email',
+        'publisher_institution': 'publisher_institution',
+        # Institution / identity
+        'institution':           'institution',
+        'infoUrl':               'infoUrl',
+        'naming_authority':      'naming_authority',
+        'references':            'references',
+        'wmo_id':                'wmo_id',
+        'wmo_platform_code':     'wmo_platform_code',
+        'gts_ingest':            'gts_ingest',
+        'title':                 'title',
+        # Vocabularies + fixed strings
+        'Conventions':                'Conventions',
+        'license':                    'license',
+        'standard_name_vocabulary':   'standard_name_vocabulary',
+        'keywords':                   'keywords',
+        'keywords_vocabulary':        'keywords_vocabulary',
+        'ncei_template_version':      'ncei_template_version',
+        'platform':                   'platform',
+        'platform_type':              'platform_type',
+        'platform_vocabulary':        'platform_vocabulary',
+        'instrument':                 'instrument',
+        'instrument_vocabulary':      'instrument_vocabulary',
+        'processing_level':           'processing_level',
+        'product_version':            'product_version',
+        # Geospatial resolution / CRS strings
+        'geospatial_lat_resolution':      'geospatial_lat_resolution',
+        'geospatial_lat_units':           'geospatial_lat_units',
+        'geospatial_lon_resolution':      'geospatial_lon_resolution',
+        'geospatial_lon_units':           'geospatial_lon_units',
+        'geospatial_vertical_positive':   'geospatial_vertical_positive',
+        'geospatial_vertical_units':      'geospatial_vertical_units',
+        'geospatial_bounds_crs':          'geospatial_bounds_crs',
+        'geospatial_bounds_vertical_crs': 'geospatial_bounds_vertical_crs',
     }
     result = {}
     for erddap_key, our_key in field_map.items():
@@ -1698,6 +1749,12 @@ def generate_metadata_files(dep):
     ga['date_issued']            = now_iso
     ga['date_modified']          = now_iso
     ga['date_metadata_modified'] = now_iso
+
+    # Overlay static_fields from settings (always win over ERDDAP / form values)
+    _settings = _load_generator_settings()
+    for k, v in _settings.get('static_fields', {}).items():
+        if v and v.strip():
+            ga[k] = v.strip()
 
     # Build deployment.json (preserve platform block; update global_attributes subset)
     deployment = dict(base_dep)

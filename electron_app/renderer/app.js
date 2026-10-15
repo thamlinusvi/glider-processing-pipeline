@@ -6439,13 +6439,63 @@ async function renderSettings () {
     'Controls how each field is populated when you generate deployment config files.'))
 
   // Load current settings from server
-  let gcSettings = { presets: [], active: null, field_tags: _defaultFieldTags() }
+  let gcSettings = { presets: [], active: null, field_tags: _defaultFieldTags(), static_fields: {} }
   try {
     const r = await apiFetch('/api/settings/generator')
     if (r.ok !== false) gcSettings = r
   } catch (_) {}
 
   renderGeneratorSettings(gcSection, gcSettings)
+
+  // ── Static Fields section ──────────────────────────────────────────────────
+  const sfSection = h('div', { class: 'settings-section' })
+  body.appendChild(sfSection)
+  sfSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Static Fields'))
+  sfSection.appendChild(h('p', { class: 'settings-section-desc' },
+    'These values are written to every generated config, overriding whatever ERDDAP returns. Set them once per institution.'))
+
+  const SF_META = [
+    { key: 'creator_name',          label: 'Creator name' },
+    { key: 'creator_email',         label: 'Creator email' },
+    { key: 'creator_institution',   label: 'Creator institution' },
+    { key: 'creator_type',          label: 'Creator type' },
+    { key: 'creator_url',           label: 'Creator URL' },
+    { key: 'publisher_email',       label: 'Publisher email' },
+    { key: 'publisher_institution', label: 'Publisher institution' },
+    { key: 'geospatial_vertical_units', label: 'Geospatial vertical units' },
+  ]
+
+  const sfFields = {}
+  const sfWrap = h('div', { class: 'sf-fields-wrap' })
+  sfSection.appendChild(sfWrap)
+
+  SF_META.forEach(({ key, label }) => {
+    const input = h('input', { class: 'form-input', type: 'text',
+      value: (gcSettings.static_fields || {})[key] || '' })
+    sfFields[key] = input
+    sfWrap.appendChild(h('div', { class: 'form-group sf-form-group' },
+      h('label', { class: 'form-label' }, label), input))
+  })
+
+  const sfStatus = h('div', { class: 'gc-status' })
+  const sfSaveBtn = h('button', { class: 'btn-primary', style: 'margin-top:16px' }, 'Save')
+  sfWrap.appendChild(sfSaveBtn)
+  sfWrap.appendChild(sfStatus)
+
+  sfSaveBtn.addEventListener('click', async () => {
+    const static_fields = {}
+    SF_META.forEach(({ key }) => { static_fields[key] = sfFields[key].value.trim() })
+    try {
+      await apiFetch('/api/settings/generator', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...gcSettings, static_fields }) })
+      gcSettings.static_fields = static_fields
+      sfStatus.textContent = 'Saved.'
+      setTimeout(() => { sfStatus.textContent = '' }, 2000)
+    } catch (e) {
+      sfStatus.textContent = 'Error: ' + e.message
+    }
+  })
 }
 
 function _defaultFieldTags () {
