@@ -3108,7 +3108,7 @@ async function showGenerateConfigModal (dep) {
           style: 'background:#4a3800;border:1px solid #8a6500;border-radius:6px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#ffd888;line-height:1.5'
         },
           h('div', { style: 'font-weight:600;margin-bottom:4px' }, '⚠ Creator / publisher fields not configured'),
-          h('div', {}, 'No previous deployment found and no preset is active. These fields will fall back to default values. Go to Settings → Static Fields to enter your organization\'s info and save a preset.'),
+          h('div', {}, 'No previous deployment found and no preset is active. These fields will fall back to default values. Go to Settings → Metadata Static Fields to enter your organization\'s info and save a preset.'),
           h('button', { class: 'btn-secondary btn-sm', style: 'margin-top:8px',
             onclick: () => { closeModal(); navigate('settings') } }, 'Go to Settings')
         ) : null,
@@ -6412,7 +6412,7 @@ async function renderSettings () {
   // ── Static Fields section ──────────────────────────────────────────────────
   const sfSection = h('div', { class: 'settings-section' })
   body.appendChild(sfSection)
-  sfSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Static Fields'))
+  sfSection.appendChild(h('h2', { class: 'settings-section-title' }, 'Metadata Static Fields'))
   sfSection.appendChild(h('p', { class: 'settings-section-desc' },
     'Creator and publisher values to use when generating config files. When no preset is active these are pulled automatically from the most recent same-glider deployment. ' +
     'Geospatial vertical units are always pulled from the previous deployment.'))
