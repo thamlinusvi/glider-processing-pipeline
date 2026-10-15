@@ -2957,25 +2957,6 @@ async function showGenerateConfigModal (dep) {
   const sameDeps = allDeps.filter(d => d.startsWith(glider + '-')).sort().reverse()
   const prevDep  = sameDeps[0] || null
 
-  // Pre-fill fields from the most recent same-glider deployment
-  let prefill = {}
-  if (prevDep) {
-    try {
-      const md = await apiFetch(`/api/deployment/${encodeURIComponent(prevDep)}/metadata`)
-      const ga = md.files?.['science_profile\\global_attributes.json']
-              || md.files?.['science_profile/global_attributes.json'] || {}
-      prefill = {
-        summary:          ga.summary          || '',
-        comment:          ga.comment          || '',
-        project:          ga.project          || '',
-        program:          ga.program          || '',
-        acknowledgment:   ga.acknowledgment   || '',
-        contributor_name: ga.contributor_name || '',
-        contributor_role: ga.contributor_role || '',
-        sea_name:         ga.sea_name         || 'Caribbean Sea',
-      }
-    } catch (_) {}
-  }
 
   const erddapInput = h('input', { class: 'form-input', type: 'url',
     placeholder: 'Paste any ERDDAP dataset or info URL',
@@ -3007,8 +2988,6 @@ async function showGenerateConfigModal (dep) {
       }
     })
   }
-  setFields(prefill)
-
   // Copy-from selector (instruments.json + sensor_defs)
   const copyFromSel = h('select', { class: 'form-input' })
   copyFromSel.appendChild(h('option', { value: '' }, '— none —'))
