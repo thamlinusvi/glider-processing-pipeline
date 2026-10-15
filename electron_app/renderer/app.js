@@ -2993,7 +2993,7 @@ async function _metaCopyFileFromDepModal (dep, glider, targetGroup, onDone) {
           const cbAttrs  = { type: 'checkbox', id: `cpff-${rel}`, style: 'margin-right:6px' }
           if (isError) cbAttrs.disabled = ''
           const cb = h('input', cbAttrs)
-          checkboxes.push({ cb, filename, isError })
+          checkboxes.push({ cb, rel, filename, isError })
           fileListWrap.appendChild(h('label', {
             for: `cpff-${rel}`,
             style: 'display:flex;align-items:center;cursor:pointer;font-size:13px;margin-bottom:3px' +
@@ -3025,12 +3025,9 @@ async function _metaCopyFileFromDepModal (dep, glider, targetGroup, onDone) {
     let errors = 0
     try {
       const meta = await apiFetch(`/api/deployment/${encodeURIComponent(srcDep)}/metadata`)
-      for (const { filename } of selected) {
-        // Find the file in any section of the source dep
-        const srcEntry = Object.entries(meta.files || {})
-          .find(([rel]) => rel.split(/[\\/]/).pop() === filename && !(meta.files[rel] && meta.files[rel].__metaError__))
-        if (!srcEntry) { errors++; continue }
-        const [, fileJson] = srcEntry
+      for (const { rel: srcRel, filename } of selected) {
+        const fileJson = (meta.files || {})[srcRel]
+        if (fileJson == null || fileJson.__metaError__) { errors++; continue }
         const destRel = targetGroup + '\\' + filename
         try {
           await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/save`, {
