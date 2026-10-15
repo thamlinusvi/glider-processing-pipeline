@@ -1528,6 +1528,20 @@ def _find_prev_deployment(glider, exclude_dep):
     return deps[0] if deps else None
 
 
+def _normalize_erddap_url(url):
+    """Convert any ERDDAP URL to its /info/<id>/index.json form."""
+    import re
+    # info page with any extension: .../info/<id>/index.html → .json
+    m = re.match(r'^(https?://[^/]+/erddap/info/([^/]+)/index)\.[a-z]+$', url)
+    if m:
+        return m.group(1) + '.json'
+    # tabledap/griddap dataset page: extract server + id
+    m = re.match(r'^(https?://[^/]+)/erddap/(?:tabledap|griddap)/([^/?#.]+)', url)
+    if m:
+        return f"{m.group(1)}/erddap/info/{m.group(2)}/index.json"
+    return url  # unchanged; will fail downstream with a meaningful error
+
+
 @app.route('/api/erddap/fetch')
 def erddap_fetch():
     """Proxy an ERDDAP /info/<id>/index.json URL and return matching form fields."""
@@ -1536,6 +1550,7 @@ def erddap_fetch():
         return jsonify({'error': 'No URL provided'}), 400
     if not url.startswith(('http://', 'https://')):
         return jsonify({'error': 'URL must start with http:// or https://'}), 400
+    url = _normalize_erddap_url(url)
     try:
         ctx = ssl.create_default_context()
         req = _urlreq.Request(url, headers={'Accept': 'application/json'})

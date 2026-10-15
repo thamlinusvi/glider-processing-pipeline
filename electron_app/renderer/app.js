@@ -2978,7 +2978,7 @@ async function showGenerateConfigModal (dep) {
   }
 
   const erddapInput = h('input', { class: 'form-input', type: 'url',
-    placeholder: 'https://…/erddap/info/<dataset_id>/index.json',
+    placeholder: 'Paste any ERDDAP dataset or info URL',
     style: 'flex:1;min-width:0' })
   const fetchBtn = h('button', { class: 'btn-secondary btn-sm',
     style: 'white-space:nowrap' }, 'Fetch')
@@ -3113,7 +3113,7 @@ async function showGenerateConfigModal (dep) {
           h('label', { class: 'form-label' }, 'ERDDAP metadata URL (optional)'),
           h('div', { style: 'display:flex;gap:6px;align-items:center' }, erddapInput, fetchBtn),
           h('div', { style: 'font-size:11px;color:#8a9bac;margin-top:4px' },
-            'Fetch pre-fills the fields below. Any fields not found in ERDDAP will remain blank — fill those in manually.')),
+            'Paste any ERDDAP URL (dataset page, info page, .html or .json). Fetch pre-fills the fields below; unfound fields remain blank — fill those in manually.')),
         sep.cloneNode(),
         h('div', { class: 'form-group' },
           h('label', { class: 'form-label' }, 'Summary'), fields.summary),
