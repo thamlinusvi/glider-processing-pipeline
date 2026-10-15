@@ -2534,6 +2534,18 @@ async function renderMetadata (selectRel) {
       sectionHdr.appendChild(copyBtn)
     }
 
+    if (otherDeps.length) {
+      const cpFileBtn = h('button', {
+        class: 'meta-section-copy-btn',
+        title: 'Copy a specific file from another deployment into this section…',
+        onclick: e => {
+          e.stopPropagation()
+          _metaCopyFileFromDepModal(dep, glider, group, renderMetadata)
+        },
+      }, 'Copy file from dep…')
+      sectionHdr.appendChild(cpFileBtn)
+    }
+
     fileList.appendChild(sectionHdr)
 
     if (!items.length) {
@@ -2947,6 +2959,146 @@ function _metaNewFileModal (dep) {
           onclick: doCreate }, 'Create'))))
   document.body.appendChild(overlay)
   nameInput.focus()
+}
+
+/* Copy a specific file from another deployment into a target section ─────────*/
+async function _metaCopyFileFromDepModal (dep, glider, targetGroup, onDone) {
+  const SECTION_LABELS = {
+    science_profile:    'Profile',
+    science_trajectory: 'Trajectory (Science)',
+    trajectory_flight:  'Trajectory (Flight)',
+  }
+  const allDeps = Array.from(document.getElementById('dep-select').options)
+    .map(o => o.value).filter(Boolean).filter(d => d !== dep)
+  if (!allDeps.length) { alert('No other deployments available.'); return }
+
+  const same  = allDeps.filter(d => glider && d.startsWith(glider + '-')).sort().reverse()
+  const other = allDeps.filter(d => !glider || !d.startsWith(glider + '-')).sort().reverse()
+
+  const depSel = h('select', { class: 'form-input' })
+  if (same.length) {
+    const grp = document.createElement('optgroup')
+    grp.label = `Same glider — ${glider}`
+    same.forEach(d => grp.appendChild(h('option', { value: d }, d)))
+    depSel.appendChild(grp)
+  }
+  if (other.length) {
+    const grp = document.createElement('optgroup')
+    grp.label = 'Other deployments'
+    other.forEach(d => grp.appendChild(h('option', { value: d }, d)))
+    depSel.appendChild(grp)
+  }
+  depSel.value = same.length ? same[0] : other[0]
+
+  const fileListWrap = h('div', {})
+  const statusEl     = h('div', { class: 'modal-status' })
+  let checkboxes     = []
+
+  async function loadFiles (srcDep) {
+    fileListWrap.innerHTML = ''
+    checkboxes = []
+    if (!srcDep) return
+    fileListWrap.appendChild(h('div', { style: 'color:#8a9bac;font-size:12px;padding:4px 0' }, 'Loading…'))
+    try {
+      const meta  = await apiFetch(`/api/deployment/${encodeURIComponent(srcDep)}/metadata`)
+      const files = Object.entries(meta.files || {})
+      fileListWrap.innerHTML = ''
+      if (!files.length) {
+        fileListWrap.appendChild(h('div', { style: 'color:#8a9bac;font-size:12px' }, 'No config files found in this deployment.'))
+        return
+      }
+      // Group by section
+      const bySection = {}
+      files.forEach(([rel, fileJson]) => {
+        const sec = rel.split(/[\\/]/)[0]
+        if (!bySection[sec]) bySection[sec] = []
+        bySection[sec].push([rel, fileJson])
+      })
+      Object.entries(bySection).forEach(([sec, entries]) => {
+        fileListWrap.appendChild(h('div', {
+          style: 'font-size:11px;color:#8a9bac;text-transform:uppercase;letter-spacing:.05em;margin:8px 0 3px'
+        }, SECTION_LABELS[sec] || sec))
+        entries.forEach(([rel, fileJson]) => {
+          const filename = rel.split(/[\\/]/).pop()
+          const isError  = !!(fileJson && fileJson.__metaError__)
+          const cb = h('input', { type: 'checkbox', checked: false,
+            id: `cpff-${rel}`, style: 'margin-right:6px',
+            disabled: isError })
+          checkboxes.push({ cb, filename, isError })
+          fileListWrap.appendChild(h('label', {
+            for: `cpff-${rel}`,
+            style: 'display:flex;align-items:center;cursor:pointer;font-size:13px;margin-bottom:3px' +
+                   (isError ? ';color:#e74c3c;opacity:.6' : '')
+          }, cb, filename + (isError ? ' (invalid JSON)' : '')))
+        })
+      })
+    } catch (e) {
+      fileListWrap.innerHTML = ''
+      fileListWrap.appendChild(h('div', { style: 'color:#e74c3c;font-size:12px' }, 'Failed to load: ' + e.message))
+    }
+  }
+
+  depSel.onchange = () => { statusEl.textContent = ''; loadFiles(depSel.value) }
+  await loadFiles(depSel.value)
+
+  const copyBtn = h('button', { class: 'btn-primary' }, 'Copy selected')
+  copyBtn.onclick = async () => {
+    statusEl.textContent = ''
+    const selected = checkboxes.filter(({ cb, isError }) => cb.checked && !isError)
+    if (!selected.length) {
+      statusEl.textContent = 'Check at least one file.'
+      statusEl.style.color = '#e74c3c'
+      return
+    }
+    copyBtn.disabled    = true
+    copyBtn.textContent = 'Copying…'
+    const srcDep = depSel.value
+    let errors = 0
+    try {
+      const meta = await apiFetch(`/api/deployment/${encodeURIComponent(srcDep)}/metadata`)
+      for (const { filename } of selected) {
+        // Find the file in any section of the source dep
+        const srcEntry = Object.entries(meta.files || {})
+          .find(([rel]) => rel.split(/[\\/]/).pop() === filename && !(meta.files[rel] && meta.files[rel].__metaError__))
+        if (!srcEntry) { errors++; continue }
+        const [, fileJson] = srcEntry
+        const destRel = targetGroup + '\\' + filename
+        try {
+          await apiFetch(`/api/deployment/${encodeURIComponent(dep)}/metadata/save`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ path: destRel, content: JSON.stringify(fileJson, null, 2) }),
+          })
+        } catch (_) { errors++ }
+      }
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message
+      statusEl.style.color = '#e74c3c'
+      copyBtn.disabled    = false
+      copyBtn.textContent = 'Copy selected'
+      return
+    }
+    closeModal()
+    await onDone()
+    if (errors) alert(`${errors} file(s) could not be copied.`)
+  }
+
+  const overlay = h('div', { class: 'modal-overlay', id: 'modal-overlay',
+    onclick: e => { if (e.target === overlay) closeModal() } },
+    h('div', { class: 'modal', style: 'max-width:480px;max-height:88vh;overflow-y:auto' },
+      h('div', { class: 'modal-header' },
+        h('h2', {}, `Copy file into ${SECTION_LABELS[targetGroup] || targetGroup}`),
+        h('button', { class: 'modal-close', onclick: closeModal }, '×')),
+      h('div', { class: 'modal-body' },
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Source deployment'), depSel),
+        h('div', { class: 'form-group' },
+          h('label', { class: 'form-label' }, 'Files to copy'), fileListWrap),
+        statusEl),
+      h('div', { class: 'modal-footer' },
+        h('button', { class: 'btn-secondary', onclick: closeModal }, 'Cancel'),
+        copyBtn)))
+  document.body.appendChild(overlay)
 }
 
 /* Generate global_attributes.json + deployment.json from a form ─────────────*/
