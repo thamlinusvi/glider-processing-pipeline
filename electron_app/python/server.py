@@ -1608,14 +1608,27 @@ def generate_metadata_files(dep):
     deployment['global_attributes'] = ga_sub
 
     config_dir = os.path.join(REPO_DIR, 'glider_config_files_json', glider, dep)
-    subdirs    = ['science_profile', 'science_trajectory']
+    # (subdir, cdm_data_type override or None to keep base value)
+    subdirs    = [
+        ('science_profile',   None),
+        ('science_trajectory', None),
+        ('trajectory_flight',  'Trajectory'),
+    ]
     written    = []
     errors     = []
 
-    for subdir in subdirs:
+    for subdir, cdm_override in subdirs:
         dst_dir = os.path.join(config_dir, subdir)
         os.makedirs(dst_dir, exist_ok=True)
-        for fname, obj in [('global_attributes.json', ga), ('deployment.json', deployment)]:
+        ga_out  = dict(ga)
+        dep_out = dict(deployment)
+        if cdm_override:
+            ga_out['cdm_data_type'] = cdm_override
+            dep_ga = dict(dep_out.get('global_attributes', {}))
+            dep_ga['cdm_data_type'] = cdm_override
+            dep_out = dict(dep_out)
+            dep_out['global_attributes'] = dep_ga
+        for fname, obj in [('global_attributes.json', ga_out), ('deployment.json', dep_out)]:
             fpath = os.path.join(dst_dir, fname)
             try:
                 with open(fpath, 'w', encoding='utf-8') as f:
